@@ -1,0 +1,21 @@
+[package]
+name = "rustfrp-core"
+description = "RustFRP shared library: frp config compatibility layer, protocol, transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_ignored.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

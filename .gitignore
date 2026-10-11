@@ -1,0 +1,15 @@
+target/
+*.profraw
+*.profdata
+lcov.info
+.DS_Store
+.dart_tool/
+build/
+.flutter-plugins*
+.idea/
+.env
+.env.local
+*.db
+*.db-wal
+*.db-shm
+node_modules/
