@@ -9,7 +9,7 @@ use rustfrp_core::frpcfg::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{Command, Mode, Options, HELP};
+use crate::cli::{AdminAction, Command, Mode, Options, HELP};
 use crate::edge::Edge;
 use crate::log::{Level, Logger};
 use crate::{client, local_control, managed, plan};
@@ -77,6 +77,7 @@ pub async fn execute(
             0
         }
         Command::Service(c) => crate::service::run(&c, &crate::service::StdHost, out, err),
+        Command::Admin(action, o) => admin_command(action, &o, fs, env, out, err).await,
         Command::Verify(o) => verify(&o, fs, env, out, err),
         Command::Convert(o) => match crate::convert::convert(&o, fs, env) {
             Ok((text, report)) => {
@@ -122,6 +123,57 @@ pub async fn execute(
             };
             tokio::join!(agent_run, local_run).0
         }
+    }
+}
+
+/// `reload` / `status` / `stop`：读配置里的 `webServer`，向运行中的客户端发一次请求。
+async fn admin_command(
+    action: AdminAction,
+    o: &Options,
+    fs: &dyn ConfigFs,
+    env: &dyn Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let opts = LoadOptions {
+        strict: false,
+        fs,
+        env,
+    };
+    let l = match load_client(&o.config, &opts) {
+        Ok(l) => l,
+        Err(e) => return fail(err, &o.config, e),
+    };
+    let web = &l.common.web_server;
+    if web.port <= 0 {
+        return fail(
+            err,
+            &o.config,
+            "webServer.port is not configured; the client has no admin interface",
+        );
+    }
+    let host = if web.addr.is_empty() || web.addr == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        web.addr.as_str()
+    };
+    let addr = format!("{host}:{}", web.port);
+    let path = match action {
+        AdminAction::Reload => "/api/reload",
+        AdminAction::Status => "/api/status",
+        AdminAction::Stop => "/api/stop",
+    };
+    match crate::admin::request(&addr, path, &web.user, &web.password).await {
+        Ok((200, body)) => {
+            let _ = match action {
+                AdminAction::Reload => writeln!(out, "reload success"),
+                AdminAction::Stop => writeln!(out, "stop success"),
+                AdminAction::Status => writeln!(out, "{body}"),
+            };
+            0
+        }
+        Ok((code, body)) => fail(err, &addr, format!("{path}: HTTP {code} {}", body.trim())),
+        Err(e) => fail(err, &addr, e),
     }
 }
 
@@ -206,7 +258,8 @@ async fn run(
             };
             let log = logger(&plan.log_to, &plan.log_level, err);
             log_notes(&log, &plan.notes);
-            match client::run(plan.cfg, log, None, cancel).await {
+            let web = l.common.web_server.clone();
+            match run_standalone_client(o, plan.cfg, &web, fs, env, log, cancel).await {
                 Ok(()) => 0,
                 Err(e) => fail(err, &o.config, e),
             }
@@ -238,6 +291,117 @@ async fn run(
             0
         }
     }
+}
+
+/// 独立模式的客户端；配置了 `webServer.port` 时同时提供管理接口，并支持 `reload`。
+async fn run_standalone_client(
+    o: &Options,
+    cfg: client::ClientConfig,
+    web: &rustfrp_core::frpcfg::WebServerConfig,
+    fs: &dyn ConfigFs,
+    env: &dyn Env,
+    log: Logger,
+    cancel: CancellationToken,
+) -> Result<(), String> {
+    use crate::admin::{self, Admin, ProxyStatus, ReloadReq};
+    if web.port <= 0 {
+        return client::run(cfg, log, None, cancel)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let status: admin::StatusTable = Arc::default();
+    let fill = |cfg: &client::ClientConfig| {
+        *status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cfg
+            .proxies
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    ProxyStatus {
+                        kind: p.kind.clone(),
+                        state: "wait start".into(),
+                        error: String::new(),
+                        local: format!("{}:{}", p.local_ip, p.local_port),
+                        remote: String::new(),
+                    },
+                )
+            })
+            .collect();
+    };
+    fill(&cfg);
+    // 配置加载时已补默认值（127.0.0.1）。
+    let addr = web.addr.as_str();
+    let port = u16::try_from(web.port).map_err(|_| "webServer.port out of range".to_string())?;
+    let listener = tokio::net::TcpListener::bind((addr, port))
+        .await
+        .map_err(|e| format!("webServer listen on {addr}:{port}: {e}"))?;
+    log.info(&format!("admin server listening on {addr}:{port}"));
+    let config_text = Arc::new(std::sync::Mutex::new(
+        fs.read_to_string(&o.config).unwrap_or_default(),
+    ));
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<ReloadReq>(1);
+    let (cfg_tx, cfg_rx) = tokio::sync::mpsc::channel(1);
+    let (etx, erx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(admin::track(erx, status.clone()));
+    let admin = Arc::new(Admin {
+        user: web.user.clone(),
+        password: web.password.clone(),
+        status: status.clone(),
+        config_text: config_text.clone(),
+        reload: reload_tx,
+        stop: cancel.clone(),
+    });
+    let server = tokio::spawn(admin::serve(listener, admin, cancel.clone()));
+    let task = client::run_with_reload(cfg, log.clone(), Some(etx), cancel.clone(), Some(cfg_rx));
+    tokio::pin!(task);
+    let result = loop {
+        tokio::select! {
+            r = &mut task => break r.map_err(|e| e.to_string()),
+            Some(req) = reload_rx.recv() => {
+                let reloaded = reload_config(o, fs, env, &log);
+                let reply = match reloaded {
+                    Ok(new_cfg) => {
+                        fill(&new_cfg);
+                        if let Ok(text) = fs.read_to_string(&o.config) {
+                            *config_text.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+                        }
+                        let _ = cfg_tx.send(new_cfg).await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log.error(&format!("reload failed: {e}"));
+                        Err(e)
+                    }
+                };
+                let _ = req.reply.send(reply);
+            }
+        }
+    };
+    cancel.cancel();
+    let _ = server.await;
+    result
+}
+
+/// 重新读取并校验配置文件，得到新的运行配置（失败时旧配置继续运行）。
+fn reload_config(
+    o: &Options,
+    fs: &dyn ConfigFs,
+    env: &dyn Env,
+    log: &Logger,
+) -> Result<client::ClientConfig, String> {
+    let opts = LoadOptions {
+        strict: o.strict,
+        fs,
+        env,
+    };
+    let l = load_client(&o.config, &opts).map_err(|e| e.to_string())?;
+    validate_client_all(&l.common, &l.proxies, &l.visitors, &o.allow_unsafe)
+        .map_err(|e| e.to_string())?;
+    let plan = plan::client_plan(&l, fs)?;
+    log_notes(log, &plan.notes);
+    Ok(plan.cfg)
 }
 
 /// 把「已识别但尚未实现」的选项逐条写进启动日志（不得静默忽略）。

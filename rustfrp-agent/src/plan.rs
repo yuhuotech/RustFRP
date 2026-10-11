@@ -256,6 +256,18 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             ));
         }
     }
+    // 管理接口只提供 JSON / 文本（reload / status / stop），没有网页和 TLS。
+    if c.web_server.port > 0 {
+        if c.web_server.tls.is_some() {
+            notes.push(
+                "webServer.tls is not supported yet: the admin interface is plain HTTP".into(),
+            );
+        }
+        if !c.web_server.assets_dir.is_empty() {
+            notes
+                .push("webServer.assetsDir is not supported yet: there is no web dashboard".into());
+        }
+    }
     let mut visitors = Vec::new();
     for v in &l.visitors {
         if !["stcp", "sudp"].contains(&v.kind.as_str()) {
@@ -330,7 +342,10 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
     if s.auth.method == "oidc" {
         return Err("auth.method \"oidc\" is not implemented yet".into());
     }
-    let notes = Vec::new();
+    let mut notes = Vec::new();
+    if s.web_server.port > 0 {
+        notes.push("webServer (dashboard) is not supported yet on the edge and is ignored".into());
+    }
     let mut allow_ports = Vec::new();
     for r in &s.allow_ports {
         let (lo, hi) = if r.single > 0 {
@@ -539,6 +554,61 @@ mod tests {
             err.contains("proxy [t]") && err.contains("crtPath"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn web_server_options_that_have_no_runtime_are_reported() {
+        let fs = MemFs::new();
+        let client_src = "serverAddr='x'\nwebServer.port=7400\nwebServer.assetsDir='/srv/ui'\nwebServer.tls.certFile='c'\nwebServer.tls.keyFile='k'\n";
+        let plan = client(client_src, &fs);
+        let notes = plan.map(|p| p.notes.join("\n")).unwrap_or_default();
+        assert!(
+            notes.contains("webServer.tls") && notes.contains("webServer.assetsDir"),
+            "{notes}"
+        );
+        let quiet = client("serverAddr='x'\nwebServer.port=7400\n", &fs).unwrap();
+        assert!(quiet.notes.is_empty(), "{:?}", quiet.notes);
+        let edge = server("bindPort=7000\nwebServer.port=7500\n", &fs).unwrap();
+        assert!(
+            edge.notes
+                .iter()
+                .any(|n| n.contains("webServer (dashboard)")),
+            "{:?}",
+            edge.notes
+        );
+    }
+
+    #[test]
+    fn visitors_are_filtered_and_unsupported_types_and_options_are_reported() {
+        let fs = MemFs::new();
+        let src = "serverAddr='x'\n\
+[[proxies]]\nname='p2p'\ntype='xtcp'\nsecretKey='k'\nlocalPort=1\n\
+[[visitors]]\nname='x'\ntype='xtcp'\nserverName='s'\nsecretKey='k'\nbindPort=1\nprotocol='quic'\n\
+[[visitors]]\nname='off'\ntype='stcp'\nenabled=false\nserverName='s'\nsecretKey='k'\nbindPort=2\n\
+[[visitors]]\nname='enc'\ntype='sudp'\nserverName='s'\nsecretKey='k'\nbindPort=3\nserverUser='bob'\ntransport.useEncryption=true\n";
+        let plan = client(src, &fs).unwrap();
+        assert!(plan.cfg.proxies.is_empty());
+        assert_eq!(plan.cfg.visitors.len(), 1);
+        let v = &plan.cfg.visitors[0];
+        assert_eq!(
+            (
+                v.name.as_str(),
+                v.kind.as_str(),
+                v.server_user.as_str(),
+                v.bind_port
+            ),
+            ("enc", "sudp", "bob", 3)
+        );
+        let notes = plan.notes.join("\n");
+        assert!(
+            notes.contains("proxy [p2p]")
+                && notes.contains("visitor [x]")
+                && notes.contains("visitor [enc]"),
+            "{notes}"
+        );
+        assert!(!notes.contains("visitor [off]"), "{notes}");
+        // 端口越界是配置错误。
+        assert!(client("serverAddr='x'\n[[visitors]]\nname='v'\ntype='stcp'\nserverName='s'\nsecretKey='k'\nbindPort=70000\n", &fs).is_err());
     }
 
     #[test]

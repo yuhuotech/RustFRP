@@ -247,8 +247,19 @@ pub async fn run(
     events: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
-    let connector = build_connector(&cfg)?;
-    let cfg = Arc::new(cfg);
+    run_with_reload(cfg, log, events, cancel, None).await
+}
+
+/// 同 [`run`]；`reload` 收到新配置时立即断开当前会话并按新配置重连（frpc 的 `reload`）。
+pub async fn run_with_reload(
+    cfg: ClientConfig,
+    log: Logger,
+    events: Option<mpsc::Sender<Event>>,
+    cancel: CancellationToken,
+    mut reload: Option<mpsc::Receiver<ClientConfig>>,
+) -> Result<(), ClientError> {
+    let mut connector = build_connector(&cfg)?;
+    let mut cfg = Arc::new(cfg);
     let mut delay = cfg.backoff.0;
     // 接入成功后由服务端签发的设备 ID：此后重连改用签名登录，不再使用（已作废的）一次性令牌。
     let issued: Issued = Arc::default();
@@ -256,6 +267,31 @@ pub async fn run(
     loop {
         let end = tokio::select! {
             _ = cancel.cancelled() => SessionEnd::Cancelled,
+            next = async {
+                match reload.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match next {
+                Some(new_cfg) => match build_connector(&new_cfg) {
+                    Ok(c) => {
+                        log.info("configuration reloaded; reconnecting");
+                        connector = c;
+                        cfg = Arc::new(new_cfg);
+                        delay = cfg.backoff.0;
+                        continue;
+                    }
+                    Err(e) => {
+                        log.error(&format!("reload rejected: {e}"));
+                        continue;
+                    }
+                },
+                None => {
+                    // 重载通道关闭：之后只按当前配置运行。
+                    reload = None;
+                    continue;
+                }
+            },
             end = session_once(&cfg, &connector, &log, &events, &cancel, &issued) => end,
         };
         match end {

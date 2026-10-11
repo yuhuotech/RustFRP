@@ -21,12 +21,25 @@ pub enum Command {
     Verify(Options),
     /// 将旧版 INI 转换为标准 TOML，输出到 stdout。
     Convert(Options),
+    /// 通过运行中客户端的管理接口（`webServer`）操作：重载配置 / 查看状态 / 停止。
+    Admin(AdminAction, Options),
     /// 系统服务管理（`service install|uninstall|status|start|stop`）。
     Service(crate::service::ServiceCmd),
     /// 打印版本。
     Version,
     /// 打印帮助。
     Help,
+}
+
+/// 管理接口动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAction {
+    /// 重新读取配置并重连。
+    Reload,
+    /// 打印各代理状态。
+    Status,
+    /// 停止客户端。
+    Stop,
 }
 
 /// 运行选项。
@@ -56,6 +69,7 @@ USAGE:
   rustfrp-agent --mode edge --controller <host[:port]> --enroll-token <token> --public-host <name> [-c <frps.toml>]
   rustfrp-agent convert --mode <client|edge> -c <legacy.ini>
   rustfrp-agent verify --mode <client|edge> -c <config>
+  rustfrp-agent <reload|status|stop> -c <frpc.toml>      (talks to the running client's webServer)
   rustfrp-agent service <install|uninstall|status|start|stop> [--user] [--name <n>] [--print] [-- <agent args>]
   frpc -c <config>        (when the binary is named frpc)
   frps -c <config>        (when the binary is named frps)
@@ -104,6 +118,7 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         None::<String>,
     );
     let mut convert = false;
+    let mut admin = None::<AdminAction>;
     let (mut verify, mut version, mut help) = (false, false, false);
 
     let mut it = args.iter();
@@ -124,6 +139,9 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         match key {
             "verify" => verify = true,
             "convert" => convert = true,
+            "reload" => admin = Some(AdminAction::Reload),
+            "status" => admin = Some(AdminAction::Status),
+            "stop" => admin = Some(AdminAction::Stop),
             "-v" | "--version" | "version" => version = true,
             "-h" | "--help" | "help" => help = true,
             "-c" | "--config" => config = Some(value(key)?),
@@ -215,7 +233,13 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         strict,
         allow_unsafe,
     };
-    Ok(if convert {
+    if admin.is_some() && (convert || verify || opts.managed.is_some() || opts.mode != Mode::Client)
+    {
+        return Err("reload / status / stop need a standalone client (-c frpc.toml)".into());
+    }
+    Ok(if let Some(action) = admin {
+        Command::Admin(action, opts)
+    } else if convert {
         Command::Convert(opts)
     } else if verify {
         Command::Verify(opts)

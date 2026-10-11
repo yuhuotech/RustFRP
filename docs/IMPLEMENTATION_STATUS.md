@@ -41,7 +41,7 @@
 | STCP / SUDP / visitors | 已实现 | 提供方注册 stcp / sudp 代理（不占公网端口，`secretKey` + `allowUsers`）；访问者开新流向 Edge 出示 `auth_key(sk, ts)` 签名，Edge 校验密钥与用户后把流接到提供方会话，之后是透明通道（sudp 复用 UDP 帧）；独立模式用 `[[visitors]]`，受管模式在面板「客户端详情 → 访问者」创建（目标隧道必须与访问者在同一节点，密钥由 Controller 生成并代为下发）；端到端测试覆盖独立、受管（全栈）两种路径。xtcp（P2P 打洞）与 TCPMUX 未实现并在兼容报告中列出 |
 | 本地插件 | 独立模式已实现 | `socks5`（可选 RFC 1929 认证）、`http_proxy`（CONNECT + 绝对形式明文请求，Proxy-Authorization Basic）、`static_file`（只读，拒绝路径穿越与符号链接逃逸，目录索引 / 前缀剥离 / Basic）、`unix_domain_socket`、`http2https` / `https2http` / `https2https`（按请求改写 Host 与请求头，仅 HTTP/1.1，证书缺省生成自签名）、`tls2raw`；`virtual_net` 等未实现并在兼容报告中列出。受管模式（Controller 存储 / 下发 / 面板）尚未接入 |
 | 通用加密/压缩 | 未实现（PROXY protocol 已实现） | 逐代理有提示；需对照上游字段与行为完成、加入兼容样例和内存基准 |
-| G8 配置兼容 / 导入导出 | 部分完成 | TOML/YAML/JSON、includes、环境模板、默认/校验/导出已有；INI convert 已接入 CLI、环境模板、includes 展开与兼容报告，正在做覆盖率/语法边界验收；reload、受管配置导入预览/摘要确认/事务应用和 TOML 导出 API 已接入并测试；仍缺面板导入向导与完整运行选项编辑；OIDC、webServer、httpPlugins 等配置的运行能力须逐字段补齐或明确报告 |
+| G8 配置兼容 / 导入导出 | 部分完成 | TOML/YAML/JSON、includes、环境模板、默认/校验/导出已有；INI convert 已接入 CLI、环境模板、includes 展开与兼容报告，正在做覆盖率/语法边界验收；独立客户端的 `webServer` 管理接口与 `reload` / `status` / `stop` 命令已实现（重载=重读校验配置并按新配置重连）、受管配置导入预览/摘要确认/事务应用和 TOML 导出 API 已接入并测试；仍缺面板导入向导与完整运行选项编辑；OIDC、frps dashboard / webServer.tls、httpPlugins 等配置的运行能力须逐字段补齐或明确报告 |
 | 管理面离线不影响数据面 | 已实现待整体验收 | 内置节点与 Controller 同进程，杀 Controller 仍会中断内置节点的隧道；使用独立节点时 AT-05 通过（同机回环全栈测试）。需要在真实多机环境复验 |
 | G7 官网 / 部署 / P07 发布 | 未实现 | 静态中文官网、快速开始、compose/systemd/nginx/caddy、Release 多平台与签名、安全审计报告待补 |
 | 内存 / 吞吐 / 延迟硬验收 | 部分完成 | macOS 空载和 100 连接约 4.3/6.2 MB 已测；Linux release、1000 连接、Controller 50 设备、吞吐≥直连90%、新增连接<5ms等需实测，不能用目标值充当成绩 |
