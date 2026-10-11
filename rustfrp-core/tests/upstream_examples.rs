@@ -85,3 +85,30 @@ fn full_examples_survive_export_and_reload_in_every_format() {
         assert_eq!(again.source, server.source, "server {fmt:?}");
     }
 }
+
+#[test]
+fn legacy_official_examples_convert_and_reload_in_strict_mode() {
+    let (fs, env) = (MemFs::new(), MapEnv::default());
+    let client = ini::convert(
+        include_str!("../../rustfrp-protocol/frp-compat/upstream/frpc_legacy_full.ini"),
+        true,
+    )
+    .unwrap();
+    let loaded = load_client_str(&client.to_string(), Format::Auto, &opts(&fs, &env)).unwrap();
+    validate::validate_client_all(&loaded.common, &loaded.proxies, &loaded.visitors, &[]).unwrap();
+    assert_eq!(loaded.common.user, "your_name");
+    assert!(loaded
+        .proxies
+        .iter()
+        .any(|p| p.name == "tcp_port_16" && p.local_port == 6028));
+    assert_eq!(loaded.visitors.len(), 2);
+    let server = ini::convert(
+        include_str!("../../rustfrp-protocol/frp-compat/upstream/frps_legacy_full.ini"),
+        false,
+    )
+    .unwrap();
+    let loaded = load_server_str(&server.to_string(), Format::Auto, &opts(&fs, &env)).unwrap();
+    validate::validate_server(&loaded.config, &[]).unwrap();
+    assert_eq!(loaded.source.http_plugins.len(), 2);
+    assert_eq!(loaded.source.allow_ports.len(), 4);
+}

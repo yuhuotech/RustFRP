@@ -7,37 +7,70 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'support/fake_server.dart';
 
-Future<ProviderContainer> container(FakeServer s, {bool sameOrigin = true, Map<String, Object> prefs = const {}}) async {
+Future<ProviderContainer> container(
+  FakeServer s, {
+  bool sameOrigin = true,
+  Map<String, Object> prefs = const {},
+}) async {
   SharedPreferences.setMockInitialValues(prefs);
   final p = await SharedPreferences.getInstance();
-  final c = ProviderContainer(retry: (_, _) => null, overrides: [
-    prefsProvider.overrideWithValue(p),
-    apiFactoryProvider.overrideWithValue((base) => s.api(base)),
-    sameOriginProvider.overrideWithValue(sameOrigin),
-    tickProvider.overrideWith((ref) => const Stream<int>.empty()),
-  ]);
+  final c = ProviderContainer(
+    retry: (_, _) => null,
+    overrides: [
+      prefsProvider.overrideWithValue(p),
+      apiFactoryProvider.overrideWithValue((base) => s.api(base)),
+      sameOriginProvider.overrideWithValue(sameOrigin),
+      tickProvider.overrideWith((ref) => const Stream<int>.empty()),
+    ],
+  );
   addTearDown(c.dispose);
   return c;
 }
 
 void main() {
-  test('session: restore without a cookie → anonymous, with one → authenticated', () async {
-    final s = FakeServer();
-    final c = await container(s);
-    expect(c.read(sessionProvider).status, SessionStatus.unknown);
-    await c.read(sessionProvider.notifier).restore();
-    expect(c.read(sessionProvider).status, SessionStatus.anonymous);
-
-    s.loggedIn = true;
+  test('desktop restore with no valid server ends at login', () async {
+    for (final url in ['', 'not a url', 'http:///missing-host']) {
+      final c = await container(
+        FakeServer(),
+        sameOrigin: false,
+        prefs: {'server_url': url},
+      );
+      await c.read(sessionProvider.notifier).restore();
+      expect(c.read(sessionProvider).status, SessionStatus.anonymous);
+    }
+    final c = await container(
+      FakeServer()..loggedIn = true,
+      sameOrigin: false,
+      prefs: {'server_url': 'https://example.test'},
+    );
     await c.read(sessionProvider.notifier).restore();
     expect(c.read(sessionProvider).status, SessionStatus.authenticated);
-    expect(c.read(sessionProvider).role, Role.owner);
-
-    s.offline = true;
-    await c.read(sessionProvider.notifier).restore();
-    expect(c.read(sessionProvider).status, SessionStatus.anonymous, reason: 'an unreachable server never leaves the app half logged in');
-    expect(c.read(sessionProvider).admin, isNull);
   });
+
+  test(
+    'session: restore without a cookie → anonymous, with one → authenticated',
+    () async {
+      final s = FakeServer();
+      final c = await container(s);
+      expect(c.read(sessionProvider).status, SessionStatus.unknown);
+      await c.read(sessionProvider.notifier).restore();
+      expect(c.read(sessionProvider).status, SessionStatus.anonymous);
+
+      s.loggedIn = true;
+      await c.read(sessionProvider.notifier).restore();
+      expect(c.read(sessionProvider).status, SessionStatus.authenticated);
+      expect(c.read(sessionProvider).role, Role.owner);
+
+      s.offline = true;
+      await c.read(sessionProvider.notifier).restore();
+      expect(
+        c.read(sessionProvider).status,
+        SessionStatus.anonymous,
+        reason: 'an unreachable server never leaves the app half logged in',
+      );
+      expect(c.read(sessionProvider).admin, isNull);
+    },
+  );
 
   test('login (same origin): success, wrong password, logout', () async {
     final s = FakeServer();
@@ -57,37 +90,77 @@ void main() {
     expect(c.read(sessionProvider).status, SessionStatus.anonymous);
   });
 
-  test('login (desktop): validates and remembers the controller address', () async {
-    final s = FakeServer();
-    final c = await container(s, sameOrigin: false);
-    final n = c.read(sessionProvider.notifier);
-    for (final bad in ['', 'frp.example.com', 'ftp://x', 'http://']) {
-      expect(await n.login('root', s.adminPassword, serverUrl: bad), contains('服务器地址'), reason: bad);
-    }
-    expect(s.requests, isEmpty, reason: 'nothing is sent for an invalid address');
-    expect(await n.login('root', s.adminPassword, serverUrl: 'https://frp.example.com//'), isNull);
-    expect(c.read(sessionProvider).serverUrl, 'https://frp.example.com');
-    expect(s.requests.first.url.origin, 'https://frp.example.com');
-    expect((await SharedPreferences.getInstance()).getString('server_url'), 'https://frp.example.com');
+  test(
+    'login (desktop): validates and remembers the controller address',
+    () async {
+      final s = FakeServer();
+      final c = await container(s, sameOrigin: false);
+      final n = c.read(sessionProvider.notifier);
+      for (final bad in ['', 'frp.example.com', 'ftp://x', 'http://']) {
+        expect(
+          await n.login('root', s.adminPassword, serverUrl: bad),
+          contains('服务器地址'),
+          reason: bad,
+        );
+      }
+      expect(
+        s.requests,
+        isEmpty,
+        reason: 'nothing is sent for an invalid address',
+      );
+      expect(
+        await n.login(
+          'root',
+          s.adminPassword,
+          serverUrl: 'https://frp.example.com//',
+        ),
+        isNull,
+      );
+      expect(c.read(sessionProvider).serverUrl, 'https://frp.example.com');
+      expect(s.requests.first.url.origin, 'https://frp.example.com');
+      expect(
+        (await SharedPreferences.getInstance()).getString('server_url'),
+        'https://frp.example.com',
+      );
 
-    // A new container (app restart) picks the remembered address up.
-    final again = await container(s, sameOrigin: false, prefs: {'server_url': 'https://saved.example.com'});
-    expect(again.read(sessionProvider).serverUrl, 'https://saved.example.com');
-    expect(again.read(apiProvider).baseUrl, 'https://saved.example.com');
-    expect(await again.read(sessionProvider.notifier).login('root', s.adminPassword), isNull, reason: 'falls back to the saved address');
-  });
+      // A new container (app restart) picks the remembered address up.
+      final again = await container(
+        s,
+        sameOrigin: false,
+        prefs: {'server_url': 'https://saved.example.com'},
+      );
+      expect(
+        again.read(sessionProvider).serverUrl,
+        'https://saved.example.com',
+      );
+      expect(again.read(apiProvider).baseUrl, 'https://saved.example.com');
+      expect(
+        await again
+            .read(sessionProvider.notifier)
+            .login('root', s.adminPassword),
+        isNull,
+        reason: 'falls back to the saved address',
+      );
+    },
+  );
 
-  test('an expired session logs the user out when any call returns 401', () async {
-    final s = FakeServer();
-    final c = await container(s);
-    await c.read(sessionProvider.notifier).login('root', s.adminPassword);
-    s.loggedIn = false;
-    await expectLater(c.read(apiProvider).clients(), throwsA(isA<ApiException>()));
-    expect(c.read(sessionProvider).status, SessionStatus.anonymous);
-    // Expiring while already anonymous is a no-op.
-    c.read(sessionProvider.notifier).expire();
-    expect(c.read(sessionProvider).status, SessionStatus.anonymous);
-  });
+  test(
+    'an expired session logs the user out when any call returns 401',
+    () async {
+      final s = FakeServer();
+      final c = await container(s);
+      await c.read(sessionProvider.notifier).login('root', s.adminPassword);
+      s.loggedIn = false;
+      await expectLater(
+        c.read(apiProvider).clients(),
+        throwsA(isA<ApiException>()),
+      );
+      expect(c.read(sessionProvider).status, SessionStatus.anonymous);
+      // Expiring while already anonymous is a no-op.
+      c.read(sessionProvider.notifier).expire();
+      expect(c.read(sessionProvider).status, SessionStatus.anonymous);
+    },
+  );
 
   test('navigation and selection state', () async {
     final c = await container(FakeServer());
@@ -108,9 +181,22 @@ void main() {
     expect(c.read(themeModeProvider), ThemeMode.system);
     await c.read(themeModeProvider.notifier).set(ThemeMode.dark);
     expect(c.read(themeModeProvider), ThemeMode.dark);
-    expect((await SharedPreferences.getInstance()).getString('theme_mode'), 'dark');
-    for (final (stored, mode) in [('light', ThemeMode.light), ('dark', ThemeMode.dark), ('x', ThemeMode.system)]) {
-      expect((await container(FakeServer(), prefs: {'theme_mode': stored})).read(themeModeProvider), mode);
+    expect(
+      (await SharedPreferences.getInstance()).getString('theme_mode'),
+      'dark',
+    );
+    for (final (stored, mode) in [
+      ('light', ThemeMode.light),
+      ('dark', ThemeMode.dark),
+      ('x', ThemeMode.system),
+    ]) {
+      expect(
+        (await container(
+          FakeServer(),
+          prefs: {'theme_mode': stored},
+        )).read(themeModeProvider),
+        mode,
+      );
     }
   });
 
@@ -128,7 +214,13 @@ void main() {
 
     final a = c.read(actionsProvider);
     final id = cl['id']! as String;
-    final t = await a.createTunnel(clientId: id, name: 'ssh', localPort: 22, remotePort: 6000, reason: 'r');
+    final t = await a.createTunnel(
+      clientId: id,
+      name: 'ssh',
+      localPort: 22,
+      remotePort: 6000,
+      reason: 'r',
+    );
     expect((await c.read(tunnelsProvider.future)).single.name, 'ssh');
     await a.updateTunnel(t.id, enabled: false, reason: 'r');
     expect((await c.read(tunnelsProvider.future)).single.enabled, isFalse);
@@ -153,17 +245,33 @@ void main() {
     expect((await c.read(nodeProvider.future)).edgePort, 7000);
   });
 
-  test('a failing write surfaces the server message and refreshes nothing', () async {
-    final s = FakeServer(role: 'viewer');
-    final c = await container(s);
-    await c.read(sessionProvider.notifier).login('root', s.adminPassword);
-    final a = c.read(actionsProvider);
-    await expectLater(a.deleteTunnel('x', 'r'), throwsA(isA<ApiException>().having((e) => e.message, 'message', 'insufficient permissions')));
-  });
+  test(
+    'a failing write surfaces the server message and refreshes nothing',
+    () async {
+      final s = FakeServer(role: 'viewer');
+      final c = await container(s);
+      await c.read(sessionProvider.notifier).login('root', s.adminPassword);
+      final a = c.read(actionsProvider);
+      await expectLater(
+        a.deleteTunnel('x', 'r'),
+        throwsA(
+          isA<ApiException>().having(
+            (e) => e.message,
+            'message',
+            'insufficient permissions',
+          ),
+        ),
+      );
+    },
+  );
 
   test('SessionState.copyWith keeps and clears the admin', () {
     const a = Admin(id: '1', name: 'n', role: Role.admin);
-    const s = SessionState(status: SessionStatus.authenticated, admin: a, serverUrl: 'u');
+    const s = SessionState(
+      status: SessionStatus.authenticated,
+      admin: a,
+      serverUrl: 'u',
+    );
     expect(s.copyWith(serverUrl: 'v').admin, a);
     expect(s.copyWith(clearAdmin: true).admin, isNull);
     expect(const SessionState().role, Role.viewer);

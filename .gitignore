@@ -14,3 +14,7 @@ build/
 *.db-shm
 node_modules/
 coverage/
+
+# Generated persistent Edge identities (private keys)
+*.edge-tls/
+*.edge-tls-*.partial/

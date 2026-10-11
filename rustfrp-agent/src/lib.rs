@@ -14,7 +14,16 @@ pub mod app;
 pub mod cli;
 pub mod client;
 pub mod edge;
+pub mod local_control;
 pub mod log;
 pub mod managed;
 pub mod plan;
 pub mod proxy_rt;
+pub mod service;
+
+pub mod metrics;
+pub mod node;
+
+pub mod log_ring;
+
+pub mod convert;

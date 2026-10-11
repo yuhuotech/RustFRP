@@ -53,6 +53,33 @@ pub struct Enroll {
     pub version: String,
 }
 
+/// http 代理的附加选项（frp 的 `locations` / `httpUser` / `httpPassword` / `routeByHTTPUser` / `requestHeaders.set`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HttpOpts {
+    /// 路径前缀；空 = `/`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<String>,
+    /// Basic 认证用户名（Edge 校验）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_user: String,
+    /// Basic 认证密码。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_password: String,
+    /// 同域名同路径下按请求里的 Basic 用户名选路。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route_by_http_user: String,
+    /// 转发前设置（覆盖）的请求头。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+}
+
+impl HttpOpts {
+    /// 全部为默认值（序列化时整体省略，保持旧线格式不变）。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// 受管代理：Controller 下发给 Edge 与 Client 的完整定义。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ManagedProxy {
@@ -75,6 +102,26 @@ pub struct ManagedProxy {
     /// http：改写 Host 头。
     #[serde(default)]
     pub host_header_rewrite: String,
+    /// http：路径 / 认证 / 请求头选项。
+    #[serde(default, skip_serializing_if = "HttpOpts::is_default")]
+    pub http: HttpOpts,
+    /// 连接本地服务时写入 PROXY protocol 头：0 = 不写，1 / 2 = v1 / v2（由客户端写）。
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub proxy_protocol: u8,
+    /// 带宽上限（字节 / 秒，整个代理共享）；0 = 不限。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bandwidth_bps: u64,
+    /// 限速在服务端（Edge）执行；缺省在客户端执行（frp 的 `bandwidthLimitMode`）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bandwidth_server: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
 }
 
 /// 一版受管配置（全量快照；幂等，可重复下发）。
@@ -84,6 +131,13 @@ pub struct ConfigSet {
     pub revision: u64,
     /// 全部代理。
     pub proxies: Vec<ManagedProxy>,
+    /// 远程重启计数：值比会话开始时大，说明管理员要求重启这台设备上的 agent。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub restart_seq: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// 代理注册信息。
@@ -104,6 +158,15 @@ pub struct ProxySpec {
     /// http：把转发给内网服务的 `Host` 头改写成这个值。
     #[serde(default)]
     pub host_header_rewrite: String,
+    /// http：路径 / 认证 / 请求头选项。
+    #[serde(default, skip_serializing_if = "HttpOpts::is_default")]
+    pub http: HttpOpts,
+    /// 带宽上限（字节 / 秒）；0 = 不限。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bandwidth_bps: u64,
+    /// 限速在服务端（Edge）执行。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bandwidth_server: bool,
 }
 
 /// Client → Edge。
@@ -164,6 +227,9 @@ pub struct StartWork {
     pub proxy: String,
     /// 访问者地址。
     pub src: String,
+    /// 访问者连接到的公网地址（PROXY protocol 头的目的地址）。
+    #[serde(default)]
+    pub dst: String,
 }
 
 /// 写一帧。
@@ -272,6 +338,7 @@ mod tests {
                     local_port: 80,
                     ..Default::default()
                 }],
+                ..Default::default()
             }),
             ServerMsg::Pong,
         ];
@@ -282,6 +349,7 @@ mod tests {
         let w = StartWork {
             proxy: "p".into(),
             src: "1.2.3.4:5".into(),
+            dst: String::new(),
         };
         write_frame(&mut a, &w).await.unwrap();
         assert_eq!(read_frame::<_, StartWork>(&mut b).await.unwrap(), w);
@@ -310,6 +378,7 @@ mod tests {
         let big = StartWork {
             proxy: "x".repeat(MAX_FRAME),
             src: String::new(),
+            dst: String::new(),
         };
         assert!(matches!(
             write_frame(&mut a, &big).await,

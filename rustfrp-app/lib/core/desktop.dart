@@ -16,7 +16,8 @@ bool get windowShellActive => debugWindowShell ?? (isDesktop && _initialized);
 @visibleForTesting
 bool? debugWindowShell;
 
-bool get isDesktop => !kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
+bool get isDesktop =>
+    !kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
 
 bool _initialized = false;
 

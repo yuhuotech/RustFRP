@@ -43,6 +43,14 @@ pub struct ProxyCfg {
     pub subdomain: String,
     /// http：改写 Host 头。
     pub host_header_rewrite: String,
+    /// http：路径 / 认证 / 请求头选项。
+    pub http: rustfrp_core::wire::HttpOpts,
+    /// 连接本地服务时写入 PROXY protocol 头：0 = 不写，1 / 2 = v1 / v2。
+    pub proxy_protocol: u8,
+    /// 带宽上限（字节 / 秒），0 = 不限。
+    pub bandwidth_bps: u64,
+    /// 限速由服务端（Edge）执行；否则由本客户端执行。
+    pub bandwidth_server: bool,
 }
 
 /// 首次接入所需信息。
@@ -110,6 +118,12 @@ pub struct ClientConfig {
     pub udp_idle: Duration,
     /// 受管模式（`None` 为独立模式，等价 frpc）。
     pub managed: Option<ManagedCfg>,
+    /// 本机展示的实时计数，不上传控制器重复累计。
+    pub traffic: Arc<pipe::Traffic>,
+    /// 私有本机界面读取的已应用摘要。
+    pub local_tunnels: crate::local_control::TunnelList,
+    /// 受管接入的固定叶证书 SHA256。
+    pub tls_pin: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -133,6 +147,9 @@ impl Default for ClientConfig {
             udp_packet_size: 1500,
             udp_idle: Duration::from_secs(60),
             managed: None,
+            traffic: Arc::default(),
+            local_tunnels: Arc::default(),
+            tls_pin: None,
         }
     }
 }
@@ -168,6 +185,8 @@ pub enum Event {
         /// 代理数量。
         proxies: usize,
     },
+    /// 管理员要求重启这台设备上的 agent。
+    RestartRequested,
     /// 连接断开（随后会重连）。
     Disconnected(String),
 }
@@ -248,7 +267,8 @@ fn build_connector(cfg: &ClientConfig) -> Result<TlsConnector, ClientError> {
         }
         None => None,
     };
-    let conf = tls::client_config(trusted).map_err(|e| ClientError::Config(e.to_string()))?;
+    let conf = tls::client_config_pinned(trusted, cfg.tls_pin.as_deref())
+        .map_err(|e| ClientError::Config(e.to_string()))?;
     Ok(TlsConnector::from(conf))
 }
 
@@ -358,6 +378,9 @@ struct Local {
     kind: String,
     host: String,
     port: u16,
+    proxy_protocol: u8,
+    /// 客户端侧限速（整个代理共享）。
+    limiter: Option<Arc<pipe::Limiter>>,
 }
 
 type Locals = Arc<Mutex<HashMap<String, Local>>>;
@@ -418,6 +441,9 @@ async fn talk(
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
             host_header_rewrite: p.host_header_rewrite.clone(),
+            http: p.http.clone(),
+            bandwidth_bps: p.bandwidth_bps,
+            bandwidth_server: p.bandwidth_server,
         };
         if let Err(e) = write_frame(&mut wr, &ClientMsg::NewProxy(spec)).await {
             return lost(e.to_string(), true);
@@ -443,6 +469,8 @@ async fn talk(
                             kind: p.kind.clone(),
                             host: p.local_ip.clone(),
                             port: p.local_port,
+                            proxy_protocol: p.proxy_protocol,
+                            limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server),
                         },
                     );
                 emit(events, Event::ProxyStarted { name, remote_port });
@@ -470,6 +498,8 @@ async fn talk(
     let mut tick = tokio::time::interval(cfg.heartbeat_interval);
     tick.tick().await;
     let mut deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout;
+    // 本次会话里第一次见到的重启计数作为基线：之后变大才表示有新的重启请求。
+    let mut restart_baseline: Option<u64> = None;
     let end = loop {
         tokio::select! {
             _ = cancel.cancelled() => break SessionEnd::Cancelled,
@@ -482,7 +512,16 @@ async fn talk(
             msg = pong_rx.recv() => match msg {
                 Some(Ok(ServerMsg::Pong)) => deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout,
                 Some(Ok(ServerMsg::Config(set))) => {
-                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port })).collect();
+                    match restart_baseline {
+                        None => restart_baseline = Some(set.restart_seq),
+                        Some(base) if set.restart_seq > base => {
+                            restart_baseline = Some(set.restart_seq);
+                            emit(events, Event::RestartRequested);
+                        }
+                        Some(_) => {}
+                    }
+                    if let Err(e) = crate::local_control::update_tunnels(&cfg.local_tunnels,&set) { break lost(e.into(),true); }
+                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server) })).collect();
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
                     emit(events, Event::ConfigApplied { revision: set.revision, proxies: set.proxies.len() });
                     if let Err(e) = write_frame(&mut wr, &ClientMsg::Applied { revision: set.revision }).await {
@@ -507,6 +546,11 @@ async fn talk(
         }
     };
     reader.abort();
+    cfg.local_tunnels
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .1
+        .clear();
     end
 }
 
@@ -536,8 +580,30 @@ async fn handle_work(
     })
     .await?;
     let _ = local.set_nodelay(true);
-    pipe::relay(&mut stream, &mut local).await?;
+    // PROXY protocol：把访问者的真实地址交给内网服务（头不计入流量）。
+    if let Some(h) = rustfrp_core::proxyproto::header(t.proxy_protocol, &start.src, &start.dst) {
+        tokio::io::AsyncWriteExt::write_all(&mut local, &h).await?;
+    }
+    match t.limiter {
+        Some(l) => {
+            let mut s = pipe::Limited::new(stream, l.clone());
+            let mut loc = pipe::Limited::new(local, l);
+            pipe::relay_counted(&mut s, &mut loc, &cfg.traffic).await?;
+        }
+        None => {
+            pipe::relay_counted(&mut stream, &mut local, &cfg.traffic).await?;
+        }
+    }
     Ok(())
+}
+
+/// 客户端侧限速器：服务端限速的代理不在这里限。
+fn client_limiter(bps: u64, server_side: bool) -> Option<Arc<pipe::Limiter>> {
+    if server_side {
+        None
+    } else {
+        pipe::Limiter::new(bps)
+    }
 }
 
 /// UDP：一条流对应一个访问者；数据报在流上用「长度 + 载荷」封装，本地一侧是一个已 connect 的 UDP 套接字。
@@ -553,12 +619,16 @@ async fn udp_work(stream: Stream, t: &Local, cfg: &ClientConfig) -> Result<(), T
     };
     let sock = Arc::new(UdpSocket::bind(bind).await?);
     sock.connect(target).await?;
+    let _connection = cfg.traffic.connection();
+    let traffic = cfg.traffic.clone();
     let (mut rd, mut wr) = tokio::io::split(stream);
     let out = sock.clone();
     let mut upstream = tokio::spawn(async move {
         let mut buf = Vec::new();
         while let Ok(Some(_)) = read_datagram(&mut rd, &mut buf).await {
-            let _ = out.send(&buf).await;
+            if let Ok(n) = out.send(&buf).await {
+                traffic.record_in(n as u64);
+            }
         }
     });
     let mut buf = vec![0u8; cfg.udp_packet_size.max(512)];
@@ -572,6 +642,7 @@ async fn udp_work(stream: Stream, t: &Local, cfg: &ClientConfig) -> Result<(), T
                     if let Err(e) = write_datagram(&mut wr, buf.get(..n).unwrap_or(&[])).await {
                         break Err(e);
                     }
+                    cfg.traffic.record_out(n as u64);
                 }
             }
         }

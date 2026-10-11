@@ -91,6 +91,31 @@ impl DeviceKey {
     }
 }
 
+impl DeviceKey {
+    /// 对「挑战 + 身份」签名（节点登录用：挑战由 Controller 现场生成，签名无法被重放）。
+    pub fn sign_challenge(&self, id: &str, challenge: &str) -> String {
+        to_hex(
+            self.pair
+                .sign(challenge_payload(id, challenge).as_bytes())
+                .as_ref(),
+        )
+    }
+}
+
+fn challenge_payload(id: &str, challenge: &str) -> String {
+    format!("rustfrp-node:{id}:{challenge}")
+}
+
+/// 验证挑战签名。
+pub fn verify_challenge(public_hex: &str, id: &str, challenge: &str, signature_hex: &str) -> bool {
+    let (Some(public), Some(sig)) = (from_hex(public_hex), from_hex(signature_hex)) else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, public)
+        .verify(challenge_payload(id, challenge).as_bytes(), &sig)
+        .is_ok()
+}
+
 fn login_payload(client_id: &str, timestamp: i64) -> String {
     format!("rustfrp-login:{client_id}:{timestamp}")
 }
@@ -148,6 +173,38 @@ mod tests {
         assert!(!verify_login(&k.public_hex(), "cid", now + 1, &sig, now));
         let other = DeviceKey::generate().unwrap();
         assert!(!verify_login(&other.public_hex(), "cid", now, &sig, now));
+    }
+
+    #[test]
+    fn challenge_signatures_bind_identity_and_nonce() {
+        let k = DeviceKey::generate().unwrap();
+        let sig = k.sign_challenge("node-1", "nonce-a");
+        assert!(verify_challenge(&k.public_hex(), "node-1", "nonce-a", &sig));
+        assert!(!verify_challenge(
+            &k.public_hex(),
+            "node-2",
+            "nonce-a",
+            &sig
+        ));
+        assert!(!verify_challenge(
+            &k.public_hex(),
+            "node-1",
+            "nonce-b",
+            &sig
+        ));
+        assert!(!verify_challenge(
+            &DeviceKey::generate().unwrap().public_hex(),
+            "node-1",
+            "nonce-a",
+            &sig
+        ));
+        assert!(!verify_challenge("zz", "node-1", "nonce-a", &sig));
+        assert!(!verify_challenge(
+            &k.public_hex(),
+            "node-1",
+            "nonce-a",
+            "xyz"
+        ));
     }
 
     #[test]

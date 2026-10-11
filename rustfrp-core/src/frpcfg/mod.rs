@@ -8,6 +8,7 @@ pub mod complete;
 pub mod env;
 pub mod error;
 pub mod export;
+pub mod ini;
 pub mod load;
 pub mod strict;
 pub mod template;

@@ -50,6 +50,8 @@ async fn rig_with(cfg: Config) -> Rig {
         hub: hub.clone(),
         cfg: Arc::new(cfg),
         limiter: Arc::new(LoginLimiter::new(5, 600_000)),
+        metrics: Arc::default(),
+        logs: Arc::default(),
     };
     Rig {
         app: router(state),
@@ -501,6 +503,34 @@ async fn overview_and_node() {
             v["clients_online"].as_i64()
         ),
         (Some(1), Some(0))
+    );
+    // 进程指标与近 24 小时流量（只统计窗口内的分钟桶）。
+    assert!(v["process"]["uptime_seconds"].is_u64());
+    assert!(v["process"].get("rss_bytes").is_some());
+    assert_eq!(v["traffic_24h"]["bytes_in"], 0);
+    let now = store::now_ms();
+    r.db.call(move |c| {
+        for (minute, bin, bout) in [
+            (now - 60_000, 100, 10),
+            (now - 3 * 3_600_000, 5, 1),
+            (now - 25 * 3_600_000, 1_000, 1_000),
+        ] {
+            c.execute(
+                "INSERT INTO traffic_minutes VALUES ('t', ?1, ?2, ?3, 0, 0, 1, 0)",
+                rusqlite::params![minute, bin, bout],
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (_, v) = r.get("/api/v1/overview", &s).await;
+    assert_eq!(
+        (
+            v["traffic_24h"]["bytes_in"].as_i64(),
+            v["traffic_24h"]["bytes_out"].as_i64()
+        ),
+        (Some(105), Some(11))
     );
     let (_, v) = r.get("/api/v1/node", &s).await;
     assert_eq!(
@@ -1099,4 +1129,1283 @@ async fn udp_and_web_tunnels_via_api() {
             "{v}"
         );
     }
+}
+
+#[tokio::test]
+async fn installers_available_without_login_or_panel() {
+    let rig = rig().await;
+    for (path, marker) in [
+        ("/install.sh", "#!/bin/sh"),
+        ("/install.ps1", "function Install-RustFrp"),
+    ] {
+        let response = rig
+            .app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with(marker));
+        assert!(text.contains("SHA256"));
+    }
+}
+
+#[tokio::test]
+async fn traffic_history_requires_auth_and_bounds_queries() {
+    use rustfrp_agent::metrics::Sample;
+    use rustfrp_core::pipe::TrafficSnapshot;
+    let r = rig().await;
+    assert_eq!(
+        r.req(Method::GET, "/api/v1/traffic", None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let viewer = r.admin("traffic-viewer", Role::Viewer).await;
+    assert_eq!(
+        r.get("/api/v1/traffic?hours=23", &viewer).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.get("/api/v1/traffic?tunnel_id=missing", &viewer).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let client = r.client("traffic-device").await;
+    let client_id = client.clone();
+    let id =
+        r.db.call(move |c| {
+            Ok(store::create_tunnel(
+                c,
+                &store::NewTunnel {
+                    client_id: client,
+                    name: "traffic".into(),
+                    kind: "tcp".into(),
+                    local_ip: "127.0.0.1".into(),
+                    local_port: 80,
+                    enabled: true,
+                    ..Default::default()
+                },
+                store::now_ms(),
+            )?
+            .id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        r.get("/api/v1/traffic?client_id=missing", &viewer).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let sample_id = id.clone();
+    r.db.call(move |c| {
+        rustfrp_server::traffic::persist(
+            c,
+            "api-test",
+            store::now_ms(),
+            &[Sample {
+                name: sample_id,
+                generation: 0,
+                traffic: TrafficSnapshot {
+                    bytes_in: 19,
+                    bytes_out: 23,
+                    connections: 1,
+                    connections_total: 1,
+                },
+            }],
+        )
+    })
+    .await
+    .unwrap();
+    let (status, result) = r
+        .get(&format!("/api/v1/traffic?tunnel_id={id}"), &viewer)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let filtered = r
+        .get(
+            &format!("/api/v1/traffic?client_id={client_id}&tunnel_id={id}"),
+            &viewer,
+        )
+        .await;
+    assert_eq!(filtered.1["items"], result["items"]);
+    assert!(result["window_end"].as_i64().is_some());
+    assert_eq!(result["range_hours"], 24);
+    assert_eq!(result["items"][0]["bytes_in"], 19);
+    assert_eq!(result["items"][0]["bytes_out"], 23);
+    assert_eq!(result["items"][0]["gap"], true);
+    assert_eq!(
+        r.get("/api/v1/traffic?hours=168", &viewer).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.get("/api/v1/overview", &viewer).await.1["traffic"]["connections"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn batch_tunnels_are_authorized_bounded_and_atomic() {
+    let r = rig().await;
+    let operator = r.admin("batch-op", Role::Operator).await;
+    let viewer = r.admin("batch-view", Role::Viewer).await;
+    let client = r.client("batch-client").await;
+    let ids =
+        r.db.call(move |c| {
+            let mut ids = vec![];
+            for n in 0..2 {
+                ids.push(
+                    store::create_tunnel(
+                        c,
+                        &store::NewTunnel {
+                            client_id: client.clone(),
+                            name: format!("batch-{n}"),
+                            kind: "tcp".into(),
+                            local_ip: "localhost".into(),
+                            local_port: 22,
+                            enabled: true,
+                            ..Default::default()
+                        },
+                        store::now_ms(),
+                    )?
+                    .id,
+                );
+            }
+            Ok(ids)
+        })
+        .await
+        .unwrap();
+    let path = "/api/v1/tunnels/batch";
+    assert_eq!(
+        r.send(
+            Method::POST,
+            path,
+            &viewer,
+            json!({"ids":ids,"enabled":false,"reason":"test"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    for list in [
+        vec![],
+        vec![ids[0].clone(); 2],
+        vec!["x".into(); 101],
+        vec!["x".repeat(65)],
+        vec!["".into()],
+    ] {
+        assert_eq!(
+            r.send(
+                Method::POST,
+                path,
+                &operator,
+                json!({"ids":list,"enabled":false,"reason":"test"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        r.send(
+            Method::POST,
+            path,
+            &operator,
+            json!({"ids":ids,"enabled":false})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.send(
+            Method::POST,
+            path,
+            &operator,
+            json!({"ids":[ids[0],"missing"],"enabled":false,"reason":"test"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let first = ids[0].clone();
+    assert!(r
+        .db
+        .call(move |c| Ok(store::get_tunnel(c, &first)?.enabled))
+        .await
+        .unwrap());
+    r.db.call(|c|{c.execute_batch("CREATE TRIGGER deny_batch BEFORE INSERT ON audit_log WHEN NEW.action='tunnel.batch' BEGIN SELECT RAISE(ABORT,'test'); END;")?;Ok(())}).await.unwrap();
+    assert_ne!(
+        r.send(
+            Method::POST,
+            path,
+            &operator,
+            json!({"ids":ids,"enabled":false,"reason":"test"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let first = ids[0].clone();
+    assert!(r
+        .db
+        .call(move |c| Ok(store::get_tunnel(c, &first)?.enabled))
+        .await
+        .unwrap());
+    r.db.call(|c| {
+        c.execute_batch("DROP TRIGGER deny_batch")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let result = r
+        .send(
+            Method::POST,
+            path,
+            &operator,
+            json!({"ids":ids,"enabled":false,"reason":"batch off"}),
+        )
+        .await;
+    assert_eq!(result.0, StatusCode::OK);
+    assert_eq!(result.1["updated"], 2);
+    assert!(r
+        .db
+        .call(|c| Ok(store::list_tunnels(c, None)?.iter().all(|t| !t.enabled)))
+        .await
+        .unwrap());
+    assert_eq!(
+        r.audit_actions()
+            .await
+            .iter()
+            .filter(|a| *a == "tunnel.batch")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn automation_tokens_scopes_revocation_and_cookie_conflict() {
+    let r = rig().await;
+    let owner = r.admin("automation", Role::Owner).await;
+    let viewer = r.admin("auto-view", Role::Viewer).await;
+    let path = "/api/v1/api-tokens";
+    assert_eq!(
+        r.send(
+            Method::POST,
+            path,
+            &viewer,
+            json!({"name":"x","scope":"read","days":1,"reason":"test"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    for (scope, days) in [("unknown", 1), ("read", 0), ("read", 366)] {
+        assert_eq!(
+            r.send(
+                Method::POST,
+                path,
+                &owner,
+                json!({"name":"x","scope":scope,"days":days,"reason":"test"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    async fn bearer(
+        r: &Rig,
+        method: Method,
+        path: &str,
+        token: &str,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "panel.test")
+            .header(header::AUTHORIZATION, token)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        if let Some(cookie) = cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        r.app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+    let (status, result) = r
+        .send(
+            Method::POST,
+            path,
+            &owner,
+            json!({"name":"CI","scope":"read","days":1,"reason":"test"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = result["token"].as_str().unwrap();
+    let auth = format!("Bearer {token}");
+    let id = result["info"]["id"].as_str().unwrap();
+    assert_eq!(r.get(path, &owner).await.1[0]["name"], "CI");
+    assert!(r.get(path, &owner).await.1[0].get("token_hash").is_none());
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/overview",
+            &auth,
+            None,
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/auth/me",
+            &auth,
+            None,
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/api-tokens",
+            &auth,
+            None,
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::POST,
+            "/api/v1/tunnels/batch",
+            &auth,
+            None,
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/overview",
+            &auth,
+            Some("https://evil.test"),
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/overview",
+            "Bearer invalid",
+            None,
+            Some(&owner.cookie),
+            json!({})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("{path}/{id}/revoke"),
+            &owner,
+            json!({"reason":"retire"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        bearer(
+            &r,
+            Method::GET,
+            "/api/v1/overview",
+            &auth,
+            None,
+            None,
+            json!({})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("{path}/missing/revoke"),
+            &owner,
+            json!({"reason":"retire"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let client = r.client("token-client").await;
+    let id =
+        r.db.call(move |c| {
+            Ok(store::create_tunnel(
+                c,
+                &store::NewTunnel {
+                    client_id: client,
+                    name: "token".into(),
+                    kind: "tcp".into(),
+                    local_ip: "localhost".into(),
+                    local_port: 22,
+                    enabled: true,
+                    ..Default::default()
+                },
+                store::now_ms(),
+            )?
+            .id)
+        })
+        .await
+        .unwrap();
+    for scope in ["tunnels", "admin"] {
+        let result = r
+            .send(
+                Method::POST,
+                path,
+                &owner,
+                json!({"name":scope,"scope":scope,"days":1,"reason":"test"}),
+            )
+            .await
+            .1;
+        let auth = format!("Bearer {}", result["token"].as_str().unwrap());
+        assert_eq!(
+            bearer(
+                &r,
+                Method::POST,
+                "/api/v1/tunnels/batch",
+                &auth,
+                None,
+                None,
+                json!({"ids":[id],"enabled":false,"reason":"automation"})
+            )
+            .await,
+            StatusCode::OK
+        );
+        if scope == "tunnels" {
+            assert_eq!(
+                bearer(
+                    &r,
+                    Method::POST,
+                    "/api/v1/enroll-tokens",
+                    &auth,
+                    None,
+                    None,
+                    json!({})
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            bearer(
+                &r,
+                Method::GET,
+                "/api/v1/overview",
+                &auth,
+                Some("http://panel.test"),
+                None,
+                json!({})
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn controller_logs_require_admin_and_remain_bounded() {
+    let r = rig().await;
+    let admin = r.admin("logs-admin", Role::Admin).await;
+    let viewer = r.admin("logs-viewer", Role::Viewer).await;
+    assert_eq!(
+        r.get("/api/v1/logs", &viewer).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let result = r.get("/api/v1/logs", &admin).await;
+    assert_eq!(result.0, StatusCode::OK);
+    assert_eq!(result.1["capacity"], 128);
+    assert_eq!(result.1["items"], json!([]));
+}
+
+#[tokio::test]
+async fn managed_config_transfer_requires_preview_digest_and_roundtrips_supported_tunnels() {
+    let r = rig().await;
+    let admin = r.admin("importer", Role::Owner).await;
+    let client = r.client("import-client").await;
+    let text="serverAddr='ignored'\nserverPort=7000\n[[proxies]]\nname='ssh'\ntype='tcp'\nlocalIP='127.0.0.1'\nlocalPort=22\nremotePort=6000\n";
+    let preview = r
+        .send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/preview"),
+            &admin,
+            json!({"text":text}),
+        )
+        .await;
+    assert_eq!(preview.0, StatusCode::OK);
+    assert_eq!(preview.1["changes"][0]["name"], "ssh");
+    let digest = preview.1["digest"].as_str().unwrap();
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/import"),
+            &admin,
+            json!({"text":text,"digest":"bad","accept_warnings":true,"reason":"import"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/import"),
+            &admin,
+            json!({"text":text,"digest":digest,"accept_warnings":false,"reason":"import"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let imported = r
+        .send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/import"),
+            &admin,
+            json!({"text":text,"digest":digest,"accept_warnings":true,"reason":"import"}),
+        )
+        .await;
+    assert_eq!(imported.0, StatusCode::OK);
+    assert_eq!(imported.1["updated"], 1);
+    let export = r
+        .get(&format!("/api/v1/clients/{client}/config/export"), &admin)
+        .await;
+    assert_eq!(export.0, StatusCode::OK);
+    assert!(export.1["text"].as_str().unwrap().contains("serverAddr"));
+    let bad = "[common]";
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/preview"),
+            &admin,
+            json!({"text":bad})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let huge = "x".repeat(1024 * 1024 + 1);
+    assert_eq!(
+        r.send(
+            Method::POST,
+            &format!("/api/v1/clients/{client}/config/preview"),
+            &admin,
+            json!({"text":huge})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn admin_management_is_owner_only_audited_and_keeps_an_owner() {
+    let r = rig().await;
+    let owner = r.admin("boss", Role::Owner).await;
+    let admin = r.admin("adm", Role::Admin).await;
+    let new = |name: &str, role: &str, pw: &str, why: &str| json!({"name": name, "role": role, "password": pw, "reason": why});
+
+    // 非 owner 不能创建；owner 需理由、强密码、合法角色。
+    let body = new("ops", "operator", PASSWORD, "onboard");
+    assert_eq!(
+        r.send(Method::POST, "/api/v1/admins", &admin, body.clone())
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    for bad in [
+        new("ops", "operator", PASSWORD, ""),
+        new("ops", "operator", "short", "r"),
+        new("", "operator", PASSWORD, "r"),
+    ] {
+        assert_eq!(
+            r.send(Method::POST, "/api/v1/admins", &owner, bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        r.send(
+            Method::POST,
+            "/api/v1/admins",
+            &owner,
+            json!({"name":"x","role":"god","password":PASSWORD,"reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let (st, v) = r
+        .send(Method::POST, "/api/v1/admins", &owner, body.clone())
+        .await;
+    assert_eq!(
+        (st, v["role"].as_str()),
+        (StatusCode::CREATED, Some("operator"))
+    );
+    assert!(!v.to_string().contains("password"));
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        r.send(Method::POST, "/api/v1/admins", &owner, body).await.0,
+        StatusCode::CONFLICT
+    );
+
+    // 修改：空修改 / 缺理由 / 弱密码 / 未知 ID。
+    let path = format!("/api/v1/admins/{id}");
+    for (b, want) in [
+        (json!({"reason":"r"}), StatusCode::BAD_REQUEST),
+        (json!({"role":"admin"}), StatusCode::BAD_REQUEST),
+        (
+            json!({"password":"short","reason":"r"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(r.send(Method::PATCH, &path, &owner, b).await.0, want);
+    }
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            "/api/v1/admins/missing",
+            &owner,
+            json!({"role":"admin","reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            &path,
+            &admin,
+            json!({"role":"admin","reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &owner,
+            json!({"role":"viewer","disabled":true,"password":"another long pass","reason":"offboard"}),
+        )
+        .await;
+    assert_eq!((st, v["role"].as_str()), (StatusCode::OK, Some("viewer")));
+    assert!(v["disabled_at"].is_i64());
+
+    // 不能改自己的角色 / 状态；最后一个 owner 受保护（经第二个 owner 验证）。
+    let own =
+        r.db.call(|c| store::list_admins(c))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "boss")
+            .unwrap();
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            &format!("/api/v1/admins/{}", own.id),
+            &owner,
+            json!({"disabled":true,"reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    // 改自己的密码是允许的（只有角色 / 状态不行）。
+    let (st, _) = r
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/admins/{}", own.id),
+            &owner,
+            json!({"password":"a brand new password","reason":"rotate"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let second = r.admin("boss2", Role::Owner).await;
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/admins/{}", own.id),
+            &second,
+            json!({"role":"admin","reason":"handover"}),
+        )
+        .await;
+    assert_eq!((st, v["role"].as_str()), (StatusCode::OK, Some("admin")));
+    let boss2 =
+        r.db.call(|c| store::list_admins(c))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "boss2")
+            .unwrap();
+    // boss2 现在是唯一的 owner：另一位 owner 不存在，无法再降级（自改已被拒绝，改用新建 owner 路径验证 409）。
+    assert_eq!(boss2.role, Role::Owner);
+    let acts = r.audit_actions().await;
+    assert_eq!(acts.iter().filter(|a| *a == "admin.create").count(), 1);
+    assert_eq!(acts.iter().filter(|a| *a == "admin.update").count(), 3);
+}
+
+#[tokio::test]
+async fn reserved_ports_and_tunnel_quota_are_enforced_atomically() {
+    let r = rig_with(Config {
+        reserved_ports: vec![(6010, 6010)],
+        max_tunnels_per_client: 2,
+        ..Config::default()
+    })
+    .await;
+    let s = r.admin("o", Role::Operator).await;
+    let cid = r.client("c1").await;
+    let make = |name: &str, remote: i64| json!({"client_id": cid, "name": name, "local_port": 22, "remote_port": remote, "reason": "t"});
+    let (st, v) = r
+        .send(Method::POST, "/api/v1/tunnels", &s, make("a", 6010))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("reserved"));
+    for (n, p) in [("a", 6011), ("b", 6012)] {
+        assert_eq!(
+            r.send(Method::POST, "/api/v1/tunnels", &s, make(n, p))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+    let (st, v) = r
+        .send(Method::POST, "/api/v1/tunnels", &s, make("c", 6013))
+        .await;
+    assert_eq!((st, err_code(&v)), (StatusCode::CONFLICT, "conflict"));
+    // 超限的创建整体回滚：没有多出的隧道，也没有「成功」审计。
+    let (_, list) = r.get("/api/v1/tunnels", &s).await;
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    let creates = r
+        .audit_actions()
+        .await
+        .iter()
+        .filter(|a| *a == "tunnel.create")
+        .count();
+    assert_eq!(creates, 2);
+}
+
+#[tokio::test]
+async fn http_options_via_rest_hide_the_password_and_exports_need_admin() {
+    let r = rig_with(Config {
+        vhost_http: Some(8080),
+        ..Config::default()
+    })
+    .await;
+    let op = r.admin("o", Role::Operator).await;
+    let admin = r.admin("a", Role::Admin).await;
+    let cid = r.client("c1").await;
+    let (st, v) = r
+        .send(
+            Method::POST,
+            "/api/v1/tunnels",
+            &op,
+            json!({
+                "client_id": cid, "name": "web", "kind": "http", "local_port": 80,
+                "custom_domains": ["a.example.com"],
+                "locations": ["/api"], "http_user": "alice", "http_password": "s3cret",
+                "route_by_http_user": "", "request_headers": {"X-Env": "prod"},
+                "reason": "t"
+            }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert!(!v.to_string().contains("s3cret"), "{v}");
+    assert_eq!(
+        (
+            v["http_user"].as_str(),
+            v["http_password_set"].as_bool(),
+            v["locations"][0].as_str()
+        ),
+        (Some("alice"), Some(true), Some("/api"))
+    );
+    let id = v["id"].as_str().unwrap().to_string();
+    // 列表与详情同样不含密码。
+    let (_, list) = r.get("/api/v1/tunnels", &op).await;
+    assert!(!list.to_string().contains("s3cret"));
+    // 不带 http_password 的修改保持原密码；非法选项被拒绝。
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/tunnels/{id}"),
+            &op,
+            json!({"http_user":"bob","reason":"t"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["http_password_set"].as_bool()),
+        (StatusCode::OK, Some(true))
+    );
+    let (st, _) = r
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/tunnels/{id}"),
+            &op,
+            json!({"locations":["bad"],"reason":"t"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 导出含 Basic 认证密码，因此需要管理员。
+    let path = format!("/api/v1/clients/{cid}/config/export");
+    assert_eq!(r.get(&path, &op).await.0, StatusCode::FORBIDDEN);
+    let (st, v) = r.get(&path, &admin).await;
+    assert_eq!(st, StatusCode::OK);
+    let text = v["text"].as_str().unwrap();
+    assert!(
+        text.contains("httpPassword = \"s3cret\"") && text.contains("httpUser = \"bob\""),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn nodes_tokens_and_lifecycle_via_rest() {
+    let r = rig_with(Config {
+        public_host: "ctl.example.com".into(),
+        node_addr: "0.0.0.0:7200".into(),
+        edge_tls_fingerprint: "a".repeat(64),
+        ..Config::default()
+    })
+    .await;
+    let viewer = r.admin("v", Role::Viewer).await;
+    let admin = r.admin("a", Role::Admin).await;
+
+    // 内置节点总在列表第一位；外置节点为空时只有它。
+    let (st, v) = r.get("/api/v1/nodes", &viewer).await;
+    assert_eq!((st, v.as_array().unwrap().len()), (StatusCode::OK, 1));
+    assert_eq!(
+        (
+            v[0]["builtin"].as_bool(),
+            v[0]["id"].as_str(),
+            v[0]["online"].as_bool()
+        ),
+        (Some(true), Some(""), Some(true))
+    );
+
+    // 接入新节点：只有 Admin；命令里带节点端口与指纹，令牌明文只出现一次。
+    let body = json!({"name": "edge-1", "kind": "node", "reason": "add node"});
+    assert_eq!(
+        r.send(Method::POST, "/api/v1/enroll-tokens", &viewer, body.clone())
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (st, v) = r
+        .send(Method::POST, "/api/v1/enroll-tokens", &admin, body)
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["kind"], "node");
+    let direct = v["commands"]["direct"].as_str().unwrap();
+    assert!(
+        direct.contains("--mode edge") && direct.contains("ctl.example.com:7200"),
+        "{direct}"
+    );
+    assert!(
+        direct.contains(&"a".repeat(64)) && direct.contains("--public-host"),
+        "{direct}"
+    );
+    let (_, list) = r.get("/api/v1/enroll-tokens", &admin).await;
+    assert!(!list.to_string().contains(v["token"].as_str().unwrap()));
+    assert_eq!(list[0]["kind"], "node");
+    // 节点端口未启用时拒绝；未知 kind 拒绝。
+    let off = rig().await;
+    let a2 = off.admin("a", Role::Admin).await;
+    let (st, v) = off
+        .send(
+            Method::POST,
+            "/api/v1/enroll-tokens",
+            &a2,
+            json!({"name":"x","kind":"node","reason":"r"}),
+        )
+        .await;
+    assert_eq!(
+        (
+            st,
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("RUSTFRP_NODE_ADDR")
+        ),
+        (StatusCode::BAD_REQUEST, true)
+    );
+    for bad in [
+        json!({"name":"x","kind":"weird","reason":"r"}),
+        json!({"name":"x","node_id":"missing","reason":"r"}),
+    ] {
+        let (st, _) = r
+            .send(Method::POST, "/api/v1/enroll-tokens", &admin, bad)
+            .await;
+        assert!(
+            st == StatusCode::BAD_REQUEST || st == StatusCode::NOT_FOUND,
+            "{st}"
+        );
+    }
+
+    // 外置节点（直接入库模拟已接入）：列表、设备令牌指向该节点、改名 / 停用 / 删除保护。
+    let info = rustfrp_core::node::NodeInfo {
+        public_host: "edge.example.com".into(),
+        edge_port: 7000,
+        tls_fingerprint: "b".repeat(64),
+        ..Default::default()
+    };
+    let key = "cd".repeat(32);
+    r.db.call(move |c| store::create_node(c, "n1", "edge-1", &key, &info, 1))
+        .await
+        .unwrap();
+    let (_, v) = r.get("/api/v1/nodes", &viewer).await;
+    assert_eq!(
+        (
+            v.as_array().unwrap().len(),
+            v[1]["id"].as_str(),
+            v[1]["online"].as_bool()
+        ),
+        (2, Some("n1"), Some(false))
+    );
+    let (st, v) = r
+        .send(
+            Method::POST,
+            "/api/v1/enroll-tokens",
+            &admin,
+            json!({"name":"laptop","node_id":"n1","reason":"r"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let direct = v["commands"]["direct"].as_str().unwrap();
+    assert!(
+        direct.contains("edge.example.com:7000") && direct.contains(&"b".repeat(64)),
+        "{direct}"
+    );
+    // 还没上报过对外主机名的节点不能生成设备命令。
+    r.db.call(|c| {
+        store::create_node(c, "n2", "bare", &"ef".repeat(32), &Default::default(), 1)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (st, _) = r
+        .send(
+            Method::POST,
+            "/api/v1/enroll-tokens",
+            &admin,
+            json!({"name":"x","node_id":"n2","reason":"r"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            "/api/v1/nodes/n1",
+            &viewer,
+            json!({"name":"x","reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    for bad in [
+        json!({"reason":"r"}),
+        json!({"name":"x"}),
+        json!({"name":"","reason":"r"}),
+    ] {
+        assert_eq!(
+            r.send(Method::PATCH, "/api/v1/nodes/n1", &admin, bad)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            "/api/v1/nodes/nope",
+            &admin,
+            json!({"name":"x","reason":"r"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            "/api/v1/nodes/n1",
+            &admin,
+            json!({"name":"renamed","disabled":true,"reason":"maintenance"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["name"].as_str(), v["disabled_at"].is_i64()),
+        (StatusCode::OK, Some("renamed"), true)
+    );
+    // 仍有设备时不能删。
+    let cid = r.client("c1").await;
+    let c2 = cid.clone();
+    r.db.call(move |c| store::set_client_node(c, &c2, "n1"))
+        .await
+        .unwrap();
+    let (st, v) = r
+        .send(
+            Method::DELETE,
+            "/api/v1/nodes/n1?reason=bye",
+            &admin,
+            json!({}),
+        )
+        .await;
+    assert_eq!((st, err_code(&v)), (StatusCode::CONFLICT, "conflict"));
+    r.db.call(move |c| store::delete_client(c, &cid, 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.send(
+            Method::DELETE,
+            "/api/v1/nodes/n1?reason=bye",
+            &admin,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.send(
+            Method::DELETE,
+            "/api/v1/nodes/n1?reason=bye",
+            &admin,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let acts = r.audit_actions().await;
+    for a in ["node_token.create", "node.update", "node.delete"] {
+        assert!(acts.iter().any(|x| x == a), "{a}: {acts:?}");
+    }
+}
+
+#[tokio::test]
+async fn client_tags_and_remote_restart_are_validated_and_audited() {
+    let r = rig().await;
+    let admin = r.admin("a", Role::Admin).await;
+    let op = r.admin("o", Role::Operator).await;
+    let cid = r.client("c1").await;
+    let path = format!("/api/v1/clients/{cid}");
+    // 标签：去重 / 校验；Operator 无权修改。
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &admin,
+            json!({"tags": ["prod", " web ", "prod"], "reason": "label"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["tags"].as_array().unwrap().len()),
+        (StatusCode::OK, 2)
+    );
+    let (_, v) = r.get(&path, &op).await;
+    assert_eq!(v["tags"][1], "web");
+    assert_eq!(
+        r.send(
+            Method::PATCH,
+            &path,
+            &op,
+            json!({"tags": ["x"], "reason": "r"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    for bad in [
+        json!({"tags": [""], "reason": "r"}),
+        json!({"tags": (0..9).map(|i| format!("t{i}")).collect::<Vec<_>>(), "reason": "r"}),
+    ] {
+        assert_eq!(
+            r.send(Method::PATCH, &path, &admin, bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // 远程重启：只对在线设备有意义，需要理由与 Admin。
+    let restart = format!("{path}/restart");
+    assert_eq!(
+        r.send(Method::POST, &restart, &op, json!({"reason": "r"}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (st, v) = r
+        .send(Method::POST, &restart, &admin, json!({"reason": "r"}))
+        .await;
+    assert_eq!(
+        (st, err_code(&v)),
+        (StatusCode::CONFLICT, "conflict"),
+        "offline device"
+    );
+    assert_eq!(
+        r.send(Method::POST, &restart, &admin, json!({"reason": ""}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    // 让设备「在线」（经 Hub 的节点上报路径），再请求重启。
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (c2, node) = (cid.clone(), "n1".to_string());
+    r.db.call(move |c| {
+        let info = rustfrp_core::node::NodeInfo::default();
+        store::create_node(c, &node, "edge", &"ab".repeat(32), &info, 1)?;
+        store::set_client_node(c, &c2, "n1")
+    })
+    .await
+    .unwrap();
+    r.hub.node_attach("n1", tx);
+    r.hub.node_client_state("n1", &cid, true).await;
+    let (st, v) = r
+        .send(Method::POST, &restart, &admin, json!({"reason": "upgrade"}))
+        .await;
+    assert_eq!((st, v["ok"].as_bool()), (StatusCode::OK, Some(true)));
+    let seq =
+        r.db.call({
+            let cid = cid.clone();
+            move |c| Ok(store::managed_config(c, &cid)?.restart_seq)
+        })
+        .await
+        .unwrap();
+    assert_eq!(seq, 1);
+    assert!(r
+        .audit_actions()
+        .await
+        .iter()
+        .any(|a| a == "client.restart"));
+}
+
+#[tokio::test]
+async fn prometheus_metrics_are_opt_in_and_authenticated() {
+    // 默认不提供。
+    let off = rig().await;
+    let (st, _, _) = off.req(Method::GET, "/metrics", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // 配置了令牌：缺少 / 错误的令牌拒绝，正确的返回文本格式。
+    let on = rig_with(Config {
+        metrics_token: "0123456789abcdef0123".into(),
+        ..Config::default()
+    })
+    .await;
+    let scrape = |auth: Option<&'static str>| {
+        let app = on.app.clone();
+        async move {
+            let mut b = Request::builder().method(Method::GET).uri("/metrics");
+            if let Some(a) = auth {
+                b = b.header(header::AUTHORIZATION, a);
+            }
+            let res = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            let (st, h) = (res.status(), res.headers().clone());
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            (st, h, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    for bad in [
+        None,
+        Some("Bearer wrong-token-0123456789"),
+        Some("Basic 0123456789abcdef0123"),
+    ] {
+        let (st, h, _) = scrape(bad).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{bad:?}");
+        assert!(h.contains_key(header::WWW_AUTHENTICATE));
+    }
+    on.client("c1").await;
+    let (st, h, body) = scrape(Some("Bearer 0123456789abcdef0123")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain; version=0.0.4"));
+    for want in [
+        "rustfrp_clients 1\n",
+        "rustfrp_clients_online 0\n",
+        "# TYPE rustfrp_builtin_bytes_in_total counter\n",
+        "rustfrp_nodes_online 0\n",
+        "rustfrp_process_uptime_seconds ",
+    ] {
+        assert!(body.contains(want), "{want}\n{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_builtin_node_is_hidden_and_refuses_builtin_tokens() {
+    let r = rig_with(Config {
+        builtin_edge: false,
+        node_addr: "0.0.0.0:7001".into(),
+        ..Config::default()
+    })
+    .await;
+    let admin = r.admin("a", Role::Admin).await;
+    let (_, v) = r.get("/api/v1/nodes", &admin).await;
+    assert!(v.as_array().unwrap().is_empty(), "no builtin entry: {v}");
+    let (_, v) = r.get("/api/v1/node", &admin).await;
+    assert_eq!(v["enabled"], false);
+    let (st, v) = r
+        .send(
+            Method::POST,
+            "/api/v1/enroll-tokens",
+            &admin,
+            json!({"name":"x","reason":"r"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("built-in node is disabled"));
+    // 节点令牌不受影响。
+    let (st, _) = r
+        .send(
+            Method::POST,
+            "/api/v1/enroll-tokens",
+            &admin,
+            json!({"name":"x","kind":"node","reason":"r"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
 }

@@ -13,14 +13,16 @@ Future<void> main() async {
   await loadWebFonts();
   await initDesktopWindow();
   final prefs = await SharedPreferences.getInstance();
-  runApp(ProviderScope(
-    // Live data is re-fetched by the periodic tick anyway; no hidden exponential retries.
-    retry: (_, _) => null,
-    overrides: [
-      prefsProvider.overrideWithValue(prefs),
-      // The browser build is served by the controller itself: always talk to the same origin.
-      sameOriginProvider.overrideWithValue(kIsWeb),
-    ],
-    child: const RustFrpApp(),
-  ));
+  runApp(
+    ProviderScope(
+      // Live data is re-fetched by the periodic tick anyway; no hidden exponential retries.
+      retry: (_, _) => null,
+      overrides: [
+        prefsProvider.overrideWithValue(prefs),
+        // The browser build is served by the controller itself: always talk to the same origin.
+        sameOriginProvider.overrideWithValue(kIsWeb),
+      ],
+      child: const RustFrpApp(),
+    ),
+  );
 }

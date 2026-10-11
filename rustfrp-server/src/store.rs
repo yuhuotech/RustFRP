@@ -6,7 +6,9 @@ use rustfrp_core::auth::random_id;
 use rustfrp_core::wire::{ConfigSet, ManagedProxy};
 
 use crate::db::StoreError;
-use crate::models::{Admin, AuditEntry, Client, EnrollToken, Role, Tunnel};
+use crate::models::{Admin, AuditEntry, Client, EnrollToken, Node, Role, Tunnel};
+use rustfrp_core::node::{NodeDevice, NodeInfo};
+use rustfrp_core::wire::HttpOpts;
 
 type Res<T> = Result<T, StoreError>;
 
@@ -132,6 +134,56 @@ pub fn set_admin_password(c: &Connection, name: &str, password_hash: &str) -> Re
     Ok(())
 }
 
+/// 修改管理员的角色 / 启停 / 密码（均可选）；至少保留一个启用的 owner。
+/// 禁用、改密码、改角色都会吊销该管理员的全部会话。
+pub fn update_admin(
+    c: &Connection,
+    id: &str,
+    role: Option<Role>,
+    disabled: Option<bool>,
+    password_hash: Option<&str>,
+    now: i64,
+) -> Res<Admin> {
+    let cur = get_admin(c, id)?;
+    let was_active_owner = cur.role == Role::Owner && cur.disabled_at.is_none();
+    let will_be_active_owner = role.unwrap_or(cur.role) == Role::Owner
+        && disabled.map_or(cur.disabled_at.is_none(), |d| !d);
+    if was_active_owner && !will_be_active_owner {
+        let others: i64 = c.query_row(
+            "SELECT COUNT(*) FROM admins WHERE role = 'owner' AND disabled_at IS NULL AND id <> ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if others == 0 {
+            return Err(StoreError::Conflict(
+                "at least one active owner is required".into(),
+            ));
+        }
+    }
+    if let Some(r) = role {
+        c.execute(
+            "UPDATE admins SET role = ?2 WHERE id = ?1",
+            params![id, r.as_str()],
+        )?;
+    }
+    if let Some(d) = disabled {
+        c.execute(
+            "UPDATE admins SET disabled_at = ?2 WHERE id = ?1",
+            params![id, if d { Some(now) } else { None }],
+        )?;
+    }
+    if let Some(h) = password_hash {
+        c.execute(
+            "UPDATE admins SET password_hash = ?2 WHERE id = ?1",
+            params![id, h],
+        )?;
+    }
+    if role.is_some() || disabled == Some(true) || password_hash.is_some() {
+        c.execute("DELETE FROM admin_sessions WHERE admin_id = ?1", [id])?;
+    }
+    get_admin(c, id)
+}
+
 // ───────────── 会话 ─────────────
 
 /// 创建会话。
@@ -187,10 +239,12 @@ fn token_from(r: &Row<'_>) -> rusqlite::Result<EnrollToken> {
         used_at: r.get(5)?,
         client_id: r.get(6)?,
         revoked_at: r.get(7)?,
+        kind: r.get(8)?,
+        node_id: r.get(9)?,
     })
 }
 const TOKEN_COLS: &str =
-    "id, name, created_by, created_at, expires_at, used_at, client_id, revoked_at";
+    "id, name, created_by, created_at, expires_at, used_at, client_id, revoked_at, kind, node_id";
 
 /// 创建接入令牌（只存哈希）。
 pub fn create_enroll_token(
@@ -201,14 +255,35 @@ pub fn create_enroll_token(
     now: i64,
     ttl_ms: i64,
 ) -> Res<EnrollToken> {
+    create_token_for(c, token_hash, name, created_by, now, ttl_ms, "client", "")
+}
+
+/// 创建接入令牌：`kind` 为 `client`（可指定服务它的节点）或 `node`（接入新节点）。
+#[allow(clippy::too_many_arguments)]
+pub fn create_token_for(
+    c: &Connection,
+    token_hash: &str,
+    name: &str,
+    created_by: &str,
+    now: i64,
+    ttl_ms: i64,
+    kind: &str,
+    node_id: &str,
+) -> Res<EnrollToken> {
     check_name(name, "name")?;
     if ttl_ms <= 0 {
         return Err(StoreError::Invalid("ttl must be positive".into()));
     }
+    if !["client", "node"].contains(&kind) || (kind == "node" && !node_id.is_empty()) {
+        return Err(StoreError::Invalid("invalid token kind".into()));
+    }
+    if !node_id.is_empty() {
+        get_node(c, node_id)?;
+    }
     let id = new_id();
     c.execute(
-        "INSERT INTO enroll_tokens (id, token_hash, name, created_by, created_at, expires_at) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![id, token_hash, name.trim(), created_by, now, now + ttl_ms],
+        "INSERT INTO enroll_tokens (id, token_hash, name, created_by, created_at, expires_at, kind, node_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![id, token_hash, name.trim(), created_by, now, now + ttl_ms, kind, node_id],
     )?;
     Ok(c.query_row(
         &format!("SELECT {TOKEN_COLS} FROM enroll_tokens WHERE id = ?1"),
@@ -256,10 +331,21 @@ pub fn consume_enroll_token(
     client_id: &str,
     now: i64,
 ) -> Res<EnrollToken> {
+    consume_token_of(c, token_hash, client_id, now, "client")
+}
+
+/// 消耗指定类型的一次性令牌（节点令牌把节点 ID 记在 `client_id` 列）。
+pub fn consume_token_of(
+    c: &Connection,
+    token_hash: &str,
+    subject_id: &str,
+    now: i64,
+    kind: &str,
+) -> Res<EnrollToken> {
     let n = c.execute(
         "UPDATE enroll_tokens SET used_at = ?2, client_id = ?3
-          WHERE token_hash = ?1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?2",
-        params![token_hash, now, client_id],
+          WHERE token_hash = ?1 AND kind = ?4 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?2",
+        params![token_hash, now, subject_id, kind],
     )?;
     if n == 0 {
         return Err(StoreError::NotFound);
@@ -269,6 +355,205 @@ pub fn consume_enroll_token(
         [token_hash],
         token_from,
     )?)
+}
+
+// ───────────── 节点 ─────────────
+
+fn node_from(r: &Row<'_>) -> rusqlite::Result<Node> {
+    let ports: String = r.get(8)?;
+    Ok(Node {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        builtin: false,
+        public_host: r.get(2)?,
+        edge_port: u16::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+        tls_fingerprint: r.get(4)?,
+        vhost_http: r
+            .get::<_, Option<i64>>(5)?
+            .and_then(|p| u16::try_from(p).ok()),
+        vhost_https: r
+            .get::<_, Option<i64>>(6)?
+            .and_then(|p| u16::try_from(p).ok()),
+        subdomain_host: r.get(7)?,
+        allow_ports: serde_json::from_str(&ports).unwrap_or_default(),
+        version: r.get(9)?,
+        os: r.get(10)?,
+        created_at: r.get(11)?,
+        last_seen_at: r.get(12)?,
+        disabled_at: r.get(13)?,
+        online: false,
+        clients: r.get(14)?,
+    })
+}
+const NODE_COLS: &str = "id, name, public_host, edge_port, tls_fingerprint, vhost_http, vhost_https, subdomain_host, allow_ports, version, os, created_at, last_seen_at, disabled_at, (SELECT COUNT(*) FROM clients c WHERE c.node_id = nodes.id AND c.deleted_at IS NULL)";
+
+/// 创建外置节点。
+pub fn create_node(
+    c: &Connection,
+    id: &str,
+    name: &str,
+    pubkey: &str,
+    info: &NodeInfo,
+    now: i64,
+) -> Res<Node> {
+    check_name(name, "name")?;
+    if !rustfrp_core::identity::is_valid_public_hex(pubkey) {
+        return Err(StoreError::Invalid("invalid public key".into()));
+    }
+    c.execute(
+        "INSERT INTO nodes (id, name, pubkey, created_at, last_seen_at) VALUES (?1,?2,?3,?4,?4)",
+        params![id, name.trim(), pubkey, now],
+    )?;
+    update_node_info(c, id, info, now)?;
+    get_node(c, id)
+}
+
+/// 取节点（未删除）。
+pub fn get_node(c: &Connection, id: &str) -> Res<Node> {
+    Ok(c.query_row(
+        &format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1 AND deleted_at IS NULL"),
+        [id],
+        node_from,
+    )?)
+}
+
+/// 取节点及其公钥（登录验签用）。
+pub fn get_node_with_key(c: &Connection, id: &str) -> Res<(Node, String)> {
+    let key: String = c.query_row(
+        "SELECT pubkey FROM nodes WHERE id = ?1 AND deleted_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok((get_node(c, id)?, key))
+}
+
+/// 全部外置节点。
+pub fn list_nodes(c: &Connection) -> Res<Vec<Node>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {NODE_COLS} FROM nodes WHERE deleted_at IS NULL ORDER BY created_at, name"
+    ))?;
+    let rows = st
+        .query_map([], node_from)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 节点上线时更新其自述信息（对外主机名为空时保留已有值，允许管理员事先指定）。
+pub fn update_node_info(c: &Connection, id: &str, info: &NodeInfo, now: i64) -> Res<()> {
+    let ports = serde_json::to_string(&info.allow_ports).unwrap_or_else(|_| "[]".into());
+    c.execute(
+        "UPDATE nodes SET public_host = CASE WHEN ?2 = '' THEN public_host ELSE ?2 END,
+                edge_port = ?3, tls_fingerprint = ?4, vhost_http = ?5, vhost_https = ?6,
+                subdomain_host = ?7, allow_ports = ?8, version = ?9, os = ?10, last_seen_at = ?11
+          WHERE id = ?1",
+        params![
+            id,
+            info.public_host,
+            i64::from(info.edge_port),
+            info.tls_fingerprint,
+            info.vhost_http.map(i64::from),
+            info.vhost_https.map(i64::from),
+            info.subdomain_host,
+            ports,
+            info.version,
+            info.os,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// 记录节点最近通信时间。
+pub fn touch_node(c: &Connection, id: &str, now: i64) -> Res<()> {
+    c.execute(
+        "UPDATE nodes SET last_seen_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
+/// 改名 / 停用 / 启用节点。
+pub fn update_node(
+    c: &Connection,
+    id: &str,
+    name: Option<&str>,
+    disabled: Option<bool>,
+    now: i64,
+) -> Res<Node> {
+    get_node(c, id)?;
+    if let Some(n) = name {
+        check_name(n, "name")?;
+        c.execute(
+            "UPDATE nodes SET name = ?2 WHERE id = ?1",
+            params![id, n.trim()],
+        )?;
+    }
+    if let Some(d) = disabled {
+        c.execute(
+            "UPDATE nodes SET disabled_at = ?2 WHERE id = ?1",
+            params![id, if d { Some(now) } else { None }],
+        )?;
+    }
+    get_node(c, id)
+}
+
+/// 删除节点：仍有设备在用时拒绝。
+pub fn delete_node(c: &Connection, id: &str, now: i64) -> Res<()> {
+    let node = get_node(c, id)?;
+    if node.clients > 0 {
+        return Err(StoreError::Conflict(format!(
+            "node still serves {} client(s); delete or move them first",
+            node.clients
+        )));
+    }
+    c.execute(
+        "UPDATE nodes SET deleted_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
+/// 把设备指派给节点（空串 = 内置节点）；只在接入时使用。
+pub fn set_client_node(c: &Connection, client_id: &str, node_id: &str) -> Res<()> {
+    if !node_id.is_empty() {
+        get_node(c, node_id)?;
+    }
+    c.execute(
+        "UPDATE clients SET node_id = ?2 WHERE id = ?1",
+        params![client_id, node_id],
+    )?;
+    Ok(())
+}
+
+/// 设备所属节点（包含已删除的设备，用于删除后通知节点）。
+pub fn client_node_id_any(c: &Connection, client_id: &str) -> Res<String> {
+    Ok(c.query_row(
+        "SELECT node_id FROM clients WHERE id = ?1",
+        [client_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// 下发给节点的设备条目；已删除的设备返回 `NotFound`。
+pub fn node_device(c: &Connection, client_id: &str) -> Res<NodeDevice> {
+    let (client, pubkey) = get_client_with_key(c, client_id)?;
+    Ok(NodeDevice {
+        id: client.id.clone(),
+        pubkey,
+        disabled: client.disabled_at.is_some(),
+        config: managed_config(c, client_id)?,
+    })
+}
+
+/// 某节点应持有的全部设备（不含被停用的）。
+pub fn list_node_devices(c: &Connection, node_id: &str) -> Res<Vec<NodeDevice>> {
+    let mut st = c.prepare(
+        "SELECT id FROM clients WHERE node_id = ?1 AND deleted_at IS NULL AND disabled_at IS NULL ORDER BY created_at",
+    )?;
+    let ids = st
+        .query_map([node_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.iter().map(|id| node_device(c, id)).collect()
 }
 
 // ───────────── 客户端 ─────────────
@@ -285,10 +570,12 @@ fn client_from(r: &Row<'_>) -> rusqlite::Result<Client> {
         last_seen_at: r.get(7)?,
         disabled_at: r.get(8)?,
         online: false,
+        node_id: r.get(9)?,
+        tags: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
     })
 }
 const CLIENT_COLS: &str =
-    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at";
+    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at, node_id, tags";
 
 /// 创建设备。
 #[allow(clippy::too_many_arguments)]
@@ -327,7 +614,7 @@ pub fn get_client_with_key(c: &Connection, id: &str) -> Res<(Client, String)> {
     Ok(c.query_row(
         &format!("SELECT {CLIENT_COLS}, pubkey FROM clients WHERE id = ?1 AND deleted_at IS NULL"),
         [id],
-        |r| Ok((client_from(r)?, r.get(9)?)),
+        |r| Ok((client_from(r)?, r.get(11)?)),
     )?)
 }
 
@@ -380,6 +667,55 @@ pub fn delete_client(c: &Connection, id: &str, now: i64) -> Res<()> {
     Ok(())
 }
 
+const MAX_TAGS: usize = 8;
+/// 带宽上限的合理上界（1 TiB/s）。
+const MAX_BANDWIDTH: u64 = 1 << 40;
+
+/// 设置设备标签：去掉首尾空白和重复项，最多 8 个，每个 1–32 个字符且不含控制字符。
+pub fn set_client_tags(c: &Connection, id: &str, tags: &[String]) -> Res<Client> {
+    get_client(c, id)?;
+    let mut clean: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim();
+        if t.is_empty() || t.chars().count() > 32 || t.chars().any(char::is_control) {
+            return Err(StoreError::Invalid(
+                "each tag must be 1-32 printable characters".into(),
+            ));
+        }
+        if !clean.iter().any(|x| x == t) {
+            clean.push(t.to_string());
+        }
+    }
+    if clean.len() > MAX_TAGS {
+        return Err(StoreError::Invalid(format!("at most {MAX_TAGS} tags")));
+    }
+    let text = if clean.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&clean).unwrap_or_default()
+    };
+    c.execute(
+        "UPDATE clients SET tags = ?2 WHERE id = ?1",
+        params![id, text],
+    )?;
+    get_client(c, id)
+}
+
+/// 请求设备重启 agent：递增计数并随配置下发（设备在线才会生效）。
+pub fn request_client_restart(c: &Connection, id: &str) -> Res<i64> {
+    get_client(c, id)?;
+    c.execute(
+        "UPDATE clients SET restart_seq = restart_seq + 1 WHERE id = ?1",
+        [id],
+    )?;
+    bump_revision(c, id)?;
+    Ok(
+        c.query_row("SELECT restart_seq FROM clients WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 /// 记录在线时间（可同时更新版本）。
 pub fn touch_client(c: &Connection, id: &str, now: i64) -> Res<()> {
     c.execute(
@@ -427,6 +763,14 @@ pub struct NewTunnel {
     pub subdomain: String,
     /// http：改写 Host 头。
     pub host_header_rewrite: String,
+    /// http：路径 / 认证 / 请求头选项。
+    pub http: HttpOpts,
+    /// PROXY protocol 版本（0 / 1 / 2）。
+    pub proxy_protocol: u8,
+    /// 带宽上限（字节 / 秒），0 = 不限。
+    pub bandwidth_bps: u64,
+    /// 限速由服务端执行。
+    pub bandwidth_server: bool,
 }
 
 /// 修改隧道的参数（`None` 表示不改）。
@@ -448,9 +792,38 @@ pub struct TunnelPatch {
     pub subdomain: Option<String>,
     /// http：改写 Host 头。
     pub host_header_rewrite: Option<String>,
+    /// http：路径前缀。
+    pub locations: Option<Vec<String>>,
+    /// http：Basic 认证用户名。
+    pub http_user: Option<String>,
+    /// http：Basic 认证密码（`Some("")` 清除，`None` 保持）。
+    pub http_password: Option<String>,
+    /// http：按 Basic 用户名选路。
+    pub route_by_http_user: Option<String>,
+    /// http：转发前设置的请求头。
+    pub request_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// PROXY protocol 版本。
+    pub proxy_protocol: Option<u8>,
+    /// 带宽上限（字节 / 秒）。
+    pub bandwidth_bps: Option<u64>,
+    /// 限速位置。
+    pub bandwidth_server: Option<bool>,
+}
+
+fn parse_opts(raw: &str) -> HttpOpts {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn store_opts(o: &HttpOpts) -> String {
+    if o.is_default() {
+        String::new()
+    } else {
+        serde_json::to_string(o).unwrap_or_default()
+    }
 }
 
 fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
+    let opts = parse_opts(&r.get::<_, String>(16)?);
     Ok(Tunnel {
         id: r.get(0)?,
         client_id: r.get(1)?,
@@ -468,9 +841,17 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         custom_domains: split_domains(&r.get::<_, String>(13)?),
         subdomain: r.get(14)?,
         host_header_rewrite: r.get(15)?,
+        locations: opts.locations,
+        http_user: opts.http_user,
+        http_password_set: !opts.http_password.is_empty(),
+        route_by_http_user: opts.route_by_http_user,
+        request_headers: opts.request_headers,
+        proxy_protocol: u8::try_from(r.get::<_, i64>(17)?).unwrap_or(0),
+        bandwidth_bps: u64::try_from(r.get::<_, i64>(18)?).unwrap_or(0),
+        bandwidth_server: r.get::<_, i64>(19)? != 0,
     })
 }
-const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite";
+const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server";
 
 fn check_port(v: i64, what: &str, allow_zero: bool) -> Res<()> {
     let lo = i64::from(!allow_zero);
@@ -582,26 +963,39 @@ fn ensure_remote_port_free(
     Ok(())
 }
 
-/// 同类别（http / https）内域名不能重复；子域名按 `sub.<根域名>` 在运行时解析，这里按「同名子域名」去重。
+/// 同类别（http / https）内：同一域名只有在路径前缀不重叠、或 `routeByHTTPUser` 不同时才可共存；
+/// 子域名按 `sub.<根域名>` 在运行时解析，这里按「同名子域名」同样处理。
 fn ensure_domains_free(
     c: &Connection,
     kind: &str,
     domains: &[String],
     subdomain: &str,
+    http: &HttpOpts,
     except_id: Option<&str>,
 ) -> Res<()> {
     if !is_web(kind) {
         return Ok(());
     }
     let mut st = c.prepare(
-        "SELECT id, custom_domains, subdomain FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
+        "SELECT custom_domains, subdomain, http_opts FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
     )?;
     let rows = st
         .query_map(params![kind, except_id], |r| {
-            Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    for (other_domains, other_sub) in rows {
+    let mine = effective_locations(http);
+    for (other_domains, other_sub, other_opts) in rows {
+        let other = parse_opts(&other_opts);
+        let overlap = other.route_by_http_user == http.route_by_http_user
+            && effective_locations(&other).iter().any(|l| mine.contains(l));
+        if !overlap {
+            continue;
+        }
         let theirs = split_domains(&other_domains);
         if let Some(d) = domains.iter().find(|d| theirs.contains(d)) {
             return Err(StoreError::Conflict(format!(
@@ -617,6 +1011,56 @@ fn ensure_domains_free(
     Ok(())
 }
 
+fn effective_locations(o: &HttpOpts) -> Vec<String> {
+    if o.locations.is_empty() {
+        vec!["/".into()]
+    } else {
+        o.locations.clone()
+    }
+}
+
+const MAX_LOCATIONS: usize = 16;
+const MAX_REQUEST_HEADERS: usize = 16;
+
+/// 校验 http 选项；非 http 隧道不得带有任何选项。
+fn check_http_opts(kind: &str, o: HttpOpts) -> Res<HttpOpts> {
+    if o.is_default() {
+        return Ok(o);
+    }
+    if kind != "http" {
+        return Err(StoreError::Invalid(
+            "locations, Basic auth and request headers only apply to http tunnels".into(),
+        ));
+    }
+    let bad = |m: &str| Err(StoreError::Invalid(m.into()));
+    if o.locations.len() > MAX_LOCATIONS || o.request_headers.len() > MAX_REQUEST_HEADERS {
+        return bad("too many locations or request headers");
+    }
+    let mut locations: Vec<String> = Vec::new();
+    for l in &o.locations {
+        if !l.starts_with('/') || l.len() > 256 || l.chars().any(|c| c.is_control() || c == ' ') {
+            return bad("each location must start with / and contain no spaces");
+        }
+        if !locations.contains(l) {
+            locations.push(l.clone());
+        }
+    }
+    for (k, v) in &o.request_headers {
+        if !rustfrp_core::http1::valid_header(k, v) || k.len() > 64 || v.len() > 1024 {
+            return bad("invalid request header");
+        }
+    }
+    for v in [&o.http_user, &o.http_password, &o.route_by_http_user] {
+        if v.len() > 128 || v.chars().any(char::is_control) {
+            return bad("Basic auth user, password and routeByHTTPUser must be at most 128 printable characters");
+        }
+    }
+    if o.http_user.contains(':') {
+        return bad("Basic auth user must not contain ':'");
+    }
+    Ok(HttpOpts { locations, ..o })
+}
+
 struct Checked {
     name: String,
     kind: String,
@@ -626,6 +1070,10 @@ struct Checked {
     domains: Vec<String>,
     subdomain: String,
     rewrite: String,
+    http: HttpOpts,
+    proxy_protocol: u8,
+    bandwidth_bps: u64,
+    bandwidth_server: bool,
 }
 
 fn check_tunnel(
@@ -647,6 +1095,17 @@ fn check_tunnel(
     let domains = normalize_domains(&t.domains)?;
     check_subdomain(&t.subdomain)?;
     check_rewrite(&t.rewrite)?;
+    let http = check_http_opts(&t.kind, t.http.clone())?;
+    if t.bandwidth_bps > MAX_BANDWIDTH || (t.bandwidth_bps != 0 && t.kind == "udp") {
+        return Err(StoreError::Invalid(
+            "bandwidth limit must be 0..=1 TiB/s and does not apply to udp tunnels".into(),
+        ));
+    }
+    if t.proxy_protocol > 2 || (t.proxy_protocol != 0 && t.kind == "udp") {
+        return Err(StoreError::Invalid(
+            "proxy_protocol must be 0, 1 or 2 and does not apply to udp tunnels".into(),
+        ));
+    }
     if is_web(&t.kind) {
         if domains.is_empty() && t.subdomain.is_empty() {
             return Err(StoreError::Invalid(
@@ -669,7 +1128,7 @@ fn check_tunnel(
         ));
     }
     ensure_remote_port_free(c, &t.kind, t.remote_port, except_id)?;
-    ensure_domains_free(c, &t.kind, &domains, &t.subdomain, except_id)?;
+    ensure_domains_free(c, &t.kind, &domains, &t.subdomain, &http, except_id)?;
     let dup: Option<String> = c
         .query_row(
             "SELECT id FROM tunnels WHERE client_id = ?1 AND name = ?2 AND deleted_at IS NULL AND (?3 IS NULL OR id <> ?3)",
@@ -683,7 +1142,7 @@ fn check_tunnel(
             t.name.trim()
         )));
     }
-    Ok(Checked { domains, ..t })
+    Ok(Checked { domains, http, ..t })
 }
 
 /// 创建隧道。
@@ -700,18 +1159,40 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
             domains: t.custom_domains.clone(),
             subdomain: t.subdomain.to_ascii_lowercase(),
             rewrite: t.host_header_rewrite.clone(),
+            http: t.http.clone(),
+            proxy_protocol: t.proxy_protocol,
+            bandwidth_bps: t.bandwidth_bps,
+            bandwidth_server: t.bandwidth_server,
         },
         None,
         &t.client_id,
     )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",
-        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server)],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
+}
+
+/// 客户端的隧道数不得超过 `max`（0 = 不限）。在写入同一事务内调用，超限即回滚。
+pub fn enforce_tunnel_quota(c: &Connection, client_id: &str, max: i64) -> Res<()> {
+    if max <= 0 {
+        return Ok(());
+    }
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL",
+        [client_id],
+        |r| r.get(0),
+    )?;
+    if n > max {
+        return Err(StoreError::Conflict(format!(
+            "client tunnel limit reached ({max})"
+        )));
+    }
+    Ok(())
 }
 
 /// 取隧道（未删除）。
@@ -737,6 +1218,29 @@ pub fn list_tunnels(c: &Connection, client_id: Option<&str>) -> Res<Vec<Tunnel>>
 /// 修改隧道（类型不可改；需要换类型请删除重建）。
 pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res<Tunnel> {
     let cur = get_tunnel(c, id)?;
+    let cur_opts = tunnel_http_opts(c, id)?;
+    let new_opts = HttpOpts {
+        locations: p
+            .locations
+            .clone()
+            .unwrap_or_else(|| cur_opts.locations.clone()),
+        http_user: p
+            .http_user
+            .clone()
+            .unwrap_or_else(|| cur_opts.http_user.clone()),
+        http_password: p
+            .http_password
+            .clone()
+            .unwrap_or_else(|| cur_opts.http_password.clone()),
+        route_by_http_user: p
+            .route_by_http_user
+            .clone()
+            .unwrap_or_else(|| cur_opts.route_by_http_user.clone()),
+        request_headers: p
+            .request_headers
+            .clone()
+            .unwrap_or_else(|| cur_opts.request_headers.clone()),
+    };
     let enabled = p.enabled.unwrap_or(cur.enabled);
     let k = check_tunnel(
         c,
@@ -758,18 +1262,43 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
                 .host_header_rewrite
                 .clone()
                 .unwrap_or_else(|| cur.host_header_rewrite.clone()),
+            http: new_opts,
+            proxy_protocol: p.proxy_protocol.unwrap_or(cur.proxy_protocol),
+            bandwidth_bps: p.bandwidth_bps.unwrap_or(cur.bandwidth_bps),
+            bandwidth_server: p.bandwidth_server.unwrap_or(cur.bandwidth_server),
         },
         Some(id),
         &cur.client_id,
     )?;
-    // 配置变化后状态回到 pending，等待 Edge 重新回报。
+    let runtime_changed = enabled != cur.enabled
+        || k.http != cur_opts
+        || k.proxy_protocol != cur.proxy_protocol
+        || k.bandwidth_bps != cur.bandwidth_bps
+        || k.bandwidth_server != cur.bandwidth_server
+        || k.local_ip != cur.local_ip
+        || k.local_port != i64::from(cur.local_port)
+        || k.remote_port != i64::from(cur.remote_port)
+        || k.domains != cur.custom_domains
+        || k.subdomain != cur.subdomain
+        || k.rewrite != cur.host_header_rewrite;
+    // 仅数据面配置变化时等待 Edge 回报；重复启停和改显示名保留实际状态。
     c.execute(
-        "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state='pending', status_error='',
-                custom_domains=?8, subdomain=?9, host_header_rewrite=?10 WHERE id=?1",
-        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite],
+        "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state=CASE WHEN ?11 THEN 'pending' ELSE status_state END, status_error=CASE WHEN ?11 THEN '' ELSE status_error END,
+                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15 WHERE id=?1",
+        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server)],
     )?;
     bump_revision(c, &cur.client_id)?;
     get_tunnel(c, id)
+}
+
+/// 隧道的 http 选项（含 Basic 认证密码，仅供服务端内部下发 / 导出使用，不得经 REST 返回）。
+pub fn tunnel_http_opts(c: &Connection, id: &str) -> Res<HttpOpts> {
+    let raw: String = c.query_row(
+        "SELECT http_opts FROM tunnels WHERE id = ?1 AND deleted_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(parse_opts(&raw))
 }
 
 /// 软删除隧道。
@@ -792,6 +1321,85 @@ pub fn set_tunnel_status(c: &Connection, id: &str, state: &str, port: u16, error
     Ok(())
 }
 
+/// 节点上报的代理状态：只接受属于该节点所服务设备的隧道。
+pub fn set_tunnel_status_of_node(
+    c: &Connection,
+    node_id: &str,
+    client_id: &str,
+    tunnel_id: &str,
+    state: &str,
+    port: u16,
+    error: &str,
+) -> Res<()> {
+    if !["running", "error", "stopped"].contains(&state) {
+        return Err(StoreError::Invalid("invalid tunnel state".into()));
+    }
+    c.execute(
+        "UPDATE tunnels SET status_state = ?5, status_port = ?6, status_error = ?7
+          WHERE id = ?1 AND client_id = ?2 AND deleted_at IS NULL
+            AND client_id IN (SELECT id FROM clients WHERE node_id = ?3 AND id = ?4)",
+        params![
+            tunnel_id,
+            client_id,
+            node_id,
+            client_id,
+            state,
+            i64::from(port),
+            error
+        ],
+    )?;
+    Ok(())
+}
+
+/// 写入节点上报的流量样本：只接受属于该节点所服务设备的隧道（其余静默丢弃，不影响其他样本）。
+pub fn persist_node_traffic(
+    c: &mut Connection,
+    node_id: &str,
+    epoch_key: &str,
+    samples: &[rustfrp_core::node::TrafficSample],
+) -> Res<()> {
+    let mut owned: Vec<rustfrp_agent::metrics::Sample> = Vec::new();
+    for s in samples {
+        let ok: Option<i64> = c
+            .query_row(
+                "SELECT 1 FROM tunnels t JOIN clients c ON c.id = t.client_id
+                  WHERE t.id = ?1 AND c.node_id = ?2",
+                params![s.name, node_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if ok.is_some() {
+            owned.push(crate::traffic::sample_from_wire(s));
+        }
+    }
+    crate::traffic::persist(c, epoch_key, now_ms(), &owned)
+}
+
+/// 节点上报设备上下线：只更新属于该节点的设备；离线时同时把其隧道置为 stopped。
+pub fn touch_client_of_node(
+    c: &Connection,
+    node_id: &str,
+    client_id: &str,
+    now: i64,
+    offline: bool,
+) -> Res<()> {
+    let owned: Option<i64> = c
+        .query_row(
+            "SELECT 1 FROM clients WHERE id = ?1 AND node_id = ?2 AND deleted_at IS NULL",
+            params![client_id, node_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if owned.is_none() {
+        return Ok(());
+    }
+    touch_client(c, client_id, now)?;
+    if offline {
+        mark_client_tunnels_stopped(c, client_id)?;
+    }
+    Ok(())
+}
+
 /// 设备下线后，把其隧道的运行状态置为 stopped。
 pub fn mark_client_tunnels_stopped(c: &Connection, client_id: &str) -> Res<()> {
     c.execute(
@@ -804,10 +1412,21 @@ pub fn mark_client_tunnels_stopped(c: &Connection, client_id: &str) -> Res<()> {
 /// 生成下发给设备的受管配置：只含启用的隧道，代理名即隧道 ID。
 pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
     let client = get_client(c, client_id)?;
+    let mut opts =
+        c.prepare("SELECT id, http_opts FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL")?;
+    let mut opts: std::collections::HashMap<String, HttpOpts> = opts
+        .query_map([client_id], |r| {
+            Ok((r.get::<_, String>(0)?, parse_opts(&r.get::<_, String>(1)?)))
+        })?
+        .collect::<Result<_, _>>()?;
     let proxies = list_tunnels(c, Some(client_id))?
         .into_iter()
         .filter(|t| t.enabled)
         .map(|t| ManagedProxy {
+            http: opts.remove(&t.id).unwrap_or_default(),
+            proxy_protocol: t.proxy_protocol,
+            bandwidth_bps: t.bandwidth_bps,
+            bandwidth_server: t.bandwidth_server,
             name: t.id,
             kind: t.kind,
             remote_port: t.remote_port,
@@ -818,7 +1437,13 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
             host_header_rewrite: t.host_header_rewrite,
         })
         .collect();
+    let restart_seq: i64 = c.query_row(
+        "SELECT restart_seq FROM clients WHERE id = ?1",
+        [client_id],
+        |r| r.get(0),
+    )?;
     Ok(ConfigSet {
+        restart_seq: u64::try_from(restart_seq).unwrap_or(0),
         revision: client.revision as u64,
         proxies,
     })
@@ -983,6 +1608,652 @@ mod tests {
         assert_eq!(get_admin(&c, &a.id).unwrap().disabled_at, Some(99));
         set_admin_disabled(&c, "root", false, 100).unwrap();
         assert_eq!(get_admin(&c, &a.id).unwrap().disabled_at, None);
+    }
+
+    #[test]
+    fn http_options_validate_coexist_by_location_and_never_leak_the_password() {
+        let c = conn();
+        let a = client(&c, "a");
+        let web = |name: &str, http: HttpOpts| NewTunnel {
+            client_id: a.id.clone(),
+            name: name.into(),
+            kind: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            custom_domains: vec!["app.example.com".into()],
+            enabled: true,
+            http,
+            ..Default::default()
+        };
+        let loc = |l: &[&str], user: &str| HttpOpts {
+            locations: l.iter().map(ToString::to_string).collect(),
+            route_by_http_user: user.into(),
+            ..Default::default()
+        };
+        // 同域名：路径不重叠或 routeByHTTPUser 不同才能共存。
+        let root = create_tunnel(&c, &web("root", HttpOpts::default()), 1).unwrap();
+        create_tunnel(&c, &web("api", loc(&["/api", "/rpc"], "")), 2).unwrap();
+        create_tunnel(&c, &web("bob", loc(&[], "bob")), 3).unwrap();
+        for (name, http) in [
+            ("dup-root", HttpOpts::default()),
+            ("dup-api", loc(&["/x", "/api"], "")),
+            ("dup-bob", loc(&["/"], "bob")),
+        ] {
+            assert!(
+                matches!(create_tunnel(&c, &web(name, http), 4), Err(StoreError::Conflict(m)) if m.contains("already used")),
+                "{name}"
+            );
+        }
+        // 非法选项。
+        let many: Vec<String> = (0..17).map(|i| format!("/p{i}")).collect();
+        let headers = |n: usize| -> std::collections::BTreeMap<String, String> {
+            (0..n)
+                .map(|i| (format!("X-{i}"), "v".to_string()))
+                .collect()
+        };
+        let bad = [
+            HttpOpts {
+                locations: many,
+                ..Default::default()
+            },
+            HttpOpts {
+                request_headers: headers(17),
+                ..Default::default()
+            },
+            HttpOpts {
+                locations: vec!["nope".into()],
+                ..Default::default()
+            },
+            HttpOpts {
+                locations: vec!["/a b".into()],
+                ..Default::default()
+            },
+            HttpOpts {
+                request_headers: [("Bad Name".to_string(), "v".to_string())].into(),
+                ..Default::default()
+            },
+            HttpOpts {
+                http_password: "p".repeat(129),
+                ..Default::default()
+            },
+            HttpOpts {
+                http_user: "a:b".into(),
+                ..Default::default()
+            },
+            HttpOpts {
+                route_by_http_user: "x\n".into(),
+                ..Default::default()
+            },
+        ];
+        for (i, h) in bad.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    create_tunnel(&c, &web(&format!("bad{i}"), h), 5),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{i}"
+            );
+        }
+        // 非 http 隧道不能带这些选项。
+        let mut tcp = nt(&a.id, "plain", 6200);
+        tcp.http = HttpOpts {
+            http_user: "u".into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(create_tunnel(&c, &tcp, 6), Err(StoreError::Invalid(m)) if m.contains("only apply to http"))
+        );
+
+        // 带认证的隧道：Tunnel 视图只有「是否设置密码」；下发配置里有完整选项。
+        let secured = create_tunnel(
+            &c,
+            &NewTunnel {
+                custom_domains: vec!["sec.example.com".into()],
+                http: HttpOpts {
+                    http_user: "alice".into(),
+                    http_password: "s3cret".into(),
+                    request_headers: [("X-Env".to_string(), "prod".to_string())].into(),
+                    ..Default::default()
+                },
+                ..web("sec", HttpOpts::default())
+            },
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            (secured.http_user.as_str(), secured.http_password_set),
+            ("alice", true)
+        );
+        assert!(!serde_json::to_string(&secured).unwrap().contains("s3cret"));
+        let managed = managed_config(&c, &a.id).unwrap();
+        let p = managed
+            .proxies
+            .iter()
+            .find(|p| p.name == secured.id)
+            .unwrap();
+        assert_eq!(p.http.http_password, "s3cret");
+        assert_eq!(
+            p.http.request_headers.get("X-Env").map(String::as_str),
+            Some("prod")
+        );
+        assert!(managed
+            .proxies
+            .iter()
+            .find(|p| p.name == root.id)
+            .unwrap()
+            .http
+            .is_default());
+
+        // 修改：不带密码字段保持原密码；空串清除；运行态因此回到 pending。
+        set_tunnel_status(&c, &secured.id, "running", 80, "").unwrap();
+        let kept = update_tunnel(
+            &c,
+            &secured.id,
+            &TunnelPatch {
+                http_user: Some("bob".into()),
+                ..Default::default()
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                kept.http_user.as_str(),
+                kept.http_password_set,
+                kept.state.as_str()
+            ),
+            ("bob", true, "pending")
+        );
+        assert_eq!(
+            tunnel_http_opts(&c, &secured.id).unwrap().http_password,
+            "s3cret"
+        );
+        let cleared = update_tunnel(
+            &c,
+            &secured.id,
+            &TunnelPatch {
+                http_password: Some(String::new()),
+                ..Default::default()
+            },
+            9,
+        )
+        .unwrap();
+        assert!(!cleared.http_password_set);
+        set_tunnel_status(&c, &secured.id, "running", 80, "").unwrap();
+        let same = update_tunnel(
+            &c,
+            &secured.id,
+            &TunnelPatch {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            same.state, "running",
+            "renaming does not restart the data plane"
+        );
+        for patch in [
+            TunnelPatch {
+                locations: Some(vec!["/z".into()]),
+                ..Default::default()
+            },
+            TunnelPatch {
+                route_by_http_user: Some("carol".into()),
+                ..Default::default()
+            },
+            TunnelPatch {
+                request_headers: Some(Default::default()),
+                ..Default::default()
+            },
+        ] {
+            assert!(update_tunnel(&c, &secured.id, &patch, 11).is_ok());
+        }
+    }
+
+    #[test]
+    fn nodes_tokens_and_device_assignment() {
+        let c = conn();
+        let key = "ab".repeat(32);
+        let info = NodeInfo {
+            public_host: "edge.example.com".into(),
+            edge_port: 7000,
+            tls_fingerprint: "f".repeat(64),
+            vhost_http: Some(80),
+            vhost_https: None,
+            subdomain_host: "t.example.com".into(),
+            allow_ports: vec![(6000, 6100)],
+            version: "0.1".into(),
+            os: "linux".into(),
+        };
+        assert!(matches!(
+            create_node(&c, "n1", "x", "zz", &info, 1),
+            Err(StoreError::Invalid(_))
+        ));
+        let n = create_node(&c, "n1", " edge ", &key, &info, 5).unwrap();
+        assert_eq!(
+            (
+                n.name.as_str(),
+                n.public_host.as_str(),
+                n.edge_port,
+                n.vhost_http,
+                n.vhost_https
+            ),
+            ("edge", "edge.example.com", 7000, Some(80), None)
+        );
+        assert_eq!(
+            (n.allow_ports.clone(), n.clients, n.builtin, n.online),
+            (vec![(6000, 6100)], 0, false, false)
+        );
+        assert!(matches!(
+            create_node(&c, "n1", "dup", &key, &info, 6),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(get_node_with_key(&c, "n1").unwrap().1, key);
+        // 重新上线时空的 public_host 不覆盖管理员/先前设定的值。
+        let mut again = info.clone();
+        again.public_host = String::new();
+        again.edge_port = 7100;
+        update_node_info(&c, "n1", &again, 9).unwrap();
+        let n = get_node(&c, "n1").unwrap();
+        assert_eq!(
+            (n.public_host.as_str(), n.edge_port, n.last_seen_at),
+            ("edge.example.com", 7100, Some(9))
+        );
+        touch_node(&c, "n1", 12).unwrap();
+        assert_eq!(get_node(&c, "n1").unwrap().last_seen_at, Some(12));
+        assert_eq!(list_nodes(&c).unwrap().len(), 1);
+
+        // 节点令牌与设备令牌互不通用；设备令牌可指定节点。
+        let node_tok = create_token_for(&c, "h-node", "node", "root", 1, 1000, "node", "").unwrap();
+        assert_eq!(
+            (node_tok.kind.as_str(), node_tok.node_id.as_str()),
+            ("node", "")
+        );
+        assert!(create_token_for(&c, "h2", "x", "root", 1, 1000, "node", "n1").is_err());
+        assert!(create_token_for(&c, "h3", "x", "root", 1, 1000, "bogus", "").is_err());
+        assert!(matches!(
+            create_token_for(&c, "h4", "x", "root", 1, 1000, "client", "missing"),
+            Err(StoreError::NotFound)
+        ));
+        let ct = create_token_for(&c, "h-client", "c", "root", 1, 1000, "client", "n1").unwrap();
+        assert_eq!(ct.node_id, "n1");
+        assert!(
+            matches!(
+                consume_enroll_token(&c, "h-node", "x", 2),
+                Err(StoreError::NotFound)
+            ),
+            "node token cannot enroll a device"
+        );
+        assert!(matches!(
+            consume_token_of(&c, "h-client", "x", 2, "node"),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            consume_token_of(&c, "h-node", "n1", 2, "node")
+                .unwrap()
+                .client_id
+                .as_deref(),
+            Some("n1")
+        );
+        assert!(
+            matches!(
+                consume_token_of(&c, "h-node", "n1", 3, "node"),
+                Err(StoreError::NotFound)
+            ),
+            "single use"
+        );
+
+        // 设备指派、节点设备清单、删除保护。
+        let a = client(&c, "a");
+        let b = client(&c, "b");
+        assert_eq!(a.node_id, "");
+        assert!(matches!(
+            set_client_node(&c, &a.id, "missing"),
+            Err(StoreError::NotFound)
+        ));
+        set_client_node(&c, &a.id, "n1").unwrap();
+        set_client_node(&c, &b.id, "n1").unwrap();
+        create_tunnel(&c, &nt(&a.id, "ssh", 6000), 1).unwrap();
+        let devices = list_node_devices(&c, "n1").unwrap();
+        assert_eq!(devices.len(), 2);
+        let da = devices.iter().find(|d| d.id == a.id).unwrap();
+        assert_eq!(
+            (da.config.proxies.len(), da.disabled, da.pubkey.len()),
+            (1, false, 64)
+        );
+        assert_eq!(get_node(&c, "n1").unwrap().clients, 2);
+        assert!(
+            matches!(delete_node(&c, "n1", 20), Err(StoreError::Conflict(m)) if m.contains("2 client"))
+        );
+        update_client(&c, &b.id, None, Some(true), 21).unwrap();
+        assert_eq!(
+            list_node_devices(&c, "n1").unwrap().len(),
+            1,
+            "disabled devices are not sent"
+        );
+        assert!(node_device(&c, &b.id).unwrap().disabled);
+        delete_client(&c, &b.id, 22).unwrap();
+        assert!(matches!(node_device(&c, &b.id), Err(StoreError::NotFound)));
+        assert_eq!(
+            client_node_id_any(&c, &b.id).unwrap(),
+            "n1",
+            "deleted devices still tell which node to notify"
+        );
+        delete_client(&c, &a.id, 23).unwrap();
+        // 改名 / 停用 / 删除。
+        let n = update_node(&c, "n1", Some("renamed"), Some(true), 30).unwrap();
+        assert_eq!((n.name.as_str(), n.disabled_at), ("renamed", Some(30)));
+        assert_eq!(
+            update_node(&c, "n1", None, Some(false), 31)
+                .unwrap()
+                .disabled_at,
+            None
+        );
+        assert!(update_node(&c, "n1", Some(""), None, 32).is_err());
+        assert_eq!(
+            update_node(&c, "n1", Some("only-name"), None, 33)
+                .unwrap()
+                .name,
+            "only-name"
+        );
+        set_client_node(&c, &a.id, "").unwrap();
+        assert_eq!(client_node_id_any(&c, &a.id).unwrap(), "");
+        delete_node(&c, "n1", 40).unwrap();
+        assert!(matches!(get_node(&c, "n1"), Err(StoreError::NotFound)));
+        assert!(list_nodes(&c).unwrap().is_empty());
+        assert!(matches!(
+            delete_node(&c, "n1", 41),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn proxy_protocol_is_validated_persisted_and_shipped_to_devices() {
+        let c = conn();
+        let a = client(&c, "a");
+        let mut t = nt(&a.id, "ssh", 6000);
+        t.proxy_protocol = 2;
+        let created = create_tunnel(&c, &t, 1).unwrap();
+        assert_eq!(created.proxy_protocol, 2);
+        let managed = managed_config(&c, &a.id).unwrap();
+        assert_eq!(managed.proxies[0].proxy_protocol, 2);
+        // 修改：缺省保持；显式改成 0 / 1。
+        let kept = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                name: Some("ssh2".into()),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(kept.proxy_protocol, 2);
+        set_tunnel_status(&c, &created.id, "running", 6000, "").unwrap();
+        let same = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                proxy_protocol: Some(2),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            same.state, "running",
+            "unchanged value does not restart the data plane"
+        );
+        let changed = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                proxy_protocol: Some(1),
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (changed.proxy_protocol, changed.state.as_str()),
+            (1, "pending")
+        );
+        // 非法：版本号超范围；udp 不支持。
+        for (kind, v) in [("tcp", 3u8), ("udp", 1u8)] {
+            let mut bad = nt(&a.id, "bad", 0);
+            bad.kind = kind.into();
+            bad.proxy_protocol = v;
+            assert!(
+                matches!(create_tunnel(&c, &bad, 5), Err(StoreError::Invalid(m)) if m.contains("proxy_protocol")),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn bandwidth_limit_is_validated_persisted_and_shipped_to_devices() {
+        let c = conn();
+        let a = client(&c, "a");
+        let mut t = nt(&a.id, "dl", 6000);
+        t.bandwidth_bps = 512 * 1024;
+        t.bandwidth_server = true;
+        let created = create_tunnel(&c, &t, 1).unwrap();
+        assert_eq!(
+            (created.bandwidth_bps, created.bandwidth_server),
+            (524_288, true)
+        );
+        let m = managed_config(&c, &a.id).unwrap();
+        assert_eq!(
+            (m.proxies[0].bandwidth_bps, m.proxies[0].bandwidth_server),
+            (524_288, true)
+        );
+        // 缺省保持；显式 0 取消限速。
+        let kept = update_tunnel(&c, &created.id, &TunnelPatch::default(), 2).unwrap();
+        assert_eq!(kept.bandwidth_bps, 524_288);
+        let off = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                bandwidth_bps: Some(0),
+                bandwidth_server: Some(false),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!((off.bandwidth_bps, off.bandwidth_server), (0, false));
+        for (kind, v) in [("tcp", MAX_BANDWIDTH + 1), ("udp", 1)] {
+            let mut bad = nt(&a.id, "bad", 0);
+            bad.kind = kind.into();
+            bad.bandwidth_bps = v;
+            assert!(
+                matches!(create_tunnel(&c, &bad, 4), Err(StoreError::Invalid(m)) if m.contains("bandwidth")),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_tags_and_restart_requests() {
+        let c = conn();
+        let a = client(&c, "a");
+        assert!(a.tags.is_empty());
+        let t =
+            set_client_tags(&c, &a.id, &[" prod ".into(), "web".into(), "prod".into()]).unwrap();
+        assert_eq!(t.tags, vec!["prod".to_string(), "web".to_string()]);
+        assert!(
+            get_client(&c, &a.id).unwrap().tags.len() == 2
+                && list_clients(&c).unwrap()[0].tags.len() == 2
+        );
+        for bad in [
+            vec!["".to_string()],
+            vec!["x".repeat(33)],
+            vec!["a\nb".to_string()],
+            (0..9).map(|i| format!("t{i}")).collect(),
+        ] {
+            assert!(
+                matches!(
+                    set_client_tags(&c, &a.id, &bad),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(set_client_tags(&c, &a.id, &[]).unwrap().tags.is_empty());
+        assert!(matches!(
+            set_client_tags(&c, "nope", &[]),
+            Err(StoreError::NotFound)
+        ));
+        // 重启请求递增计数，并随配置下发、同时提升配置版本。
+        let before = managed_config(&c, &a.id).unwrap();
+        assert_eq!(before.restart_seq, 0);
+        assert_eq!(request_client_restart(&c, &a.id).unwrap(), 1);
+        assert_eq!(request_client_restart(&c, &a.id).unwrap(), 2);
+        let after = managed_config(&c, &a.id).unwrap();
+        assert_eq!(after.restart_seq, 2);
+        assert!(after.revision > before.revision);
+        assert!(matches!(
+            request_client_restart(&c, "nope"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn domain_subdomain_and_rewrite_validation_boundaries() {
+        let long_label = "a".repeat(64);
+        let long_name = format!("{}.com", "a.".repeat(127));
+        for bad in [
+            "",
+            "*.",
+            "a..b",
+            "a_b.com",
+            "-a.com",
+            "a-.com",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert!(normalize_domains(&[bad.to_string()]).is_err(), "{bad}");
+        }
+        assert_eq!(
+            normalize_domains(&[
+                "*.Example.COM".into(),
+                " a.b-c.io ".into(),
+                "*.example.com".into()
+            ])
+            .unwrap(),
+            vec!["*.example.com", "a.b-c.io"]
+        );
+        for bad in [long_label.as_str(), "a_b", "-a", "a-"] {
+            assert!(check_subdomain(bad).is_err(), "{bad}");
+        }
+        assert!(check_subdomain("").is_ok() && check_subdomain("web-1").is_ok());
+        for bad in ["a b", "a\tb", "a\u{7}b", "x".repeat(254).as_str()] {
+            assert!(check_rewrite(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_rewrite("inner.lan:8080").is_ok());
+    }
+
+    #[test]
+    fn web_only_fields_are_rejected_on_other_tunnel_kinds() {
+        let c = conn();
+        let a = client(&c, "a");
+        for field in 0..3 {
+            let mut t = nt(&a.id, &format!("t{field}"), 6100 + field);
+            match field {
+                0 => t.custom_domains = vec!["a.example.com".into()],
+                1 => t.subdomain = "web".into(),
+                _ => t.host_header_rewrite = "inner".into(),
+            }
+            assert!(
+                matches!(create_tunnel(&c, &t, 1), Err(StoreError::Invalid(m)) if m.contains("only apply to http")),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn tunnel_quota_counts_live_tunnels_only() {
+        let c = conn();
+        let cl = create_client(
+            &c,
+            &new_id(),
+            "c",
+            &"a".repeat(64),
+            "linux",
+            "x86_64",
+            "0",
+            1,
+        )
+        .unwrap();
+        let mk = |name: &str, port: i64| NewTunnel {
+            client_id: cl.id.clone(),
+            name: name.into(),
+            kind: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: port,
+            remote_port: 0,
+            enabled: true,
+            custom_domains: vec![],
+            subdomain: String::new(),
+            host_header_rewrite: String::new(),
+            http: Default::default(),
+            proxy_protocol: 0,
+            bandwidth_bps: 0,
+            bandwidth_server: false,
+        };
+        let a = create_tunnel(&c, &mk("a", 1), 1).unwrap();
+        assert!(enforce_tunnel_quota(&c, &cl.id, 1).is_ok());
+        assert!(enforce_tunnel_quota(&c, &cl.id, 0).is_ok(), "0 = unlimited");
+        create_tunnel(&c, &mk("b", 2), 2).unwrap();
+        assert!(matches!(
+            enforce_tunnel_quota(&c, &cl.id, 1),
+            Err(StoreError::Conflict(m)) if m.contains("limit")
+        ));
+        delete_tunnel(&c, &a.id, 3).unwrap();
+        assert!(enforce_tunnel_quota(&c, &cl.id, 1).is_ok());
+    }
+
+    #[test]
+    fn update_admin_keeps_one_active_owner_and_revokes_sessions() {
+        let c = conn();
+        let o1 = create_admin(&c, "o1", "h", Role::Owner, 0).unwrap();
+        let o2 = create_admin(&c, "o2", "h", Role::Owner, 0).unwrap();
+        create_session(&c, "t1", &o1.id, "c", 0, 10_000).unwrap();
+        // 还有另一个 owner 时可以降级，且会话被吊销。
+        let d = update_admin(&c, &o1.id, Some(Role::Viewer), None, None, 5).unwrap();
+        assert_eq!(d.role, Role::Viewer);
+        assert!(matches!(
+            find_session(&c, "t1", 1),
+            Err(StoreError::NotFound)
+        ));
+        // 最后一个启用的 owner 不能降级或禁用。
+        for (r, dis) in [(Some(Role::Admin), None), (None, Some(true))] {
+            assert!(matches!(
+                update_admin(&c, &o2.id, r, dis, None, 6),
+                Err(StoreError::Conflict(m)) if m.contains("owner")
+            ));
+        }
+        assert_eq!(get_admin(&c, &o2.id).unwrap().role, Role::Owner);
+        // 非 owner 的启停与改密码；启用不吊销会话。
+        update_admin(&c, &o1.id, None, Some(true), None, 7).unwrap();
+        assert_eq!(get_admin(&c, &o1.id).unwrap().disabled_at, Some(7));
+        create_session(&c, "t2", &o2.id, "c", 0, 10_000).unwrap();
+        update_admin(&c, &o1.id, None, Some(false), None, 8).unwrap();
+        assert!(find_session(&c, "t2", 1).is_ok());
+        update_admin(&c, &o1.id, None, None, Some("new"), 9).unwrap();
+        assert_eq!(find_admin_with_hash(&c, "o1").unwrap().1, "new");
+        assert!(matches!(
+            update_admin(&c, "missing", None, None, None, 1),
+            Err(StoreError::NotFound)
+        ));
+        // 只改密码：即使是唯一启用的 owner 也允许。
+        update_admin(&c, &o2.id, None, None, Some("pw"), 9).unwrap();
+        assert_eq!(find_admin_with_hash(&c, "o2").unwrap().1, "pw");
+        // 禁用的 owner 再启用 / 提升不受限制。
+        update_admin(&c, &o1.id, Some(Role::Owner), None, None, 10).unwrap();
+        assert!(update_admin(&c, &o2.id, Some(Role::Admin), None, None, 11).is_ok());
     }
 
     #[test]
@@ -1242,6 +2513,10 @@ mod tests {
             custom_domains: domains.iter().map(|d| d.to_string()).collect(),
             subdomain: sub.into(),
             host_header_rewrite: String::new(),
+            http: Default::default(),
+            proxy_protocol: 0,
+            bandwidth_bps: 0,
+            bandwidth_server: false,
         };
         let w = create_tunnel(
             &c,
@@ -1567,5 +2842,40 @@ mod tests {
                 tokens_pending: 0
             }
         );
+    }
+    #[test]
+    fn no_op_and_display_name_changes_preserve_live_status() {
+        let c = conn();
+        let a = client(&c, "idempotent");
+        let t = create_tunnel(&c, &nt(&a.id, "ssh", 6000), 0).unwrap();
+        set_tunnel_status(&c, &t.id, "running", 6000, "").unwrap();
+        for patch in [
+            TunnelPatch::default(),
+            TunnelPatch {
+                enabled: Some(true),
+                ..Default::default()
+            },
+            TunnelPatch {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+        ] {
+            let updated = update_tunnel(&c, &t.id, &patch, 1).unwrap();
+            assert_eq!(
+                (updated.state.as_str(), updated.status_port),
+                ("running", 6000)
+            );
+        }
+        let updated = update_tunnel(
+            &c,
+            &t.id,
+            &TunnelPatch {
+                local_port: Some(23),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(updated.state, "pending");
     }
 }

@@ -247,6 +247,7 @@ async fn enroll_push_config_hot_update_and_reconnect() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 1,
         proxies: vec![mp("a", 0, echo_a)],
+        ..Default::default()
     }));
     let ev = until(&mut rig.events, |e| {
         matches!(e.state, ProxyState::Running(_))
@@ -272,6 +273,7 @@ async fn enroll_push_config_hot_update_and_reconnect() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 2,
         proxies: vec![mp("a", 0, echo_b), mp("b", 0, echo_a)],
+        ..Default::default()
     }));
     let ev = until(&mut rig.events, |e| {
         e.name == "b" && matches!(e.state, ProxyState::Running(_))
@@ -291,6 +293,7 @@ async fn enroll_push_config_hot_update_and_reconnect() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 3,
         proxies: vec![mp("b", 0, echo_a)],
+        ..Default::default()
     }));
     let ev = until(&mut rig.events, |e| e.state == ProxyState::Stopped).await;
     assert_eq!(ev.name, "a");
@@ -305,6 +308,7 @@ async fn enroll_push_config_hot_update_and_reconnect() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 4,
         proxies: vec![mp("b", busy_port, echo_a), udp],
+        ..Default::default()
     }));
     let mut failed = Vec::new();
     while failed.len() < 2 {
@@ -456,6 +460,7 @@ async fn disconnect_stops_running_proxies_and_names_are_unique_across_sessions()
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 1,
         proxies: vec![mp("same", 0, echo_port)],
+        ..Default::default()
     }));
     let running = until(&mut rig.events, |e| {
         matches!(e.state, ProxyState::Running(_))
@@ -552,6 +557,7 @@ async fn managed_http_and_udp_proxies_follow_config_changes() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 1,
         proxies: vec![web(&["a.example.com"], ""), dns.clone()],
+        ..Default::default()
     }));
     until(&mut rig.events, |e| {
         e.name == "web" && matches!(e.state, ProxyState::Running(_))
@@ -582,6 +588,7 @@ async fn managed_http_and_udp_proxies_follow_config_changes() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 2,
         proxies: vec![web(&["b.example.com"], "internal.lan"), dns.clone()],
+        ..Default::default()
     }));
     until(&mut rig.events, |e| {
         e.name == "web" && e.state == ProxyState::Stopped
@@ -602,6 +609,7 @@ async fn managed_http_and_udp_proxies_follow_config_changes() {
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 3,
         proxies: vec![web(&["b.example.com"], "internal.lan"), moved],
+        ..Default::default()
     }));
     until(&mut rx, |e| {
         matches!(e, Event::ConfigApplied { revision: 3, .. })
@@ -622,6 +630,7 @@ mod cli_flow {
 
     fn opts(port: u16, token: Option<&str>, state_dir: Option<&str>) -> Command {
         Command::Run(Options {
+            local_control: None,
             mode: Mode::Client,
             config: String::new(),
             managed: Some(ManagedOpts {
@@ -630,13 +639,15 @@ mod cli_flow {
                 name: Some("cli-box".into()),
                 state_dir: state_dir.map(str::to_string),
                 ca_file: None,
+                tls_pin: None,
+                public_host: None,
             }),
             strict: true,
             allow_unsafe: vec![],
         })
     }
 
-    async fn run_for(cmd: Command, fs: &MemFs, env: &MapEnv, ms: u64) -> (i32, String) {
+    async fn run_for(cmd: Command, fs: &dyn ConfigFs, env: &MapEnv, ms: u64) -> (i32, String) {
         let cancel = CancellationToken::new();
         let stopper = {
             let c = cancel.clone();
@@ -677,6 +688,182 @@ mod cli_flow {
         );
         assert_eq!(run.0, 0);
         assert!(online, "the saved identity logs in without an enroll token");
+        rig.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_restart_request_exits_with_the_restart_code_only_when_supervised() {
+        for (supervised, want) in [(true, 75), (false, 0)] {
+            let rig = rig().await;
+            let (fs, env) = (
+                MemFs::new(),
+                if supervised {
+                    MapEnv(
+                        [("RUSTFRP_SUPERVISED".to_string(), "1".to_string())]
+                            .into_iter()
+                            .collect(),
+                    )
+                } else {
+                    MapEnv::default()
+                },
+            );
+            // 先接入一次，保存身份；第二次运行用签名登录。
+            let (code, _) = run_for(opts(rig.port, Some("good"), Some("/s")), &fs, &env, 600).await;
+            assert_eq!(code, 0);
+            let cfg = rig.cfg.clone();
+            let bump = async move {
+                // 先让设备拿到基线，再下发更大的重启计数。
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                cfg.send_replace(Arc::new(ConfigSet {
+                    revision: 2,
+                    restart_seq: 1,
+                    ..Default::default()
+                }));
+            };
+            let (run, _) = tokio::join!(
+                run_for(opts(rig.port, None, Some("/s")), &fs, &env, 1500),
+                bump
+            );
+            assert_eq!(run.0, want, "supervised={supervised}: {}", run.1);
+            rig.stop.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_control_tracks_real_connection_and_rejects_invalid_setup() {
+        let rig = rig().await;
+        let dir = std::env::temp_dir().join(format!(
+            "rustfrp-control-{}",
+            rustfrp_core::auth::random_id()
+        ));
+        let path = dir.join("control.json").to_string_lossy().into_owned();
+        let Command::Run(mut o) = opts(rig.port, Some("good"), Some("/local")) else {
+            panic!("run")
+        };
+        o.local_control = Some(path.clone());
+        let probe = async {
+            for _ in 0..100 {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    let d: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if let Ok(mut stream) =
+                        TcpStream::connect(("127.0.0.1", d["port"].as_u64().unwrap() as u16)).await
+                    {
+                        let request = serde_json::json!({"token":d["token"],"command":"status"});
+                        stream
+                            .write_all(format!("{request}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        let mut text = String::new();
+                        stream.read_to_string(&mut text).await.unwrap();
+                        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if status["connected"] == true {
+                            rig.stop.cancel();
+                            for _ in 0..50 {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                let mut stream = TcpStream::connect((
+                                    "127.0.0.1",
+                                    d["port"].as_u64().unwrap() as u16,
+                                ))
+                                .await
+                                .unwrap();
+                                stream
+                                    .write_all(format!("{request}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                let mut text = String::new();
+                                stream.read_to_string(&mut text).await.unwrap();
+                                let disconnected: serde_json::Value =
+                                    serde_json::from_str(&text).unwrap();
+                                if disconnected["connected"] == false {
+                                    assert_eq!(disconnected["proxies"], 0);
+                                    return status;
+                                }
+                            }
+                            panic!("disconnect not reflected");
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("local agent never connected")
+        };
+        let (local_fs, local_env) = (MemFs::new(), MapEnv::default());
+        let (run, status) = tokio::join!(
+            run_for(Command::Run(o.clone()), &local_fs, &local_env, 600),
+            probe
+        );
+        assert_eq!(run.0, 0, "{}", run.1);
+        assert_eq!(status["version"], 1);
+        assert_eq!(status["pid"], std::process::id());
+        o.managed = None;
+        let run = run_for(
+            Command::Run(o.clone()),
+            &MemFs::new(),
+            &MapEnv::default(),
+            1,
+        )
+        .await;
+        assert!(run.0 == 1 && run.1.contains("requires managed"));
+        o.managed = match opts(rig.port, Some("good"), Some("/local")) {
+            Command::Run(o) => o.managed,
+            _ => unreachable!(),
+        };
+        tokio::fs::write(&path, "bad").await.unwrap();
+        let run = run_for(Command::Run(o), &MemFs::new(), &MapEnv::default(), 1).await;
+        assert_eq!(run.0, 1);
+        assert!(run.1.contains("local control"));
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+        rig.stop.cancel();
+    }
+
+    struct FailSecondSave {
+        fs: MemFs,
+        writes: AtomicUsize,
+    }
+    impl ConfigFs for FailSecondSave {
+        fn read_to_string(&self, p: &str) -> std::io::Result<String> {
+            self.fs.read_to_string(p)
+        }
+        fn list_files(&self, p: &str) -> std::io::Result<Vec<String>> {
+            self.fs.list_files(p)
+        }
+        fn dir_exists(&self, p: &str) -> bool {
+            self.fs.dir_exists(p)
+        }
+        fn create_dir_all(&self, p: &str) -> std::io::Result<()> {
+            self.fs.create_dir_all(p)
+        }
+        fn write_private(&self, p: &str, value: &str) -> std::io::Result<()> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "disk read-only",
+                ));
+            }
+            self.fs.write_private(p, value)
+        }
+    }
+    #[tokio::test]
+    async fn failed_enrollment_persistence_is_fatal() {
+        let rig = rig().await;
+        let fs = FailSecondSave {
+            fs: MemFs::new(),
+            writes: AtomicUsize::new(0),
+        };
+        let result = run_for(
+            opts(rig.port, Some("good"), Some("/state")),
+            &fs,
+            &MapEnv::default(),
+            800,
+        )
+        .await;
+        assert_eq!(result.0, 1);
+        assert!(result.1.contains("managed identity") && result.1.contains("disk read-only"));
+        assert_eq!(fs.writes.load(Ordering::SeqCst), 2);
+        assert!(!fs
+            .read_to_string("/state/identity.json")
+            .unwrap()
+            .contains("dev-1"));
         rig.stop.cancel();
     }
 

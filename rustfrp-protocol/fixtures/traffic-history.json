@@ -1,0 +1,1 @@
+{"range_hours":24,"bucket_ms":3600000,"sampled_only":true,"items":[{"timestamp":3600000,"bytes_in":24,"bytes_out":48,"connections_total":9,"connections_peak":2,"samples":4,"gap":true}],"window_end":3600000}

@@ -5,11 +5,11 @@
 //! * **受管模式**：由 Controller 的策略放行客户端，并通过 `watch` 通道下发整份配置，Edge 对账后增删代理。
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustfrp_core::auth::{self, random_id};
@@ -30,7 +30,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::log::Logger;
-use crate::proxy_rt::{serve_vhost, udp_proxy, Route, Routes, UdpOpts, VhostOpts};
+use crate::proxy_rt::{serve_vhost, udp_proxy, HttpRoute, Route, Routes, UdpOpts, VhostOpts};
 
 /// 装箱的异步返回值。
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -177,25 +177,6 @@ impl EdgeConfig {
     }
 }
 
-/// 全局已占用的代理名（跨客户端去重）。
-#[derive(Default)]
-struct Names(Mutex<HashSet<String>>);
-
-impl Names {
-    fn claim(&self, name: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(name.to_string())
-    }
-    fn release(&self, name: &str) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(name);
-    }
-}
-
 /// 已绑定、待运行的边缘节点。
 pub struct Edge {
     listener: TcpListener,
@@ -205,6 +186,10 @@ pub struct Edge {
     cfg: Arc<EdgeConfig>,
     policy: Arc<dyn Policy>,
     log: Logger,
+    traffic: Arc<pipe::Traffic>,
+    metrics: Arc<crate::metrics::Metrics>,
+    retain_metrics: bool,
+    fingerprint: String,
 }
 
 impl Edge {
@@ -217,7 +202,9 @@ impl Edge {
         let policy = Arc::new(TokenPolicy {
             token: cfg.token.clone(),
         });
-        Self::bind_with_policy(cfg, identity, policy, log).await
+        let mut edge = Self::bind_with_policy(cfg, identity, policy, log).await?;
+        edge.retain_metrics = false;
+        Ok(edge)
     }
 
     /// 绑定监听端口并使用自定义登录策略。
@@ -231,6 +218,11 @@ impl Edge {
             Some(i) => i,
             None => tls::self_signed(vec!["rustfrp".into()])?,
         };
+        let fingerprint = id
+            .certs
+            .first()
+            .map(tls::certificate_fingerprint)
+            .unwrap_or_default();
         let acceptor = TlsAcceptor::from(tls::server_config(id)?);
         let listener = TcpListener::bind((cfg.bind_addr.as_str(), cfg.bind_port)).await?;
         let vhost = |port: Option<u16>| {
@@ -244,6 +236,7 @@ impl Edge {
         };
         let http_listener = vhost(cfg.vhost_http_port).await?;
         let https_listener = vhost(cfg.vhost_https_port).await?;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
         Ok(Edge {
             listener,
             http_listener,
@@ -252,7 +245,32 @@ impl Edge {
             cfg: Arc::new(cfg),
             policy,
             log,
+            traffic: metrics.total(),
+            metrics,
+            retain_metrics: true,
+            fingerprint,
         })
+    }
+
+    /// 是否保留已停止代理的计数条目直到被确认回收（受管 Controller 采样用）；节点本身不采样时应关闭。
+    pub fn retain_metrics(mut self, retain: bool) -> Self {
+        self.retain_metrics = retain;
+        self
+    }
+
+    /// 数据面实时总计数。
+    pub fn traffic(&self) -> Arc<pipe::Traffic> {
+        self.traffic.clone()
+    }
+
+    /// 服务端叶证书指纹，供可信控制面生成固定证书接入命令。
+    pub fn certificate_fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// 按代理采样注册表。
+    pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
+        self.metrics.clone()
     }
 
     /// 实际监听地址。
@@ -276,7 +294,9 @@ impl Edge {
 
     /// 运行直到 `shutdown` 被取消。
     pub async fn serve(self, shutdown: CancellationToken) {
-        let names = Arc::new(Names::default());
+        let names = self.metrics.clone();
+        let mut sweep = tokio::time::interval(Duration::from_secs(5));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let routes = Arc::new(Routes::default());
         let vopts = VhostOpts {
             head_timeout: self.cfg.vhost_head_timeout,
@@ -297,6 +317,7 @@ impl Edge {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = sweep.tick(), if !self.retain_metrics => { names.sweep_stopped(); },
                 accepted = self.listener.accept() => {
                     let Ok((tcp, peer)) = accepted else { continue };
                     let ctx = ClientCtx {
@@ -305,6 +326,8 @@ impl Edge {
                         policy: self.policy.clone(),
                         names: names.clone(),
                         routes: routes.clone(),
+                        traffic: self.traffic.clone(),
+                        limiter: None,
                         log: self.log.clone(),
                         cancel: shutdown.child_token(),
                     };
@@ -324,8 +347,11 @@ struct ClientCtx {
     cfg: Arc<EdgeConfig>,
     acceptor: TlsAcceptor,
     policy: Arc<dyn Policy>,
-    names: Arc<Names>,
+    names: Arc<crate::metrics::Metrics>,
     routes: Arc<Routes>,
+    traffic: Arc<pipe::Traffic>,
+    /// 服务端限速（`bandwidthLimitMode = "server"`）；`None` = 不限。
+    limiter: Option<Arc<pipe::Limiter>>,
     log: Logger,
     cancel: CancellationToken,
 }
@@ -602,6 +628,8 @@ async fn reconcile(
     for name in stale {
         if let Some(r) = running.remove(&name) {
             r.stop.cancel();
+            // 路由的异步清理可能晚于下面的重新登记：先同步摘掉，避免与自己的旧路由冲突。
+            ctx.routes.remove_proxy(&name);
             ctx.names.release(&name);
             emit(&name, ProxyState::Stopped);
         }
@@ -639,6 +667,9 @@ struct ProxyDef {
     custom_domains: Vec<String>,
     subdomain: String,
     host_header_rewrite: String,
+    http: rustfrp_core::wire::HttpOpts,
+    bandwidth_bps: u64,
+    bandwidth_server: bool,
 }
 
 impl From<&ProxySpec> for ProxyDef {
@@ -650,6 +681,9 @@ impl From<&ProxySpec> for ProxyDef {
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
             host_header_rewrite: p.host_header_rewrite.clone(),
+            http: p.http.clone(),
+            bandwidth_bps: p.bandwidth_bps,
+            bandwidth_server: p.bandwidth_server,
         }
     }
 }
@@ -663,6 +697,9 @@ impl From<&ManagedProxy> for ProxyDef {
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
             host_header_rewrite: p.host_header_rewrite.clone(),
+            http: p.http.clone(),
+            bandwidth_bps: p.bandwidth_bps,
+            bandwidth_server: p.bandwidth_server,
         }
     }
 }
@@ -674,6 +711,9 @@ fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
         && a.custom_domains == b.custom_domains
         && a.subdomain == b.subdomain
         && a.host_header_rewrite == b.host_header_rewrite
+        && a.http == b.http
+        && a.bandwidth_server == b.bandwidth_server
+        && (!a.bandwidth_server || a.bandwidth_bps == b.bandwidth_bps)
 }
 
 /// 启动一个代理（tcp / udp / http / https）。成功返回（对外端口, 停止令牌），失败返回给客户端看的原因。
@@ -686,7 +726,10 @@ async fn activate(
         return Err(format!("proxy type [{}] is not supported yet", def.kind));
     }
     if !ctx.names.claim(&def.name) {
-        return Err(format!("proxy [{}] already exists", def.name));
+        return Err(format!(
+            "proxy [{}] already exists or metrics capacity reached",
+            def.name
+        ));
     }
     let stop = ctx.cancel.child_token();
     match launch(session, def, ctx, &stop).await {
@@ -712,7 +755,16 @@ async fn launch(
     stop: &CancellationToken,
 ) -> Result<u16, String> {
     let sub = ClientCtx {
+        traffic: ctx
+            .names
+            .counter(&def.name)
+            .ok_or_else(|| "proxy metrics missing".to_string())?,
         cancel: stop.clone(),
+        limiter: if def.bandwidth_server {
+            pipe::Limiter::new(def.bandwidth_bps)
+        } else {
+            None
+        },
         ..ctx.clone()
     };
     match def.kind.as_str() {
@@ -734,6 +786,7 @@ async fn launch(
                 idle: ctx.cfg.udp_idle,
                 packet_size: ctx.cfg.udp_packet_size,
                 open_timeout: ctx.cfg.user_conn_timeout,
+                traffic: sub.traffic.clone(),
             };
             tokio::spawn(udp_proxy(
                 sock,
@@ -776,6 +829,13 @@ async fn launch(
                 proxy: def.name.clone(),
                 session: session.clone(),
                 rewrite: def.host_header_rewrite.clone(),
+                traffic: sub.traffic.clone(),
+                limiter: sub.limiter.clone(),
+                http: Arc::new(if https {
+                    HttpRoute::default()
+                } else {
+                    HttpRoute::from_opts(&def.http)?
+                }),
             };
             let route_id = ctx.routes.add(https, &hosts, &route)?;
             let (routes, stop) = (ctx.routes.clone(), stop.clone());
@@ -883,9 +943,22 @@ async fn forward(
         &StartWork {
             proxy: name.to_string(),
             src: peer.to_string(),
+            dst: visitor
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
         },
     )
     .await?;
-    pipe::relay(&mut visitor, &mut stream).await?;
+    match &ctx.limiter {
+        Some(l) => {
+            let mut v = pipe::Limited::new(visitor, l.clone());
+            let mut w = pipe::Limited::new(stream, l.clone());
+            pipe::relay_counted(&mut v, &mut w, &ctx.traffic).await?;
+        }
+        None => {
+            pipe::relay_counted(&mut visitor, &mut stream, &ctx.traffic).await?;
+        }
+    }
     Ok(())
 }

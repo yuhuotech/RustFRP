@@ -13,6 +13,7 @@ serde_ignored.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 serde_yaml_ng = "0.10"
+httparse = "1"
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

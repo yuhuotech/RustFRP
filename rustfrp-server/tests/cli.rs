@@ -186,3 +186,58 @@ async fn run_starts_and_stops_on_cancel() {
     assert_eq!(code, 1);
     cleanup(&db);
 }
+
+#[tokio::test]
+async fn backup_command_preserves_live_database_and_rejects_invalid_targets() {
+    let db = tmp_db();
+    let env = Env::new(&db, &[]);
+    let copy = db.with_extension("snapshot.db");
+    assert!(parse(&["backup".into()]).is_err());
+    assert!(parse(&["backup".into(), "".into()]).is_err());
+    assert_eq!(
+        run(&["backup", copy.to_str().unwrap()], &env, "").await.0,
+        1
+    );
+    assert!(
+        !db.exists(),
+        "backup must not silently create an empty source"
+    );
+    assert_eq!(
+        run(&["admin", "create", "root"], &env, "long-enough-password")
+            .await
+            .0,
+        0
+    );
+    let result = run(&["backup", copy.to_str().unwrap()], &env, "").await;
+    assert_eq!(result.0, 0, "{}", result.2);
+    assert!(result.1.contains("snapshot saved"));
+    let restored = Env::new(&copy, &[]);
+    assert!(run(&["admin", "list"], &restored, "")
+        .await
+        .1
+        .contains("root"));
+    assert_eq!(
+        run(&["backup", copy.to_str().unwrap()], &env, "").await.0,
+        1
+    );
+    assert_eq!(
+        run(&["backup", "/nonexistent-folder/foo.db"], &env, "")
+            .await
+            .0,
+        1
+    );
+    cleanup(&copy);
+    cleanup(&db);
+    let directory = std::env::temp_dir().join(format!(
+        "rustfrp-backup-dir-{}",
+        rustfrp_server::store::new_id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    assert_eq!(
+        run(&["backup", "unused.db"], &Env::new(&directory, &[]), "")
+            .await
+            .0,
+        1
+    );
+    std::fs::remove_dir(directory).unwrap();
+}

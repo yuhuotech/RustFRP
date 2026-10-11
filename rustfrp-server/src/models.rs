@@ -77,6 +77,12 @@ pub struct Client {
     /// 是否在线（运行时状态，不入库）。
     #[serde(default)]
     pub online: bool,
+    /// 服务该设备的节点 ID（空串 = 内置节点）。
+    #[serde(default)]
+    pub node_id: String,
+    /// 标签（最多 8 个，每个 1–32 个字符）。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// 隧道（spec + status）。
@@ -117,6 +123,30 @@ pub struct Tunnel {
     /// http：改写 Host 头。
     #[serde(default)]
     pub host_header_rewrite: String,
+    /// http：路径前缀（空 = `/`）。
+    #[serde(default)]
+    pub locations: Vec<String>,
+    /// http：Basic 认证用户名。
+    #[serde(default)]
+    pub http_user: String,
+    /// http：是否设置了 Basic 认证密码（密码本身永不通过 API 返回）。
+    #[serde(default)]
+    pub http_password_set: bool,
+    /// http：按请求里的 Basic 用户名选路。
+    #[serde(default)]
+    pub route_by_http_user: String,
+    /// http：转发前设置的请求头。
+    #[serde(default)]
+    pub request_headers: std::collections::BTreeMap<String, String>,
+    /// PROXY protocol 版本：0 = 不写，1 / 2 = v1 / v2。
+    #[serde(default)]
+    pub proxy_protocol: u8,
+    /// 带宽上限（字节 / 秒），0 = 不限。
+    #[serde(default)]
+    pub bandwidth_bps: u64,
+    /// 限速由服务端执行（否则由客户端）。
+    #[serde(default)]
+    pub bandwidth_server: bool,
 }
 
 /// 接入令牌（不含明文）。
@@ -138,6 +168,53 @@ pub struct EnrollToken {
     pub client_id: Option<String>,
     /// 撤销时间。
     pub revoked_at: Option<i64>,
+    /// 令牌类型：`client` 或 `node`。
+    #[serde(default)]
+    pub kind: String,
+    /// 设备令牌指定的节点（空串 = 内置节点）。
+    #[serde(default)]
+    pub node_id: String,
+}
+
+/// 节点（运行 Edge 的进程）。`id` 为空串表示内置节点。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node {
+    /// ID（内置节点为空串）。
+    pub id: String,
+    /// 名称。
+    pub name: String,
+    /// 是否为内置节点。
+    pub builtin: bool,
+    /// 对外主机名。
+    pub public_host: String,
+    /// 客户端接入端口。
+    pub edge_port: u16,
+    /// 叶证书 SHA-256 指纹。
+    pub tls_fingerprint: String,
+    /// HTTP 虚拟主机端口。
+    pub vhost_http: Option<u16>,
+    /// HTTPS 虚拟主机端口。
+    pub vhost_https: Option<u16>,
+    /// 子域名后缀。
+    pub subdomain_host: String,
+    /// 允许分配的端口区间。
+    pub allow_ports: Vec<(u16, u16)>,
+    /// 版本。
+    pub version: String,
+    /// 系统。
+    pub os: String,
+    /// 创建时间。
+    pub created_at: i64,
+    /// 最近一次与 Controller 通信的时间。
+    pub last_seen_at: Option<i64>,
+    /// 停用时间。
+    pub disabled_at: Option<i64>,
+    /// 控制连接是否在线（运行时状态，不入库）。
+    #[serde(default)]
+    pub online: bool,
+    /// 由该节点服务的设备数。
+    #[serde(default)]
+    pub clients: i64,
 }
 
 /// 审计记录。

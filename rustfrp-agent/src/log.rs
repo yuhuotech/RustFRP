@@ -47,6 +47,7 @@ impl Level {
 pub struct Logger {
     level: Level,
     sink: Arc<Mutex<Box<dyn Write + Send>>>,
+    ring: Option<Arc<crate::log_ring::LogRing>>,
 }
 
 impl Logger {
@@ -55,7 +56,14 @@ impl Logger {
         Self {
             level,
             sink: Arc::new(Mutex::new(sink)),
+            ring: None,
         }
+    }
+
+    /// 额外保留经过限长和脱敏的日志，不改变原有日志级别。
+    pub fn with_ring(mut self, ring: Arc<crate::log_ring::LogRing>) -> Self {
+        self.ring = Some(ring);
+        self
     }
 
     /// 按 frp 的 `log.to` 创建：`console` 写 stderr，否则追加到文件。
@@ -77,6 +85,9 @@ impl Logger {
     pub fn log(&self, level: Level, msg: &str) {
         if level < self.level {
             return;
+        }
+        if let Some(ring) = &self.ring {
+            ring.push(msg);
         }
         let mut sink = self.sink.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = writeln!(sink, "[{}] {msg}", level.tag());

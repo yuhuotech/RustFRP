@@ -39,6 +39,18 @@ impl From<rusqlite::Error> for StoreError {
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_tunnel_domains.sql")),
+    (3, include_str!("../migrations/0003_retention_indices.sql")),
+    (4, include_str!("../migrations/0004_traffic.sql")),
+    (5, include_str!("../migrations/0005_api_tokens.sql")),
+    (6, include_str!("../migrations/0006_config_import.sql")),
+    (7, include_str!("../migrations/0007_http_options.sql")),
+    (8, include_str!("../migrations/0008_nodes.sql")),
+    (
+        9,
+        include_str!("../migrations/0009_client_tags_restart.sql"),
+    ),
+    (10, include_str!("../migrations/0010_proxy_protocol.sql")),
+    (11, include_str!("../migrations/0011_bandwidth.sql")),
 ];
 
 /// 执行未应用的迁移（以 `PRAGMA user_version` 记录进度）。
@@ -83,6 +95,15 @@ impl Db {
         })
     }
 
+    /// 只读打开已有数据库；备份不会隐式创建、迁移源库或改变其 journal_mode。
+    pub fn open_read_only(path: &Path) -> Result<Db, StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        tune(&conn)?;
+        Ok(Db {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     /// 内存数据库（测试）。
     pub fn open_memory() -> Result<Db, StoreError> {
         let mut conn = Connection::open_in_memory()?;
@@ -91,6 +112,11 @@ impl Db {
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// 创建包含 WAL 中已提交内容的一致性快照；不覆盖目标文件，完成后才原子发布。
+    pub async fn backup(&self, destination: std::path::PathBuf) -> Result<(), StoreError> {
+        self.call(move |c| snapshot(c, &destination)).await
     }
 
     /// 在阻塞线程里执行数据库操作。
@@ -109,6 +135,47 @@ impl Db {
     }
 }
 
+fn snapshot(c: &Connection, destination: &Path) -> Result<(), StoreError> {
+    use std::io;
+    let io_error = |e: io::Error| StoreError::Sqlite(format!("snapshot I/O: {e}"));
+    if destination.to_str().is_none() {
+        return Err(StoreError::Invalid(
+            "backup destination must be UTF-8".into(),
+        ));
+    }
+    if destination.exists() {
+        return Err(StoreError::Conflict(
+            "backup destination already exists".into(),
+        ));
+    }
+    let name = destination
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            StoreError::Invalid("backup destination must be a UTF-8 file path".into())
+        })?;
+    let staged = destination.with_file_name(format!(".{name}.{}.partial", crate::store::new_id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&staged).map_err(io_error)?;
+    let result = (|| {
+        // The destination was validated above and the generated suffix is ASCII.
+        c.execute("VACUUM INTO ?1", [staged.to_string_lossy().as_ref()])?;
+        file.sync_all().map_err(io_error)?;
+        // hard_link is an atomic, no-overwrite publish in the same directory.
+        // A crash leaves only an explicitly named .partial file until this point.
+        std::fs::hard_link(&staged, destination).map_err(io_error)?;
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_file(&staged).map_err(io_error);
+    result.and(cleanup)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
@@ -122,7 +189,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 11);
         for t in [
             "admins",
             "admin_sessions",

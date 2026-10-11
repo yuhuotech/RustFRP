@@ -13,7 +13,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,6 +40,10 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     /// 登录限流。
     pub limiter: Arc<LoginLimiter>,
+    /// 内置 Edge 实时计数。
+    pub metrics: Arc<rustfrp_agent::metrics::Metrics>,
+    /// 进程级有界脱敏日志。
+    pub logs: Arc<rustfrp_agent::log_ring::LogRing>,
 }
 
 // ───────────── 错误 ─────────────
@@ -208,6 +212,47 @@ impl FromRequestParts<AppState> for Auth {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        if let Some(header) = parts.headers.get(header::AUTHORIZATION) {
+            let bearer = header
+                .to_str()
+                .ok()
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .filter(|v| v.len() == 69 && v.starts_with("rfrp_"))
+                .ok_or_else(ApiError::unauthorized)?;
+            if parts.headers.contains_key(header::ORIGIN) && !same_origin(&parts.headers) {
+                return Err(ApiError::forbidden("cross-origin request rejected"));
+            }
+            let (hash, path, safe) = (
+                token_hash(bearer),
+                parts
+                    .extensions
+                    .get::<axum::extract::OriginalUri>()
+                    .map_or_else(
+                        || parts.uri.path().to_string(),
+                        |uri| uri.0.path().to_string(),
+                    ),
+                is_safe(&parts.method),
+            );
+            let admin = state
+                .db
+                .call(move |c| {
+                    crate::api_tokens::authenticate(c, &hash, store::now_ms(), &path, safe)
+                })
+                .await
+                .map_err(|e| match e {
+                    StoreError::NotFound => ApiError::unauthorized(),
+                    StoreError::Invalid(_) => {
+                        ApiError::forbidden("token scope denies this endpoint")
+                    }
+                    other => other.into(),
+                })?;
+            return Ok(Auth {
+                admin,
+                ip: client_ip(parts),
+                token_hash: String::new(),
+                csrf: String::new(),
+            });
+        }
         let token = cookie_value(&parts.headers, COOKIE).ok_or_else(ApiError::unauthorized)?;
         let th = token_hash(token);
         let h2 = th.clone();
@@ -404,17 +449,72 @@ async fn me(a: Auth) -> Json<serde_json::Value> {
 // ───────────── 概览 / 节点 ─────────────
 
 async fn overview(State(st): State<AppState>, _a: Auth) -> ApiResult<serde_json::Value> {
-    let counts = st.db.call(|c| store::counts(c, store::now_ms())).await?;
+    let (counts, day) = st
+        .db
+        .call(|c| {
+            let now = store::now_ms();
+            Ok((
+                store::counts(c, now)?,
+                crate::traffic::last_day_totals(c, now)?,
+            ))
+        })
+        .await?;
+    let traffic = st.metrics.total().snapshot();
     Ok(Json(json!({
+        "process": crate::process::sample(),
+        "traffic_24h": {"bytes_in": day.0, "bytes_out": day.1},
+        "traffic": {"bytes_in":traffic.bytes_in,"bytes_out":traffic.bytes_out,"connections":traffic.connections,"connections_total":traffic.connections_total},
         "counts": counts,
         "clients_online": st.hub.online_ids().len(),
         "version": env!("CARGO_PKG_VERSION"),
     })))
 }
 
+#[derive(Deserialize)]
+struct TrafficQuery {
+    #[serde(default = "traffic_hours")]
+    hours: i64,
+    tunnel_id: Option<String>,
+    client_id: Option<String>,
+}
+fn traffic_hours() -> i64 {
+    24
+}
+async fn traffic_history(
+    State(st): State<AppState>,
+    _a: Auth,
+    Query(q): Query<TrafficQuery>,
+) -> ApiResult<serde_json::Value> {
+    let hours = q.hours;
+    let now = store::now_ms();
+    let items = st
+        .db
+        .call(move |c| {
+            if let Some(id) = &q.tunnel_id {
+                store::get_tunnel(c, id)?;
+            }
+            if let Some(id) = &q.client_id {
+                store::get_client(c, id)?;
+            }
+            crate::traffic::history_filtered(
+                c,
+                now,
+                hours,
+                q.tunnel_id.as_deref(),
+                q.client_id.as_deref(),
+            )
+        })
+        .await?;
+    Ok(Json(
+        json!({"range_hours":hours,"bucket_ms":3_600_000,"sampled_only":true,"window_end":now / 3_600_000 * 3_600_000,"items":items}),
+    ))
+}
+
 async fn node(State(st): State<AppState>, _a: Auth) -> Json<serde_json::Value> {
     Json(json!({
+        "tls_fingerprint":st.cfg.edge_tls_fingerprint,
         "name": "builtin",
+        "enabled": st.cfg.builtin_edge,
         "public_host": st.cfg.public_host,
         "edge_port": st.cfg.edge_port(),
         "allow_ports": st.cfg.allow_ports,
@@ -424,6 +524,281 @@ async fn node(State(st): State<AppState>, _a: Auth) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "clients_online": st.hub.online_ids().len(),
     }))
+}
+
+// ───────────── Prometheus ─────────────
+
+/// 文本暴露格式 0.0.4。默认不提供；设置 `RUSTFRP_METRICS_TOKEN` 后需 `Authorization: Bearer <token>`。
+async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let token = st.cfg.metrics_token.as_str();
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if token.is_empty() {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    }
+    if !rustfrp_core::http1::ct_eq(presented, token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized",
+        )
+            .into_response();
+    }
+    let counted = st
+        .db
+        .call(|c| {
+            let now = store::now_ms();
+            Ok((
+                store::counts(c, now)?,
+                crate::traffic::last_day_totals(c, now)?,
+                store::list_nodes(c)?,
+            ))
+        })
+        .await;
+    let Ok((counts, day, nodes)) = counted else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+    };
+    let live = st.metrics.total().snapshot();
+    let process = crate::process::sample();
+    let nodes_online = nodes.iter().filter(|n| st.hub.node_online(&n.id)).count();
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, kind: &str, value: String| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
+    gauge(
+        "rustfrp_build_info",
+        "Controller version (value is always 1).",
+        "gauge",
+        "1".into(),
+    );
+    gauge(
+        "rustfrp_clients",
+        "Registered clients.",
+        "gauge",
+        counts.clients.to_string(),
+    );
+    gauge(
+        "rustfrp_clients_online",
+        "Clients currently connected.",
+        "gauge",
+        st.hub.online_ids().len().to_string(),
+    );
+    gauge(
+        "rustfrp_tunnels",
+        "Configured tunnels.",
+        "gauge",
+        counts.tunnels.to_string(),
+    );
+    gauge(
+        "rustfrp_tunnels_running",
+        "Tunnels reported running.",
+        "gauge",
+        counts.tunnels_running.to_string(),
+    );
+    gauge(
+        "rustfrp_nodes",
+        "External nodes.",
+        "gauge",
+        nodes.len().to_string(),
+    );
+    gauge(
+        "rustfrp_nodes_online",
+        "External nodes with a live control link.",
+        "gauge",
+        nodes_online.to_string(),
+    );
+    gauge(
+        "rustfrp_builtin_connections",
+        "Connections currently relayed by the built-in node.",
+        "gauge",
+        live.connections.to_string(),
+    );
+    gauge(
+        "rustfrp_builtin_bytes_in_total",
+        "Bytes from visitors to services since start (built-in node).",
+        "counter",
+        live.bytes_in.to_string(),
+    );
+    gauge(
+        "rustfrp_builtin_bytes_out_total",
+        "Bytes from services to visitors since start (built-in node).",
+        "counter",
+        live.bytes_out.to_string(),
+    );
+    gauge(
+        "rustfrp_traffic_bytes_in_24h",
+        "Bytes in over the last 24 hours (all nodes).",
+        "gauge",
+        day.0.to_string(),
+    );
+    gauge(
+        "rustfrp_traffic_bytes_out_24h",
+        "Bytes out over the last 24 hours (all nodes).",
+        "gauge",
+        day.1.to_string(),
+    );
+    gauge(
+        "rustfrp_process_uptime_seconds",
+        "Controller uptime.",
+        "gauge",
+        process.uptime_seconds.to_string(),
+    );
+    if let Some(rss) = process.rss_bytes {
+        gauge(
+            "rustfrp_process_resident_memory_bytes",
+            "Controller resident memory.",
+            "gauge",
+            rss.to_string(),
+        );
+    }
+    if let Some(cpu) = process.cpu_seconds {
+        gauge(
+            "rustfrp_process_cpu_seconds_total",
+            "Controller CPU time.",
+            "counter",
+            format!("{cpu:.2}"),
+        );
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+// ───────────── 节点 ─────────────
+
+/// 内置节点的展示条目。
+fn builtin_node(cfg: &Config, clients: i64) -> crate::models::Node {
+    crate::models::Node {
+        id: String::new(),
+        name: "builtin".into(),
+        builtin: true,
+        public_host: cfg.public_host.clone(),
+        edge_port: cfg.edge_port(),
+        tls_fingerprint: cfg.edge_tls_fingerprint.clone(),
+        vhost_http: cfg.vhost_http,
+        vhost_https: cfg.vhost_https,
+        subdomain_host: cfg.subdomain_host.clone(),
+        allow_ports: cfg.allow_ports.clone(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        os: std::env::consts::OS.into(),
+        created_at: 0,
+        last_seen_at: None,
+        disabled_at: None,
+        online: true,
+        clients,
+    }
+}
+
+async fn list_nodes(State(st): State<AppState>, _a: Auth) -> ApiResult<Vec<crate::models::Node>> {
+    let (mut nodes, builtin_clients) = st
+        .db
+        .call(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM clients WHERE node_id = '' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((store::list_nodes(c)?, n))
+        })
+        .await?;
+    nodes
+        .iter_mut()
+        .for_each(|n| n.online = st.hub.node_online(&n.id));
+    if st.cfg.builtin_edge {
+        nodes.insert(0, builtin_node(&st.cfg, builtin_clients));
+    }
+    Ok(Json(nodes))
+}
+
+#[derive(Deserialize)]
+struct PatchNode {
+    name: Option<String>,
+    disabled: Option<bool>,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn patch_node(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<PatchNode>,
+) -> ApiResult<crate::models::Node> {
+    a.require(&st, Role::Admin).await?;
+    let why = reason(&b.reason)?;
+    if b.name.is_none() && b.disabled.is_none() {
+        return Err(ApiError::bad("nothing to change"));
+    }
+    let (actor, ip, id2) = (a.admin.name.clone(), a.ip.clone(), id.clone());
+    let mut node = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let n = store::update_node(&tx, &id2, b.name.as_deref(), b.disabled, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "node.update",
+                "node",
+                &id2,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await?;
+    if node.disabled_at.is_some() {
+        st.hub.node_drop(&id);
+    }
+    node.online = st.hub.node_online(&id);
+    Ok(Json(node))
+}
+
+async fn delete_node(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Query(q): Query<ReasonQuery>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Admin).await?;
+    let why = reason(&q.reason)?;
+    let (actor, ip, id2) = (a.admin.name.clone(), a.ip.clone(), id.clone());
+    st.db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            store::delete_node(&tx, &id2, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "node.delete",
+                "node",
+                &id2,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    st.hub.node_drop(&id);
+    Ok(Json(json!({"ok": true})))
 }
 
 // ───────────── 客户端 ─────────────
@@ -452,6 +827,7 @@ async fn get_client(
 struct PatchClient {
     name: Option<String>,
     disabled: Option<bool>,
+    tags: Option<Vec<String>>,
     #[serde(default)]
     reason: String,
 }
@@ -470,7 +846,10 @@ async fn patch_client(
         .call(move |c| {
             let tx = c.transaction()?;
             let now = store::now_ms();
-            let cl = store::update_client(&tx, &id2, b.name.as_deref(), b.disabled, now)?;
+            let mut cl = store::update_client(&tx, &id2, b.name.as_deref(), b.disabled, now)?;
+            if let Some(tags) = &b.tags {
+                cl = store::set_client_tags(&tx, &id2, tags)?;
+            }
             store::audit(
                 &tx,
                 &actor,
@@ -486,6 +865,8 @@ async fn patch_client(
             Ok(cl)
         })
         .await?;
+    // 外置节点上的设备：停用 / 启用要推给节点，节点才会真正拒绝或放行它。
+    st.hub.sync_device(&id).await;
     if client.disabled_at.is_some() {
         st.hub.kick(&id);
     }
@@ -523,6 +904,8 @@ async fn delete_client(
             Ok(())
         })
         .await?;
+    // 外置节点要收到 Remove，才会拒绝这台设备再次登录。
+    st.hub.sync_device(&id).await;
     st.hub.kick(&id);
     Ok(Json(json!({"ok": true})))
 }
@@ -531,6 +914,46 @@ async fn delete_client(
 struct ReasonBody {
     #[serde(default)]
     reason: String,
+}
+
+async fn restart_client(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<ReasonBody>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Admin).await?;
+    let why = reason(&b.reason)?;
+    if !st.hub.is_online(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "the device is offline; a restart request only applies to a connected agent",
+        ));
+    }
+    let (actor, ip, id2) = (a.admin.name.clone(), a.ip.clone(), id.clone());
+    st.db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            store::request_client_restart(&tx, &id2)?;
+            store::audit(
+                &tx,
+                &actor,
+                "client.restart",
+                "client",
+                &id2,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    st.hub.refresh(&id).await?;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn kick_client(
@@ -560,6 +983,70 @@ async fn kick_client(
         .await?;
     st.hub.kick(&id);
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct ConfigUpload {
+    text: String,
+    digest: Option<String>,
+    #[serde(default)]
+    accept_warnings: bool,
+    #[serde(default)]
+    reason: String,
+}
+async fn preview_config(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<ConfigUpload>,
+) -> ApiResult<crate::config_transfer::Preview> {
+    a.require(&st, Role::Operator).await?;
+    let cfg = st.cfg.clone();
+    Ok(Json(
+        st.db
+            .call(move |c| crate::config_transfer::preview(c, &cfg, &id, &b.text))
+            .await?,
+    ))
+}
+async fn import_config(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<ConfigUpload>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Operator).await?;
+    let why = reason(&b.reason)?;
+    if b.digest.as_deref() != Some(token_hash(&b.text).as_str()) || !b.accept_warnings {
+        return Err(ApiError::bad(
+            "preview digest and explicit compatibility acknowledgement required",
+        ));
+    }
+    let cfg = st.cfg.clone();
+    let target = id.clone();
+    let updated = st
+        .db
+        .call(move |c| {
+            crate::config_transfer::import(c, &cfg, &target, &b.text, (&a.admin.name, &why, &a.ip))
+        })
+        .await?;
+    st.hub.refresh(&id).await?;
+    Ok(Json(json!({"updated":updated})))
+}
+async fn export_config(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    // 导出含 http 隧道的 Basic 认证密码，等同于凭据：仅管理员及以上。
+    a.require(&st, Role::Admin).await?;
+    let cfg = st.cfg.clone();
+    let text = st
+        .db
+        .call(move |c| crate::config_transfer::export(c, &cfg, &id))
+        .await?;
+    Ok(Json(
+        json!({"format":"toml","text":text,"notice":"device and server authentication credentials omitted; http Basic auth passwords are included"}),
+    ))
 }
 
 // ───────────── 隧道 ─────────────
@@ -619,24 +1106,27 @@ struct CreateTunnel {
     #[serde(default)]
     host_header_rewrite: String,
     #[serde(default)]
+    locations: Vec<String>,
+    #[serde(default)]
+    http_user: String,
+    #[serde(default)]
+    http_password: String,
+    #[serde(default)]
+    route_by_http_user: String,
+    #[serde(default)]
+    request_headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    proxy_protocol: u8,
+    #[serde(default)]
+    bandwidth_bps: u64,
+    #[serde(default)]
+    bandwidth_server: bool,
+    #[serde(default)]
     reason: String,
 }
 
 fn port_policy(cfg: &Config, remote_port: i64) -> Result<(), ApiError> {
-    if remote_port == 0 || cfg.allow_ports.is_empty() {
-        return Ok(());
-    }
-    if cfg
-        .allow_ports
-        .iter()
-        .any(|(lo, hi)| (i64::from(*lo)..=i64::from(*hi)).contains(&remote_port))
-    {
-        Ok(())
-    } else {
-        Err(ApiError::bad(format!(
-            "remote port {remote_port} is outside the ports this server allows"
-        )))
-    }
+    cfg.check_remote_port(remote_port).map_err(ApiError::bad)
 }
 
 /// 该服务器是否开启了对应的虚拟主机端口 / 子域名后缀。
@@ -669,6 +1159,7 @@ async fn create_tunnel(
     port_policy(&st.cfg, b.remote_port)?;
     vhost_policy(&st.cfg, &b.kind, &b.subdomain)?;
     let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
+    let quota = st.cfg.max_tunnels_per_client;
     let new = NewTunnel {
         client_id: b.client_id,
         name: b.name,
@@ -680,6 +1171,16 @@ async fn create_tunnel(
         custom_domains: b.custom_domains,
         subdomain: b.subdomain,
         host_header_rewrite: b.host_header_rewrite,
+        http: rustfrp_core::wire::HttpOpts {
+            locations: b.locations,
+            http_user: b.http_user,
+            http_password: b.http_password,
+            route_by_http_user: b.route_by_http_user,
+            request_headers: b.request_headers,
+        },
+        proxy_protocol: b.proxy_protocol,
+        bandwidth_bps: b.bandwidth_bps,
+        bandwidth_server: b.bandwidth_server,
     };
     let t = st
         .db
@@ -687,6 +1188,7 @@ async fn create_tunnel(
             let tx = c.transaction()?;
             let now = store::now_ms();
             let t = store::create_tunnel(&tx, &new, now)?;
+            store::enforce_tunnel_quota(&tx, &t.client_id, quota)?;
             store::audit(
                 &tx,
                 &actor,
@@ -707,6 +1209,69 @@ async fn create_tunnel(
 }
 
 #[derive(Deserialize)]
+struct BatchTunnels {
+    ids: Vec<String>,
+    enabled: bool,
+    #[serde(default)]
+    reason: String,
+}
+async fn batch_tunnels(
+    State(st): State<AppState>,
+    a: Auth,
+    Json(b): Json<BatchTunnels>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Operator).await?;
+    let why = reason(&b.reason)?;
+    let ids: std::collections::HashSet<_> = b.ids.iter().collect();
+    if b.ids.is_empty()
+        || b.ids.len() > 100
+        || ids.len() != b.ids.len()
+        || b.ids.iter().any(|id| id.is_empty() || id.len() > 64)
+    {
+        return Err(StoreError::Invalid("batch requires 1..100 distinct tunnel IDs".into()).into());
+    }
+    let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
+    let updated = b.ids.len();
+    let clients = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let mut clients = std::collections::HashSet::new();
+            for id in b.ids {
+                let t = store::update_tunnel(
+                    &tx,
+                    &id,
+                    &TunnelPatch {
+                        enabled: Some(b.enabled),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                store::audit(
+                    &tx,
+                    &actor,
+                    "tunnel.batch",
+                    "tunnel",
+                    &id,
+                    &why,
+                    "ok",
+                    &ip,
+                    now,
+                )?;
+                clients.insert(t.client_id);
+            }
+            tx.commit()?;
+            Ok(clients)
+        })
+        .await?;
+    for id in clients {
+        st.hub.refresh(&id).await?;
+    }
+    Ok(Json(json!({"updated":updated})))
+}
+
+#[derive(Deserialize)]
 struct PatchTunnel {
     name: Option<String>,
     local_ip: Option<String>,
@@ -716,6 +1281,15 @@ struct PatchTunnel {
     custom_domains: Option<Vec<String>>,
     subdomain: Option<String>,
     host_header_rewrite: Option<String>,
+    locations: Option<Vec<String>>,
+    http_user: Option<String>,
+    /// 缺省 = 保持原密码；空串 = 清除。
+    http_password: Option<String>,
+    route_by_http_user: Option<String>,
+    request_headers: Option<std::collections::BTreeMap<String, String>>,
+    proxy_protocol: Option<u8>,
+    bandwidth_bps: Option<u64>,
+    bandwidth_server: Option<bool>,
     #[serde(default)]
     reason: String,
 }
@@ -741,6 +1315,14 @@ async fn patch_tunnel(
         custom_domains: b.custom_domains,
         subdomain: b.subdomain,
         host_header_rewrite: b.host_header_rewrite,
+        locations: b.locations,
+        http_user: b.http_user,
+        http_password: b.http_password,
+        route_by_http_user: b.route_by_http_user,
+        request_headers: b.request_headers,
+        proxy_protocol: b.proxy_protocol,
+        bandwidth_bps: b.bandwidth_bps,
+        bandwidth_server: b.bandwidth_server,
     };
     let t = st
         .db
@@ -809,6 +1391,12 @@ struct CreateToken {
     name: String,
     #[serde(default = "default_ttl")]
     ttl_minutes: i64,
+    /// `client`（默认）或 `node`。
+    #[serde(default)]
+    kind: String,
+    /// 设备令牌：由哪个外置节点服务（缺省 = 内置节点）。
+    #[serde(default)]
+    node_id: String,
     #[serde(default)]
     reason: String,
 }
@@ -817,30 +1405,76 @@ fn default_ttl() -> i64 {
     60
 }
 
-/// 渲染各平台的安装 / 接入命令。
+/// 设备接入的目标：内置节点，或某个外置节点。
+struct Target {
+    host: String,
+    port: u16,
+    fingerprint: String,
+}
+
+/// 渲染各平台的安装 / 接入命令（内置节点）。
 fn commands(cfg: &Config, token: &str, name: &str) -> serde_json::Value {
-    let controller = format!("{}:{}", cfg.public_host, cfg.edge_port());
-    let quoted = name.replace('"', "");
-    let direct = format!("rustfrp-agent --mode client --controller {controller} --enroll-token {token} --name \"{quoted}\"");
+    let target = Target {
+        host: cfg.public_host.clone(),
+        port: cfg.edge_port(),
+        fingerprint: cfg.edge_tls_fingerprint.clone(),
+    };
+    commands_to(cfg, token, name, &target)
+}
+
+/// 渲染各平台的安装 / 接入命令。
+fn commands_to(cfg: &Config, token: &str, name: &str, target: &Target) -> serde_json::Value {
+    let controller = format!("{}:{}", target.host, target.port);
+    let edge_tls_fingerprint = &target.fingerprint;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let ps_quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let direct = format!(
+        "rustfrp-agent --mode client --controller {} --enroll-token {} --name {}",
+        quote(&controller),
+        quote(token),
+        quote(name)
+    );
+    let pin = if edge_tls_fingerprint.is_empty() {
+        String::new()
+    } else {
+        format!(" --tls-pin {}", quote(edge_tls_fingerprint))
+    };
+    let direct = format!("{direct}{pin}");
     let mut v = serde_json::Map::new();
     v.insert("controller".into(), json!(controller));
     v.insert("direct".into(), json!(direct));
     if !cfg.public_url.is_empty() {
-        let args = format!("--controller {controller} --enroll-token {token} --name \"{quoted}\"");
+        let base = cfg.public_url.trim_end_matches('/');
+        let args = format!(
+            "--controller {} --enroll-token {} --name {} --download-base {}",
+            quote(&controller),
+            quote(token),
+            quote(name),
+            quote(&format!("{base}/downloads"))
+        );
+        let args = format!("{args}{pin}");
         v.insert(
             "linux_macos".into(),
             json!(format!(
-                "curl -fsSL {}/install.sh | sh -s -- {args}",
-                cfg.public_url
+                "curl -fsSL {} | sh -s -- {args}",
+                quote(&format!("{base}/install.sh"))
             )),
         );
-        v.insert(
-            "windows".into(),
-            json!(format!(
-                "powershell -c \"iwr {}/install.ps1 -UseBasicParsing | iex; Install-RustFrp {args}\"",
-                cfg.public_url
-            )),
+        // PowerShell literals preserve names and tokens without interpolation.
+        let script = format!(
+            "& {{ $ErrorActionPreference = 'Stop'; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing {}).Content)); Install-RustFrp -Controller {} -EnrollToken {} -Name {} -DownloadBase {} }}",
+            ps_quote(&format!("{base}/install.ps1")), ps_quote(&controller),
+            ps_quote(token), ps_quote(name), ps_quote(&format!("{base}/downloads"))
         );
+        let script = if edge_tls_fingerprint.is_empty() {
+            script
+        } else {
+            script.replace(
+                " -DownloadBase ",
+                &format!(" -TlsPin {} -DownloadBase ", ps_quote(edge_tls_fingerprint)),
+            )
+        };
+        v.insert("windows".into(), json!(script));
     }
     serde_json::Value::Object(v)
 }
@@ -855,6 +1489,24 @@ async fn create_token(
     if !(1..=10_080).contains(&b.ttl_minutes) {
         return Err(ApiError::bad("ttl_minutes must be 1..10080"));
     }
+    let kind = if b.kind.is_empty() {
+        "client"
+    } else {
+        b.kind.as_str()
+    };
+    if !["client", "node"].contains(&kind) {
+        return Err(ApiError::bad("kind must be client or node"));
+    }
+    if kind == "client" && b.node_id.is_empty() && !st.cfg.builtin_edge {
+        return Err(ApiError::bad(
+            "the built-in node is disabled; choose an external node (node_id)",
+        ));
+    }
+    if kind == "node" && st.cfg.node_addr.is_empty() {
+        return Err(ApiError::bad(
+            "the node port is not enabled (set RUSTFRP_NODE_ADDR on the server)",
+        ));
+    }
     let token = auth::new_token()
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?;
     let (th, name, actor, ip) = (
@@ -864,16 +1516,26 @@ async fn create_token(
         a.ip.clone(),
     );
     let ttl = b.ttl_minutes * 60_000;
-    let rec = st
+    let (kind_s, node_s) = (kind.to_string(), b.node_id.clone());
+    let (rec, node) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
             let now = store::now_ms();
-            let rec = store::create_enroll_token(&tx, &th, &name, &actor, now, ttl)?;
+            let node = if node_s.is_empty() {
+                None
+            } else {
+                Some(store::get_node(&tx, &node_s)?)
+            };
+            let rec = store::create_token_for(&tx, &th, &name, &actor, now, ttl, &kind_s, &node_s)?;
             store::audit(
                 &tx,
                 &actor,
-                "enroll_token.create",
+                if kind_s == "node" {
+                    "node_token.create"
+                } else {
+                    "enroll_token.create"
+                },
                 "enroll_token",
                 &rec.id,
                 &why,
@@ -882,15 +1544,63 @@ async fn create_token(
                 now,
             )?;
             tx.commit()?;
-            Ok(rec)
+            Ok((rec, node))
         })
         .await?;
     // 明文令牌只在这一次响应里出现。
-    let cmds = commands(&st.cfg, &token, &rec.name);
+    let cmds = if kind == "node" {
+        node_commands(&st.cfg, &token, &rec.name)
+    } else if let Some(n) = node {
+        if n.public_host.is_empty() || n.edge_port == 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                "this node has not reported its public host yet; connect the node first",
+            ));
+        }
+        commands_to(
+            &st.cfg,
+            &token,
+            &rec.name,
+            &Target {
+                host: n.public_host,
+                port: n.edge_port,
+                fingerprint: n.tls_fingerprint,
+            },
+        )
+    } else {
+        commands(&st.cfg, &token, &rec.name)
+    };
     Ok((
         StatusCode::CREATED,
-        Json(json!({"id": rec.id, "token": token, "expires_at": rec.expires_at, "commands": cmds})),
+        Json(
+            json!({"id": rec.id, "token": token, "expires_at": rec.expires_at, "kind": rec.kind, "commands": cmds}),
+        ),
     ))
+}
+
+/// 接入新节点的命令：节点端口与内置 Edge 共用证书，所以沿用同一个指纹。
+fn node_commands(cfg: &Config, token: &str, name: &str) -> serde_json::Value {
+    let port = cfg
+        .node_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(7001);
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let controller = format!("{}:{port}", cfg.public_host);
+    let pin = if cfg.edge_tls_fingerprint.is_empty() {
+        String::new()
+    } else {
+        format!(" --tls-pin {}", quote(&cfg.edge_tls_fingerprint))
+    };
+    json!({
+        "controller": controller,
+        "direct": format!(
+            "rustfrp-agent --mode edge --controller {} --enroll-token {} --name {} --public-host <this-node-public-host>{pin}",
+            quote(&controller), quote(token), quote(name)
+        ),
+    })
 }
 
 async fn list_tokens(
@@ -962,6 +1672,178 @@ async fn list_audit(
 async fn list_admins(State(st): State<AppState>, a: Auth) -> ApiResult<Vec<Admin>> {
     a.require(&st, Role::Owner).await?;
     Ok(Json(st.db.call(|c| store::list_admins(c)).await?))
+}
+
+#[derive(Deserialize)]
+struct NewAdmin {
+    name: String,
+    password: String,
+    role: Role,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn create_admin(
+    State(st): State<AppState>,
+    a: Auth,
+    Json(b): Json<NewAdmin>,
+) -> Result<(StatusCode, Json<Admin>), ApiError> {
+    a.require(&st, Role::Owner).await?;
+    let why = reason(&b.reason)?;
+    auth::check_password(&b.password).map_err(ApiError::bad)?;
+    let hash = auth::hash_password(&b.password)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?;
+    let (actor, ip, name, role) = (a.admin.name.clone(), a.ip.clone(), b.name, b.role);
+    let created = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let rec = store::create_admin(&tx, &name, &hash, role, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "admin.create",
+                "admin",
+                &rec.id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(rec)
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+#[derive(Deserialize)]
+struct PatchAdmin {
+    role: Option<Role>,
+    disabled: Option<bool>,
+    password: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn patch_admin(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<PatchAdmin>,
+) -> ApiResult<Admin> {
+    a.require(&st, Role::Owner).await?;
+    let why = reason(&b.reason)?;
+    if b.role.is_none() && b.disabled.is_none() && b.password.is_none() {
+        return Err(ApiError::bad("nothing to change"));
+    }
+    if id == a.admin.id && (b.role.is_some() || b.disabled.is_some()) {
+        return Err(ApiError::forbidden("cannot change your own role or status"));
+    }
+    let hash = match &b.password {
+        Some(p) => {
+            auth::check_password(p).map_err(ApiError::bad)?;
+            Some(
+                auth::hash_password(p)
+                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?,
+            )
+        }
+        None => None,
+    };
+    let (actor, ip, id2) = (a.admin.name.clone(), a.ip.clone(), id);
+    let (role, disabled) = (b.role, b.disabled);
+    let updated = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let rec = store::update_admin(&tx, &id2, role, disabled, hash.as_deref(), now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "admin.update",
+                "admin",
+                &id2,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(rec)
+        })
+        .await?;
+    Ok(Json(updated))
+}
+
+async fn controller_logs(State(st): State<AppState>, a: Auth) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Admin).await?;
+    Ok(Json(
+        json!({"items":st.logs.snapshot(),"capacity":128,"line_bytes":512}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct NewApiToken {
+    name: String,
+    scope: String,
+    days: i64,
+    #[serde(default)]
+    reason: String,
+}
+async fn list_api_tokens(
+    State(st): State<AppState>,
+    a: Auth,
+) -> ApiResult<Vec<crate::api_tokens::ApiToken>> {
+    a.require(&st, Role::Owner).await?;
+    let id = a.admin.id;
+    Ok(Json(
+        st.db.call(move |c| crate::api_tokens::list(c, &id)).await?,
+    ))
+}
+async fn create_api_token(
+    State(st): State<AppState>,
+    a: Auth,
+    Json(b): Json<NewApiToken>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Owner).await?;
+    let why = reason(&b.reason)?;
+    let token = auth::new_token()
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "rng", e))?;
+    let hash = token_hash(&token);
+    let info = st
+        .db
+        .call(move |c| {
+            crate::api_tokens::create(
+                c,
+                &a.admin,
+                crate::api_tokens::NewToken {
+                    name: &b.name,
+                    scope: &b.scope,
+                    days: b.days,
+                },
+                &hash,
+                &why,
+                &a.ip,
+                store::now_ms(),
+            )
+        })
+        .await?;
+    Ok(Json(json!({"token":token,"info":info})))
+}
+async fn revoke_api_token(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<ReasonBody>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Owner).await?;
+    let why = reason(&b.reason)?;
+    st.db
+        .call(move |c| crate::api_tokens::revoke(c, &a.admin, &id, &why, &a.ip, store::now_ms()))
+        .await?;
+    Ok(Json(json!({"ok":true})))
 }
 
 // ───────────── 静态面板与安全头 ─────────────
@@ -1060,15 +1942,26 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/logs", get(controller_logs))
+        .route("/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route("/api-tokens/{id}/revoke", post(revoke_api_token))
         .route("/overview", get(overview))
+        .route("/traffic", get(traffic_history))
         .route("/node", get(node))
+        .route("/nodes", get(list_nodes))
+        .route("/nodes/{id}", patch(patch_node).delete(delete_node))
+        .route("/clients/{id}/config/preview", post(preview_config))
+        .route("/clients/{id}/config/import", post(import_config))
+        .route("/clients/{id}/config/export", get(export_config))
         .route("/clients", get(list_clients))
         .route(
             "/clients/{id}",
             get(get_client).patch(patch_client).delete(delete_client),
         )
         .route("/clients/{id}/kick", post(kick_client))
+        .route("/clients/{id}/restart", post(restart_client))
         .route("/tunnels", get(list_tunnels).post(create_tunnel))
+        .route("/tunnels/batch", post(batch_tunnels))
         .route(
             "/tunnels/{id}",
             get(get_tunnel).patch(patch_tunnel).delete(delete_tunnel),
@@ -1076,9 +1969,29 @@ pub fn router(state: AppState) -> Router {
         .route("/enroll-tokens", get(list_tokens).post(create_token))
         .route("/enroll-tokens/{id}", delete(revoke_token))
         .route("/audit", get(list_audit))
-        .route("/admins", get(list_admins));
+        .route("/admins", get(list_admins).post(create_admin))
+        .route("/admins/{id}", patch(patch_admin));
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
+        .route(
+            "/install.sh",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../../installer/install.sh"),
+                )
+            }),
+        )
+        .route(
+            "/install.ps1",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../../installer/install.ps1"),
+                )
+            }),
+        )
         .nest("/api/v1", api)
         .fallback(panel)
         .layer(middleware::from_fn(security_headers))
@@ -1211,6 +2124,25 @@ mod tests {
     }
 
     #[test]
+    fn reserved_and_listening_ports_are_refused() {
+        let cfg = Config {
+            reserved_ports: vec![(2200, 2299)],
+            vhost_http: Some(8081),
+            vhost_https: Some(8443),
+            edge_addr: "0.0.0.0:7100".into(),
+            http_addr: "127.0.0.1:8088".into(),
+            ..Config::default()
+        };
+        for p in [2200, 2250, 2299, 7100, 8081, 8443, 8088] {
+            let e = port_policy(&cfg, p).unwrap_err();
+            assert!(e.message.contains("reserved"), "{p}: {}", e.message);
+        }
+        for p in [0, 2199, 2300, 7000, 22] {
+            assert!(port_policy(&cfg, p).is_ok(), "{p}");
+        }
+    }
+
+    #[test]
     fn vhost_policy_rules() {
         let off = Config::default();
         assert!(vhost_policy(&off, "tcp", "").is_ok());
@@ -1227,6 +2159,32 @@ mod tests {
     }
 
     #[test]
+    fn install_command_preserves_shell_literals() {
+        let name = "中文 ' \" $(printf injected); `printf injected`\nnext";
+        let cfg = Config {
+            public_url: "https://example.test/".into(),
+            ..Config::default()
+        };
+        let v = commands(&cfg, "t'ok", name);
+        let command = v["direct"].as_str().unwrap();
+        let args = command.strip_prefix("rustfrp-agent ").unwrap();
+        let script = format!("set -- {args}; printf '%s\\n' \"$8\"");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{name}\n")
+        );
+        let windows = v["windows"].as_str().unwrap();
+        assert!(windows.contains("-EnrollToken 't''ok'"));
+        assert!(windows.contains("-Name '中文 '' "));
+        assert!(!windows.contains("test//install"));
+    }
+
+    #[test]
     fn install_commands() {
         let mut cfg = Config {
             public_host: "frp.example.com".into(),
@@ -1238,14 +2196,26 @@ mod tests {
         assert!(v["direct"]
             .as_str()
             .unwrap()
-            .contains("--enroll-token rfrp_tok --name \"my box\""));
+            .contains("--enroll-token 'rfrp_tok' --name 'my \"box\"'"));
         assert!(v.get("linux_macos").is_none());
         cfg.public_url = "https://frp.example.com".into();
         let v = commands(&cfg, "t", "n");
         assert!(v["linux_macos"]
             .as_str()
             .unwrap()
-            .starts_with("curl -fsSL https://frp.example.com/install.sh | sh -s --"));
+            .starts_with("curl -fsSL 'https://frp.example.com/install.sh' | sh -s --"));
         assert!(v["windows"].as_str().unwrap().contains("install.ps1"));
+    }
+    #[test]
+    fn managed_commands_fix_the_actual_leaf_certificate() {
+        let cfg = Config {
+            public_url: "https://panel.test".into(),
+            edge_tls_fingerprint: "a".repeat(64),
+            ..Default::default()
+        };
+        let v = commands(&cfg, "token", "name");
+        assert!(v["direct"].as_str().unwrap().contains("--tls-pin"));
+        assert!(v["linux_macos"].as_str().unwrap().contains("--tls-pin"));
+        assert!(v["windows"].as_str().unwrap().contains("-TlsPin"));
     }
 }

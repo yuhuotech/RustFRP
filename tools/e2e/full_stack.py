@@ -112,6 +112,15 @@ def port_closed(port):
         return True
 
 
+def local_request(path, command, token=None):
+    with open(path) as file:
+        discovery = json.load(file)
+    with socket.create_connection(("127.0.0.1", discovery["port"]), timeout=5) as stream:
+        stream.sendall((json.dumps({"token": token or discovery["token"], "command": command}) + "\n").encode())
+        with stream.makefile("rb") as response:
+            return json.loads(response.readline(2048))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin-dir", default="target/release")
@@ -138,6 +147,12 @@ def main():
         procs.append(subprocess.Popen([server_bin, "run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         api = Api(f"http://127.0.0.1:{http_port}")
         wait(lambda: not port_closed(http_port), "controller HTTP")
+        for path, marker in (("install.sh", b"#!/bin/sh"), ("install.ps1", b"function Install-RustFrp")):
+            with urllib.request.urlopen(f"{api.base}/{path}", timeout=5) as response:
+                assert response.status == 200
+                assert response.headers.get_content_type() == "text/plain"
+                assert response.read().startswith(marker)
+        print("未登录安装脚本入口 OK")
 
         me = api.call("POST", "/auth/login", {"name": "root", "password": env["RUSTFRP_ADMIN_PASSWORD"]}, login=True)
         api.csrf = me["csrf"]
@@ -147,11 +162,21 @@ def main():
         assert tok["token"].startswith("rfrp_") and "--enroll-token" in tok["commands"]["direct"]
         print("接入令牌 OK:", tok["commands"]["direct"].split(" --enroll-token")[0])
 
+        fingerprint=api.call("GET","/node")["tls_fingerprint"]
+        assert len(fingerprint)==64
+        assert "--tls-pin" in tok["commands"]["direct"]
         procs.append(subprocess.Popen(
-            [agent_bin, "--mode", "client", "--controller", f"127.0.0.1:{edge_port}", "--enroll-token", tok["token"], "--name", "e2e-box", "--state-dir", f"{tmp}/agent"],
+            [agent_bin, "--mode", "client", "--controller", f"127.0.0.1:{edge_port}", "--enroll-token", tok["token"], "--name", "e2e-box", "--state-dir", f"{tmp}/agent", "--local-control", f"{tmp}/agent/control.json", "--tls-pin", fingerprint],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         client = wait(lambda: next((c for c in api.call("GET", "/clients") if c["online"]), None), "agent online")
         assert client["name"] == "e2e-box", client
+        control_path = f"{tmp}/agent/control.json"
+        status = wait(lambda: (lambda s: s if s["connected"] else None)(local_request(control_path, "status")), "local connected")
+        assert status["version"] == 1 and status["pid"] == procs[-1].pid
+        assert local_request(control_path, "stop", "wrong-token") == {"error": "unauthorized"}
+        assert local_request(control_path, "status")["connected"]
+        assert oct(os.stat(control_path).st_mode & 0o777) == "0o600"
+        print("本机控制鉴权 / 实际连接状态 / 私有发现文件 OK")
         print("设备上线 OK:", client["id"], client["os"], client["arch"])
         ident = json.load(open(f"{tmp}/agent/identity.json"))
         assert ident["client_id"] == client["id"] and oct(os.stat(f"{tmp}/agent/identity.json").st_mode & 0o777) == "0o600"
@@ -162,9 +187,39 @@ def main():
         port = t["status_port"]
         payload = os.urandom(300_000)
         assert tcp_roundtrip(port, payload) == payload
+        wait(lambda: local_request(control_path, "status")["proxies"] == 1, "local config count")
         print(f"隧道 OK: 公网端口 {port} 回显 {len(payload)} 字节一致")
+        traffic = wait(lambda: (lambda x: x if sum(b["bytes_in"] for b in x["items"]) == len(payload) else None)(api.call("GET", f"/traffic?tunnel_id={t['id']}")), "traffic persisted")
+        assert sum(b["bytes_out"] for b in traffic["items"]) == len(payload)
+        assert api.call("GET", "/overview")["traffic"]["bytes_in"] == len(payload)
+        local_traffic = local_request(control_path, "status")["traffic"]
+        assert local_traffic["bytes_in"] == len(payload) and local_traffic["bytes_out"] == len(payload)
+        logs = local_request(control_path, "logs")
+        assert 0 < len(logs["items"]) <= 128
+        assert all(len(line.encode()) <= 512 for line in logs["items"])
+        assert any("applied config" in line for line in logs["items"])
+        local_tunnels = local_request(control_path, "tunnels")
+        assert len(local_tunnels["items"]) == 1
+        assert local_tunnels["items"][0]["id"] == t["id"]
+        assert local_tunnels["items"][0]["local_port"] == echo_port
+        automation = api.call("POST", "/api-tokens", {"name":"e2e", "scope":"read", "days":1, "reason":"e2e"})
+        req = urllib.request.Request(api.base + "/api/v1/overview", headers={"Authorization":"Bearer " + automation["token"]})
+        with urllib.request.urlopen(req) as response:
+            assert json.loads(response.read())["traffic"]["bytes_in"] == len(payload)
+        api.call("POST", f"/api-tokens/{automation['info']['id']}/revoke", {"reason":"e2e"})
+        try:
+            urllib.request.urlopen(req)
+            raise AssertionError("revoked automation token accepted")
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
+        controller_logs=api.call("GET","/logs")
+        assert 0 < len(controller_logs["items"]) <= 128
+        assert any("management on" in line for line in controller_logs["items"])
+        print("API Token 真实调用 / 撤销立即失效 / Controller 有界日志 OK")
+        print("实时流量 / 历史查询 / 本机统计 / 有界日志 / 已应用隧道列表 OK")
 
-        api.call("PATCH", f"/tunnels/{t['id']}", {"enabled": False, "reason": "e2e"})
+        api.call("PATCH", f"/tunnels/{t['id']}", {"name":"echo-renamed", "reason":"e2e rename"})
+        assert api.call("POST", "/tunnels/batch", {"ids":[t["id"]], "enabled":False, "reason":"e2e batch"})["updated"] == 1
         wait(lambda: port_closed(port), "tunnel port closed")
         wait(lambda: api.call("GET", f"/tunnels/{t['id']}")["state"] == "stopped", "state stopped")
         print("停用隧道 OK: 端口已关闭")
@@ -174,7 +229,7 @@ def main():
         wait(lambda: api.call("GET", f"/clients/{client['id']}")["online"], "agent reconnect")
         print("强制下线后自动重连 OK")
 
-        api.call("PATCH", f"/tunnels/{t['id']}", {"enabled": True, "reason": "e2e"})
+        api.call("POST", "/tunnels/batch", {"ids":[t["id"]], "enabled":True, "reason":"e2e batch"})
         t2 = wait(lambda: (lambda x: x if x["state"] == "running" else None)(api.call("GET", f"/tunnels/{t['id']}")), "tunnel running again")
         assert tcp_roundtrip(t2["status_port"], b"after reconnect") == b"after reconnect"
         print("重连后隧道恢复 OK")
@@ -236,13 +291,28 @@ def main():
             assert hs.recv(100).startswith(b"HTTP/1.1 404")
         print("HTTP 域名 / 子域名路由与 Host 改写 OK")
 
+        # Online snapshot of the running WAL database: no stop and no WAL file copy.
+        snapshot = f"{tmp}/snapshot.db"
+        subprocess.run([server_bin, "backup", snapshot], env=env, check=True, timeout=30, stdout=subprocess.DEVNULL)
+        import sqlite3
+        with sqlite3.connect(snapshot) as saved:
+            assert saved.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert saved.execute("SELECT count(*) FROM clients WHERE deleted_at IS NULL").fetchone()[0] == 1
+            assert saved.execute("SELECT count(*) FROM tunnels WHERE deleted_at IS NULL").fetchone()[0] >= 3
+            assert saved.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert oct(os.stat(snapshot).st_mode & 0o777) == "0o600"
+        print("在线 WAL 快照 / 私有权限 / 数据完整性 OK")
+
         api.call("DELETE", f"/clients/{client['id']}?reason=e2e")
         wait(lambda: port_closed(t2["status_port"]), "port closed after delete")
         assert api.call("GET", "/clients") == []
         actions = {e["action"] for e in api.call("GET", "/audit")}
-        for need in ["auth.login", "enroll_token.create", "client.enroll", "tunnel.create", "tunnel.update", "client.kick", "client.delete"]:
+        for need in ["auth.login", "enroll_token.create", "client.enroll", "tunnel.create", "tunnel.update", "tunnel.batch", "api_token.create", "api_token.revoke", "client.kick", "client.delete"]:
             assert need in actions, (need, actions)
         print("删除设备 OK；审计完整:", sorted(actions))
+        assert local_request(control_path, "stop") == {"ok": True}
+        assert procs[-1].wait(timeout=5) == 0
+        print("本机控制停止 agent OK")
         print("全栈冒烟通过")
     finally:
         for p in procs:

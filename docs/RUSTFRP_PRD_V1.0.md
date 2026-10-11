@@ -327,5 +327,5 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 | R4 | 「极致省内存」与「功能全」冲突（如 QUIC、ACME 会增加依赖） | 重功能用 Cargo feature 开关，默认发布版裁剪；每个 PR 跑内存基准 |
 | R5 | Windows 服务 / macOS launchd 的权限与签名成本 | P05 提前验证；macOS 需要 Apple 开发者账号 |
 | R6 | 公网暴露面板的安全风险 | 默认面板仅监听内网/127.0.0.1，需要显式开启公网并强制 HTTPS |
-| R7 | Logo 与品牌视觉 | 名称已定 RustFRP，Logo 待设计 |
+| R7 | Logo 与品牌视觉 | 名称已定 RustFRP，Logo 已完成（一笔贯通的倾斜双环） |
 | R8 | 官网技术 | 静态 HTML，托管在自有服务器（nginx），域名 rustfrp.com / www.rustfrp.com，仅中文 |

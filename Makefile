@@ -71,3 +71,7 @@ e2e:
 # 评审用截图（真实字体）：make app-shots DIR=/tmp/shots
 app-shots:
 	cd rustfrp-app && SCREENSHOTS=$(or $(DIR),/tmp/rustfrp-shots) $(FLUTTER) test test/screenshots_test.dart
+
+.PHONY: installer-test
+installer-test:
+	python3 tools/installer/test_install.py

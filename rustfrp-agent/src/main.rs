@@ -26,7 +26,7 @@ fn main() {
     let c = cancel.clone();
     let code = rt.block_on(async move {
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            app::wait_for_stop().await;
             c.cancel();
         });
         app::execute(

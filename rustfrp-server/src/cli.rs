@@ -16,6 +16,7 @@ rustfrp-server — RustFRP controller (management API + embedded edge)
 
 USAGE:
   rustfrp-server run
+  rustfrp-server backup <new-file>
   rustfrp-server admin create <name> [--role owner|admin|operator|viewer]
   rustfrp-server admin list
   rustfrp-server admin disable <name>
@@ -30,6 +31,8 @@ ENVIRONMENT:
   RUSTFRP_DB (rustfrp.db)   RUSTFRP_HTTP (127.0.0.1:8080)   RUSTFRP_EDGE (0.0.0.0:7000)
   RUSTFRP_PROXY_BIND (0.0.0.0)   RUSTFRP_ALLOW_PORTS (e.g. 6000-6100,7000)
   RUSTFRP_VHOST_HTTP / RUSTFRP_VHOST_HTTPS (ports for http / https tunnels)   RUSTFRP_SUBDOMAIN_HOST
+  RUSTFRP_AUDIT_RETENTION_DAYS (90; 0 keeps all)   RUSTFRP_CLEANUP_BATCH (500; 1..1000)
+  RUSTFRP_EDGE_TLS_CERT / RUSTFRP_EDGE_TLS_KEY (PEM files; configured together)
   RUSTFRP_PUBLIC_HOST   RUSTFRP_PUBLIC_URL   RUSTFRP_PANEL_DIR   RUSTFRP_SECURE_COOKIE   RUSTFRP_SESSION_HOURS
 ";
 
@@ -38,6 +41,8 @@ ENVIRONMENT:
 pub enum Cmd {
     /// 启动服务。
     Run,
+    /// 在线一致性快照；目标必须不存在。
+    Backup(String),
     /// 创建管理员。
     AdminCreate(String, Role),
     /// 列出管理员。
@@ -59,6 +64,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         [] | ["help" | "-h" | "--help"] => Ok(Cmd::Help),
         ["version" | "-v" | "--version"] => Ok(Cmd::Version),
         ["run"] => Ok(Cmd::Run),
+        ["backup", path] if !path.is_empty() => Ok(Cmd::Backup((*path).into())),
         ["admin", "list"] => Ok(Cmd::AdminList),
         ["admin", "create", name] => Ok(Cmd::AdminCreate((*name).into(), Role::Owner)),
         ["admin", "create", name, "--role", role] => match *role {
@@ -112,6 +118,24 @@ pub async fn execute(
             let _ = writeln!(out, "rustfrp-server {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        Cmd::Backup(destination) => {
+            if let Err(e) = tokio::fs::metadata(&cfg.db_path).await {
+                return fail(err, format!("source database: {e}"));
+            }
+            let result = backup_database(
+                cfg.db_path.clone(),
+                destination.clone().into(),
+                Db::open_read_only,
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    let _ = writeln!(out, "snapshot saved to {destination}");
+                    0
+                }
+                Err(e) => fail(err, e.to_string()),
+            }
+        }
         Cmd::Run => {
             let log =
                 Logger::from_target("console", Level::Info).unwrap_or_else(|_| Logger::silent());
@@ -128,6 +152,18 @@ pub async fn execute(
             Ok(()) => 0,
             Err(e) => fail(err, e),
         },
+    }
+}
+
+async fn backup_database(
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    open: fn(&std::path::Path) -> Result<Db, StoreError>,
+) -> Result<(), StoreError> {
+    match tokio::task::spawn_blocking(move || open(&source)).await {
+        Ok(Ok(db)) => db.backup(destination).await,
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(StoreError::Sqlite(format!("backup worker failed: {e}"))),
     }
 }
 
@@ -195,7 +231,7 @@ async fn admin_command(
                 "password updated for \"{name}\"; all of its sessions were revoked"
             );
         }
-        Cmd::Run | Cmd::Version | Cmd::Help => {}
+        Cmd::Run | Cmd::Backup(_) | Cmd::Version | Cmd::Help => {}
     }
     Ok(())
 }
@@ -207,6 +243,16 @@ mod tests {
 
     fn p(a: &[&str]) -> Result<Cmd, String> {
         parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[tokio::test]
+    async fn backup_worker_failure_is_reported() {
+        fn broken(_: &std::path::Path) -> Result<Db, StoreError> {
+            panic!("injected reader failure");
+        }
+        let result = backup_database("unused-source".into(), "unused-target".into(), broken).await;
+        assert!(matches!(result, Err(StoreError::Sqlite(e)) if e.contains("backup worker failed")));
+        assert!(!std::path::Path::new("unused-target").exists());
     }
 
     #[test]

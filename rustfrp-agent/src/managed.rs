@@ -21,6 +21,10 @@ pub struct ManagedOpts {
     pub state_dir: Option<String>,
     /// 受信 CA 文件（PEM）；缺省不校验证书（与 frp 一致）。
     pub ca_file: Option<String>,
+    /// 固定服务端叶证书，来自可信接入命令。
+    pub tls_pin: Option<String>,
+    /// 受管 Edge：客户端访问本节点所用的主机名（首次接入必填）。
+    pub public_host: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,8 +101,13 @@ pub fn save(
         .map_err(|e| format!("write {path}: {e}"))
 }
 
-/// 拆分 `host[:port]`。
+/// 拆分 `host[:port]`（默认端口 7000，客户端接入 Edge）。
 pub fn split_controller(s: &str) -> Result<(String, u16), String> {
+    split_controller_default(s, 7000)
+}
+
+/// 拆分 `host[:port]`，缺省端口由调用方给定（受管 Edge 连 Controller 的节点端口默认 7001）。
+pub fn split_controller_default(s: &str, default_port: u16) -> Result<(String, u16), String> {
     match s.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() => {
             let port = p
@@ -107,7 +116,7 @@ pub fn split_controller(s: &str) -> Result<(String, u16), String> {
             Ok((h.to_string(), port))
         }
         _ if s.is_empty() || s.contains(':') => Err(format!("invalid --controller \"{s}\"")),
-        _ => Ok((s.to_string(), 7000)),
+        _ => Ok((s.to_string(), default_port)),
     }
 }
 
@@ -151,6 +160,7 @@ pub fn client_config(
         server_addr: host,
         server_port: port,
         trusted_ca_pem,
+        tls_pin: opts.tls_pin.clone(),
         // 首次接入失败（令牌无效 / 过期）应直接报错退出；已接入的设备则一直重试。
         login_fail_exit: id.client_id.is_none(),
         managed: Some(ManagedCfg {
@@ -174,7 +184,9 @@ mod tests {
             enroll_token: Some("t".into()),
             name: None,
             state_dir: None,
+            public_host: None,
             ca_file: None,
+            tls_pin: None,
         }
     }
 

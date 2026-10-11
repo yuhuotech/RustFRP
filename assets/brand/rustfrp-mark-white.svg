@@ -1,5 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
-<title id="title">RustFRP</title>
-<g fill="none" stroke="#FFFFFF" stroke-width="82" stroke-linecap="round" stroke-linejoin="round"><path d="M342 742V500a170 170 0 0 1 340 0v242"/><path stroke-width="56" d="M126 640H186M838 640H898"/></g>
-<circle cx="512" cy="600" r="62" fill="#FFFFFF"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="RustFRP"><g id="mark" fill="#FFFFFF" transform="translate(512 512) scale(1.12) translate(-512 -512)">
+    <path fill-rule="evenodd" d="M278 318C163 318 102 404 102 512s61 194 176 194c97 0 169-75 234-148 65 73 137 148 234 148 115 0 176-86 176-194s-61-194-176-194c-97 0-169 75-234 148-65-73-137-148-234-148ZM278 430c-43 0-64 35-64 82s21 82 64 82c43 0 96-45 158-82-62-37-115-82-158-82Zm468 0c-43 0-96 45-158 82 62 37 115 82 158 82 43 0 64-35 64-82s-21-82-64-82Z" transform="rotate(-32 512 512)" />
+  </g>
 </svg>

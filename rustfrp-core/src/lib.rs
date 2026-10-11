@@ -13,9 +13,12 @@
 pub mod auth;
 pub mod error;
 pub mod frpcfg;
+pub mod http1;
 pub mod identity;
 pub mod mux;
+pub mod node;
 pub mod pipe;
+pub mod proxyproto;
 pub mod tls;
 pub mod udpframe;
 pub mod vhost;

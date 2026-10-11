@@ -12,6 +12,7 @@ use std::time::Duration;
 use rustfrp_agent::client::{self, ClientConfig, EnrollInfo, Event, ManagedCfg};
 use rustfrp_agent::log::Logger;
 use rustfrp_core::identity::DeviceKey;
+use rustfrp_core::wire::HttpOpts;
 use rustfrp_server::app::{self, Server};
 use rustfrp_server::auth::token_hash;
 use rustfrp_server::config::Config;
@@ -661,4 +662,182 @@ async fn udp_and_http_tunnels_run_through_the_controller() {
     cancel.cancel();
     server.stop().await;
     cleanup(&path);
+}
+
+#[tokio::test]
+async fn http_basic_auth_and_locations_are_pushed_and_hot_updated() {
+    let (server, path) = start().await;
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let token = make_token(&server, "box", 60_000).await;
+    let (mut rx, cancel) = spawn(agent(&server, key, None, Some(&token)));
+    let Event::Enrolled { client_id } =
+        until(&mut rx, |e| matches!(e, Event::Enrolled { .. })).await
+    else {
+        unreachable!()
+    };
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&b[..n]).to_string();
+                let tag = if head.contains("X-Env: prod") {
+                    "tagged"
+                } else {
+                    "plain"
+                };
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tag}",
+                            tag.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    let cid = client_id.clone();
+    let tunnel = server
+        .db
+        .call(move |c| {
+            store::create_tunnel(
+                c,
+                &NewTunnel {
+                    client_id: cid,
+                    name: "private".into(),
+                    kind: "http".into(),
+                    local_ip: "127.0.0.1".into(),
+                    local_port: i64::from(backend_port),
+                    enabled: true,
+                    custom_domains: vec!["app.example.com".into()],
+                    http: HttpOpts {
+                        locations: vec!["/admin".into()],
+                        http_user: "alice".into(),
+                        http_password: "first".into(),
+                        request_headers: [("X-Env".to_string(), "prod".to_string())].into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                store::now_ms(),
+            )
+        })
+        .await
+        .unwrap();
+    server.hub.refresh(&client_id).await.unwrap();
+    let id = tunnel.id.clone();
+    wait_for(|| {
+        let (db, id) = (server.db.clone(), id.clone());
+        async move {
+            db.call(move |c| store::get_tunnel(c, &id))
+                .await
+                .unwrap()
+                .state
+                == "running"
+        }
+    })
+    .await;
+    let vhost = server.vhost_http_addr.unwrap();
+    let get = |path: &'static str, auth: Option<&'static str>| async move {
+        let mut s = TcpStream::connect(vhost).await.unwrap();
+        let extra = auth.map_or(String::new(), |a| format!("Authorization: Basic {a}\r\n"));
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: app.example.com\r\n{extra}\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = String::new();
+        timeout(T, s.read_to_string(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        out
+    };
+    // alice:first / alice:second
+    let (first, second) = ("YWxpY2U6Zmlyc3Q=", "YWxpY2U6c2Vjb25k");
+    assert!(get("/admin/x", None).await.starts_with("HTTP/1.1 401"));
+    assert!(get("/admin/x", Some(first)).await.ends_with("tagged"));
+    assert!(
+        get("/other", Some(first)).await.starts_with("HTTP/1.1 404"),
+        "outside the location"
+    );
+
+    // 热更新：改密码，旧密码立即失效，设备不用重连。
+    let t2 = tunnel.id.clone();
+    server
+        .db
+        .call(move |c| {
+            store::update_tunnel(
+                c,
+                &t2,
+                &TunnelPatch {
+                    http_password: Some("second".into()),
+                    ..Default::default()
+                },
+                store::now_ms(),
+            )
+        })
+        .await
+        .unwrap();
+    server.hub.refresh(&client_id).await.unwrap();
+    wait_for(|| async move { get("/admin/x", Some(second)).await.ends_with("tagged") }).await;
+    assert!(get("/admin/x", Some(first))
+        .await
+        .starts_with("HTTP/1.1 401"));
+    cancel.cancel();
+    server.stop().await;
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn controller_accepts_explicit_edge_identity_and_rejects_bad_material() {
+    let dir = std::env::temp_dir().join(format!("rfrp-cert-server-{}", store::new_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(
+        &cert,
+        include_bytes!("../../rustfrp-protocol/fixtures/edge-test-cert.pem"),
+    )
+    .unwrap();
+    std::fs::write(
+        &key,
+        include_bytes!("../../rustfrp-protocol/fixtures/edge-test-key.pem"),
+    )
+    .unwrap();
+    let cfg = rustfrp_server::config::Config {
+        db_path: dir.join("test.db"),
+        http_addr: "127.0.0.1:0".into(),
+        edge_addr: "127.0.0.1:0".into(),
+        edge_tls_cert: Some(cert.clone()),
+        edge_tls_key: Some(key.clone()),
+        ..Default::default()
+    };
+    let server = rustfrp_server::app::start(cfg.clone(), Logger::silent())
+        .await
+        .unwrap();
+    assert_ne!(server.edge_addr.port(), 0);
+    let token = make_token(&server, "trusted", 60_000).await;
+    let mut client = agent(
+        &server,
+        Arc::new(DeviceKey::generate().unwrap()),
+        None,
+        Some(&token),
+    );
+    client.trusted_ca_pem =
+        Some(include_bytes!("../../rustfrp-protocol/fixtures/edge-test-cert.pem").to_vec());
+    let (mut events, stop) = spawn(client);
+    until(&mut events, |e| matches!(e, Event::ConfigApplied { .. })).await;
+    assert_eq!(server.hub.online_ids().len(), 1);
+    stop.cancel();
+    server.stop().await;
+    std::fs::write(&key, "invalid").unwrap();
+    assert!(rustfrp_server::app::start(cfg, Logger::silent())
+        .await
+        .is_err());
+    std::fs::remove_dir_all(dir).unwrap();
 }

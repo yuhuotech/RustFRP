@@ -44,6 +44,12 @@ pub fn self_signed(names: Vec<String>) -> Result<Identity, TunnelError> {
     })
 }
 
+/// 生成可持久化的自签名证书和私钥 PEM。
+pub fn self_signed_pem(names: Vec<String>) -> Result<(String, String), TunnelError> {
+    let ck = rcgen::generate_simple_self_signed(names).map_err(tls_err)?;
+    Ok((ck.cert.pem(), ck.signing_key.serialize_pem()))
+}
+
 /// 从 PEM 文本解析证书链与私钥。
 pub fn identity_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Identity, TunnelError> {
     let certs = CertificateDer::pem_slice_iter(cert_pem)
@@ -96,25 +102,89 @@ pub fn client_config(
         }
         None => builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider())))
+            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider(), None, None)))
             .with_no_client_auth(),
     };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     Ok(Arc::new(cfg))
 }
 
+/// 叶证书 DER 的 SHA-256（与 openssl x509 指纹口径一致，不含分隔符）。
+pub fn certificate_fingerprint(cert: &CertificateDer<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(cert.as_ref()) {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+/// 同时验证可选 CA 与固定叶证书；无 pin 时沿用 frp 默认行为。
+pub fn client_config_pinned(
+    trusted: Option<Vec<CertificateDer<'static>>>,
+    pin: Option<&str>,
+) -> Result<Arc<ClientConfig>, TunnelError> {
+    let Some(pin) = pin else {
+        return client_config(trusted);
+    };
+    if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(tls_err("TLS pin must be 64 hexadecimal SHA256 characters"));
+    }
+    let verifier: Option<Arc<dyn ServerCertVerifier>> = match &trusted {
+        Some(certs) => {
+            let mut roots = RootCertStore::empty();
+            for cert in certs {
+                roots.add(cert.clone()).map_err(tls_err)?;
+            }
+            Some(
+                rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider(),
+                )
+                .build()
+                .map_err(tls_err)?,
+            )
+        }
+        None => None,
+    };
+    let mut cfg = client_config(trusted)?.as_ref().clone();
+    cfg.dangerous().set_certificate_verifier(Arc::new(AcceptAny(
+        provider(),
+        Some(pin.to_ascii_lowercase()),
+        verifier,
+    )));
+    Ok(Arc::new(cfg))
+}
+
 #[derive(Debug)]
-struct AcceptAny(Arc<CryptoProvider>);
+struct AcceptAny(
+    Arc<CryptoProvider>,
+    Option<String>,
+    Option<Arc<dyn ServerCertVerifier>>,
+);
 
 impl ServerCertVerifier for AcceptAny {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if let Some(verifier) = &self.2 {
+            verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp, now)?;
+        }
+        if self
+            .1
+            .as_ref()
+            .is_some_and(|pin| certificate_fingerprint(end_entity) != *pin)
+        {
+            return Err(rustls::Error::General(
+                "server certificate pin mismatch".into(),
+            ));
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -228,5 +298,48 @@ mod tests {
             key: b.key,
         };
         assert!(server_config(mixed).is_err());
+    }
+    #[tokio::test]
+    async fn pinned_handshake_never_falls_back_on_mismatch() {
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let cert = id.certs[0].clone();
+        let pin = certificate_fingerprint(&cert);
+        assert_eq!(pin.len(), 64);
+        let server = server_config(id).unwrap();
+        assert_eq!(
+            handshake(
+                client_config_pinned(None, Some(&pin)).unwrap(),
+                server.clone()
+            )
+            .await
+            .unwrap(),
+            b"pong"
+        );
+        assert!(handshake(
+            client_config_pinned(None, Some(&"0".repeat(64))).unwrap(),
+            server.clone()
+        )
+        .await
+        .is_err());
+        assert!(handshake(
+            client_config_pinned(Some(vec![cert]), Some(&pin)).unwrap(),
+            server
+        )
+        .await
+        .is_ok());
+        assert!(client_config_pinned(None, Some("invalid")).is_err());
+        assert!(client_config_pinned(None, Some(&"z".repeat(64))).is_err());
+        assert!(client_config_pinned(Some(vec![]), Some(&pin)).is_err());
+        assert!(
+            client_config_pinned(Some(vec![CertificateDer::from(vec![1])]), Some(&pin)).is_err()
+        );
+        assert!(client_config_pinned(None, None).is_ok());
+    }
+    #[test]
+    fn persisted_pem_roundtrips_identity() {
+        let (cert, key) = self_signed_pem(vec!["localhost".into()]).unwrap();
+        let id = identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+        assert_eq!(id.certs.len(), 1);
+        assert!(server_config(id).is_ok());
     }
 }

@@ -487,6 +487,7 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
             &StartWork {
                 proxy: "nope".into(),
                 src: "1.1.1.1:1".into(),
+                dst: String::new(),
             },
         )
         .await

@@ -1,0 +1,3 @@
+-- 设备标签（JSON 数组文本）与远程重启计数。
+ALTER TABLE clients ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+ALTER TABLE clients ADD COLUMN restart_seq INTEGER NOT NULL DEFAULT 0;

@@ -25,6 +25,9 @@ struct Rig {
     http: Option<SocketAddr>,
     https: Option<SocketAddr>,
     stop: CancellationToken,
+    traffic: std::sync::Arc<rustfrp_core::pipe::Traffic>,
+    metrics: std::sync::Arc<rustfrp_agent::metrics::Metrics>,
+    client_traffic: std::sync::Arc<rustfrp_core::pipe::Traffic>,
 }
 
 async fn start(cfg: EdgeConfig) -> Rig {
@@ -40,6 +43,9 @@ async fn start(cfg: EdgeConfig) -> Rig {
         http: edge.http_addr(),
         https: edge.https_addr(),
         stop: CancellationToken::new(),
+        traffic: edge.traffic(),
+        metrics: edge.metrics(),
+        client_traffic: std::sync::Arc::default(),
     };
     tokio::spawn(edge.serve(rig.stop.clone()));
     rig
@@ -72,6 +78,7 @@ fn run_client(rig: &Rig, proxies: Vec<ProxyCfg>) -> (mpsc::Receiver<Event>, Canc
         server_addr: "127.0.0.1".into(),
         server_port: rig.edge.port(),
         proxies,
+        traffic: rig.client_traffic.clone(),
         udp_idle: Duration::from_millis(400),
         heartbeat_interval: Duration::from_millis(100),
         ..Default::default()
@@ -165,6 +172,15 @@ async fn udp_proxy_forwards_per_peer_and_recycles_idle_sessions() {
     assert_eq!(&buf[..n], b"echo:from-a");
     let n = timeout(T, b.recv(&mut buf)).await.unwrap().unwrap();
     assert_eq!(&buf[..n], b"echo:from-b");
+    let sample = rig.traffic.snapshot();
+    assert_eq!((sample.bytes_in, sample.bytes_out), (12, 22));
+    assert_eq!((sample.connections, sample.connections_total), (2, 2));
+    let local = rig.client_traffic.snapshot();
+    assert_eq!(
+        (local.bytes_in, local.bytes_out, local.connections),
+        (12, 22, 2)
+    );
+    assert_eq!(rig.metrics.snapshot(), vec![("dns".into(), sample)]);
     // 同一访问者的多个包复用同一条流，且保持顺序。
     for i in 0..5u8 {
         a.send_to(&[i], remote).await.unwrap();
@@ -235,7 +251,11 @@ async fn http_routing_by_host_wildcard_subdomain_and_rewrite() {
         assert!(matches!(e, Event::ProxyStarted { .. }), "{e:?}");
     }
 
-    assert!(http_get(http, "a.example.com").await.ends_with("backend=a"));
+    let response = http_get(http, "a.example.com").await;
+    assert!(response.ends_with("backend=a"));
+    let first_sample = rig.traffic.snapshot();
+    assert_eq!(first_sample.bytes_out, response.len() as u64);
+    assert_eq!(first_sample.connections_total, 1);
     assert!(
         http_get(http, "B.Example.COM:8080")
             .await
@@ -255,6 +275,14 @@ async fn http_routing_by_host_wildcard_subdomain_and_rewrite() {
         "{seen}"
     );
 
+    assert!(first_sample.bytes_in > 0);
+    let samples = rig.metrics.snapshot();
+    let a_sample = &samples.iter().find(|(name, _)| name == "a").unwrap().1;
+    let b_sample = &samples.iter().find(|(name, _)| name == "b").unwrap().1;
+    assert_eq!(a_sample.bytes_out, first_sample.bytes_out);
+    assert_eq!(a_sample.connections_total, 1);
+    assert_eq!(b_sample.connections_total, 1);
+    assert!(rig.traffic.snapshot().bytes_in > first_sample.bytes_in);
     // 未知域名 → 404；没有 Host → 400；通配不匹配根域名。
     assert!(http_get(http, "unknown.example.com")
         .await
@@ -398,12 +426,17 @@ async fn https_routing_by_sni_is_a_transparent_passthrough() {
     s.write_all(&hello).await.unwrap();
     let received = timeout(T, seen.recv()).await.unwrap().unwrap();
     assert_eq!(received, hello);
+    assert_eq!(rig.traffic.snapshot().bytes_in, hello.len() as u64);
+    assert_eq!(rig.traffic.snapshot().connections_total, 1);
     let mut out = String::new();
     timeout(T, s.read_to_string(&mut out))
         .await
         .unwrap()
         .unwrap();
     assert!(out.ends_with("backend=tls"));
+    s.shutdown().await.unwrap();
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // 未知 SNI / 没有 SNI / 非 TLS：直接断开。
     for bytes in [
@@ -416,6 +449,15 @@ async fn https_routing_by_sni_is_a_transparent_passthrough() {
         let _ = timeout(T, s.read_to_end(&mut b)).await.unwrap();
         assert!(b.is_empty());
     }
+    // 连上就关 / 声称很长却一直凑不齐的 TLS 记录：不挂住连接，也不无限缓冲。
+    drop(TcpStream::connect(https).await.unwrap());
+    let mut s = TcpStream::connect(https).await.unwrap();
+    let mut junk = vec![0x16, 3, 1, 0xff, 0xff];
+    junk.extend(vec![1u8; 20_000]);
+    s.write_all(&junk).await.unwrap();
+    let mut b = Vec::new();
+    let _ = timeout(T, s.read_to_end(&mut b)).await.unwrap();
+    assert!(b.is_empty());
     // 分两次发送 ClientHello 也能识别。
     let mut s = TcpStream::connect(https).await.unwrap();
     s.write_all(&hello[..10]).await.unwrap();

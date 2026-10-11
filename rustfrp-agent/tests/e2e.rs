@@ -24,6 +24,8 @@ const T: Duration = Duration::from_secs(10);
 struct Harness {
     edge_addr: SocketAddr,
     shutdown: CancellationToken,
+    traffic: std::sync::Arc<rustfrp_core::pipe::Traffic>,
+    metrics: std::sync::Arc<rustfrp_agent::metrics::Metrics>,
 }
 
 async fn start_edge(mut cfg: EdgeConfig) -> Harness {
@@ -32,11 +34,15 @@ async fn start_edge(mut cfg: EdgeConfig) -> Harness {
     cfg.proxy_bind_addr = "127.0.0.1".into();
     let edge = Edge::bind(cfg, None, Logger::silent()).await.unwrap();
     let edge_addr = edge.local_addr().unwrap();
+    let traffic = edge.traffic();
+    let metrics = edge.metrics();
     let shutdown = CancellationToken::new();
     tokio::spawn(edge.serve(shutdown.clone()));
     Harness {
         edge_addr,
         shutdown,
+        traffic,
+        metrics,
     }
 }
 
@@ -151,6 +157,9 @@ async fn tcp_tunnel_carries_data_both_ways() {
     assert_ne!(port, 0);
 
     echo_roundtrip(port, b"hello through the tunnel").await;
+    let snapshot = h.traffic.snapshot();
+    assert_eq!((snapshot.bytes_in, snapshot.bytes_out), (24, 24));
+    assert_eq!(snapshot.connections_total, 1);
     // 1 MiB，且多条并发，验证流控与多路复用。
     let big: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let mut set = tokio::task::JoinSet::new();
@@ -499,4 +508,30 @@ async fn trusted_ca_is_verified_and_bad_config_is_rejected() {
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Config(_)));
+}
+
+#[tokio::test]
+async fn standalone_sweep_reclaims_stopped_proxy_after_disconnect() {
+    let h = start_edge(EdgeConfig::default()).await;
+    let port = start_echo().await;
+    let (mut rx, cancel, task) = spawn_client(client_cfg(&h, vec![tcp_proxy("sweep", port, 0)]));
+    assert_eq!(next_event(&mut rx).await, Event::Connected);
+    let remote = expect_proxy_port(&mut rx).await;
+    echo_roundtrip(remote, b"counted").await;
+    assert_eq!(h.metrics.snapshot().len(), 1);
+    cancel.cancel();
+    assert!(timeout(T, task).await.unwrap().unwrap().is_ok());
+    timeout(T, async {
+        while !h.metrics.snapshot().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let totals = h.traffic.snapshot();
+    assert_eq!(
+        (totals.bytes_in, totals.bytes_out, totals.connections),
+        (7, 7, 0)
+    );
+    h.shutdown.cancel();
 }

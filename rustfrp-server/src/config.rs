@@ -11,10 +11,20 @@ pub struct Config {
     pub http_addr: String,
     /// 内置 Edge 监听地址（Client 连接）。
     pub edge_addr: String,
+    /// 是否启动内置 Edge（默认开启）。关闭后 Controller 只做管理面，设备必须接入独立节点。
+    pub builtin_edge: bool,
+    /// Prometheus `/metrics` 的 Bearer 令牌；空 = 不提供该端点。
+    pub metrics_token: String,
+    /// 节点端口（外置 Edge 接入 Controller 的监听地址）；空 = 不启用。
+    pub node_addr: String,
     /// 内置 Edge 的代理端口绑定地址。
     pub proxy_bind_addr: String,
     /// 允许分配给隧道的远程端口区间；空 = 不限。
     pub allow_ports: Vec<(u16, u16)>,
+    /// 禁止分配给隧道的端口区间（在 `allow_ports` 之上再剔除；Controller 自身监听的端口总是保留）。
+    pub reserved_ports: Vec<(u16, u16)>,
+    /// 单个客户端最多的隧道数；0 = 不限。
+    pub max_tunnels_per_client: i64,
     /// 对外可访问的主机名（安装命令里使用）。
     pub public_host: String,
     /// 面板对外访问地址（含协议），用于生成安装脚本命令；空则不生成。
@@ -31,6 +41,15 @@ pub struct Config {
     pub vhost_https: Option<u16>,
     /// 子域名后缀（`*.tunnel.example.com` 的 `tunnel.example.com`）。
     pub subdomain_host: String,
+    /// 审计保留天数；0 保留全部。
+    pub audit_retention_days: i64,
+    /// 每轮、每表清理上限。
+    pub cleanup_batch: i64,
+    /// 内置 Edge 的 PEM 证书链与私钥，必须成对配置。
+    pub edge_tls_cert: Option<PathBuf>,
+    pub edge_tls_key: Option<PathBuf>,
+    /// 启动时由实际 Edge 证书生成，不从环境变量接受。
+    pub edge_tls_fingerprint: String,
 }
 
 impl Default for Config {
@@ -39,8 +58,13 @@ impl Default for Config {
             db_path: PathBuf::from("rustfrp.db"),
             http_addr: "127.0.0.1:8080".into(),
             edge_addr: "0.0.0.0:7000".into(),
+            builtin_edge: true,
+            metrics_token: String::new(),
+            node_addr: String::new(),
             proxy_bind_addr: "0.0.0.0".into(),
             allow_ports: Vec::new(),
+            reserved_ports: Vec::new(),
+            max_tunnels_per_client: 0,
             public_host: "127.0.0.1".into(),
             public_url: String::new(),
             panel_dir: None,
@@ -49,6 +73,11 @@ impl Default for Config {
             vhost_http: None,
             vhost_https: None,
             subdomain_host: String::new(),
+            audit_retention_days: 90,
+            cleanup_batch: 500,
+            edge_tls_cert: None,
+            edge_tls_key: None,
+            edge_tls_fingerprint: String::new(),
         }
     }
 }
@@ -79,7 +108,20 @@ pub fn parse_ports(s: &str) -> Result<Vec<(u16, u16)>, String> {
 impl Config {
     /// 从「键 → 值」查询函数构造（便于测试，不直接读进程环境）。
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let mut c = Config::default();
+        let mut c = Config {
+            edge_tls_cert: get("RUSTFRP_EDGE_TLS_CERT")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from),
+            edge_tls_key: get("RUSTFRP_EDGE_TLS_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from),
+            ..Default::default()
+        };
+        if c.edge_tls_cert.is_some() != c.edge_tls_key.is_some() {
+            return Err(
+                "RUSTFRP_EDGE_TLS_CERT and RUSTFRP_EDGE_TLS_KEY must be configured together".into(),
+            );
+        }
         if let Some(v) = get("RUSTFRP_DB") {
             c.db_path = v.into();
         }
@@ -89,11 +131,29 @@ impl Config {
         if let Some(v) = get("RUSTFRP_EDGE") {
             c.edge_addr = v;
         }
+        if let Some(v) = get("RUSTFRP_BUILTIN_EDGE") {
+            c.builtin_edge = !matches!(v.trim(), "0" | "false" | "no" | "off");
+        }
+        if let Some(v) = get("RUSTFRP_METRICS_TOKEN") {
+            let t = v.trim();
+            if !t.is_empty() && (t.len() < 16 || t.chars().any(char::is_whitespace)) {
+                return Err(
+                    "RUSTFRP_METRICS_TOKEN must be at least 16 characters without spaces".into(),
+                );
+            }
+            c.metrics_token = t.to_string();
+        }
+        if let Some(v) = get("RUSTFRP_NODE_ADDR") {
+            c.node_addr = v.trim().to_string();
+        }
         if let Some(v) = get("RUSTFRP_PROXY_BIND") {
             c.proxy_bind_addr = v;
         }
         if let Some(v) = get("RUSTFRP_ALLOW_PORTS") {
             c.allow_ports = parse_ports(&v)?;
+        }
+        if let Some(v) = get("RUSTFRP_RESERVED_PORTS") {
+            c.reserved_ports = parse_ports(&v)?;
         }
         if let Some(v) = get("RUSTFRP_PUBLIC_HOST") {
             c.public_host = v;
@@ -130,7 +190,67 @@ impl Config {
             }
             c.session_ttl_ms = h * 3600 * 1000;
         }
+        for (key, slot, min, max) in [
+            (
+                "RUSTFRP_AUDIT_RETENTION_DAYS",
+                &mut c.audit_retention_days,
+                0,
+                3650,
+            ),
+            (
+                "RUSTFRP_MAX_TUNNELS_PER_CLIENT",
+                &mut c.max_tunnels_per_client,
+                0,
+                10_000,
+            ),
+            (
+                "RUSTFRP_CLEANUP_BATCH",
+                &mut c.cleanup_batch,
+                1,
+                crate::maintenance::MAX_BATCH,
+            ),
+        ] {
+            if let Some(value) = get(key) {
+                let n = value.parse::<i64>().map_err(|_| format!("invalid {key}"))?;
+                if !(min..=max).contains(&n) {
+                    return Err(format!("{key} must be {min}..{max}"));
+                }
+                *slot = n;
+            }
+        }
         Ok(c)
+    }
+
+    /// 远程端口是否可分配：`0`（由服务器分配）总是通过；否则必须落在 `allow_ports` 内（若配置），
+    /// 且不得命中显式保留区间或 Controller 自身的监听端口（Edge / 管理 HTTP / vhost）。
+    pub fn check_remote_port(&self, port: i64) -> Result<(), String> {
+        if port == 0 {
+            return Ok(());
+        }
+        let within = |ranges: &[(u16, u16)]| {
+            ranges
+                .iter()
+                .any(|(lo, hi)| (i64::from(*lo)..=i64::from(*hi)).contains(&port))
+        };
+        if !self.allow_ports.is_empty() && !within(&self.allow_ports) {
+            return Err(format!(
+                "remote port {port} is outside the ports this server allows"
+            ));
+        }
+        let listening = [
+            Some(self.edge_port()),
+            self.vhost_http,
+            self.vhost_https,
+            self.http_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok()),
+        ];
+        if within(&self.reserved_ports) || listening.iter().flatten().any(|p| i64::from(*p) == port)
+        {
+            return Err(format!("remote port {port} is reserved by the server"));
+        }
+        Ok(())
     }
 
     /// 内置 Edge 的监听端口（用于生成安装命令）。
@@ -148,6 +268,45 @@ impl Config {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn retention_config_is_bounded() {
+        let defaults = cfg(&[]).unwrap();
+        assert_eq!(defaults.audit_retention_days, 90);
+        assert_eq!(defaults.cleanup_batch, 500);
+        assert_eq!(
+            cfg(&[
+                ("RUSTFRP_AUDIT_RETENTION_DAYS", "0"),
+                ("RUSTFRP_CLEANUP_BATCH", "1")
+            ])
+            .unwrap()
+            .audit_retention_days,
+            0
+        );
+        assert_eq!(
+            cfg(&[
+                ("RUSTFRP_AUDIT_RETENTION_DAYS", "3650"),
+                ("RUSTFRP_CLEANUP_BATCH", "1000")
+            ])
+            .unwrap()
+            .cleanup_batch,
+            1000
+        );
+        for (key, value) in [
+            ("RUSTFRP_AUDIT_RETENTION_DAYS", "bad"),
+            ("RUSTFRP_AUDIT_RETENTION_DAYS", "-1"),
+            ("RUSTFRP_AUDIT_RETENTION_DAYS", "3651"),
+            ("RUSTFRP_CLEANUP_BATCH", "0"),
+            ("RUSTFRP_METRICS_TOKEN", "short"),
+            ("RUSTFRP_METRICS_TOKEN", "has space in it xxxxxxxxx"),
+            ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "-1"),
+            ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "10001"),
+            ("RUSTFRP_RESERVED_PORTS", "x"),
+            ("RUSTFRP_CLEANUP_BATCH", "1001"),
+        ] {
+            assert!(cfg(&[(key, value)]).is_err());
+        }
+    }
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, String> {
         let m: HashMap<String, String> = pairs
@@ -175,8 +334,13 @@ mod tests {
             ("RUSTFRP_DB", "/data/x.db"),
             ("RUSTFRP_HTTP", "0.0.0.0:9000"),
             ("RUSTFRP_EDGE", "0.0.0.0:7100"),
+            ("RUSTFRP_NODE_ADDR", " 0.0.0.0:7200 "),
+            ("RUSTFRP_BUILTIN_EDGE", "off"),
+            ("RUSTFRP_METRICS_TOKEN", " 0123456789abcdef0123 "),
             ("RUSTFRP_PROXY_BIND", "10.0.0.1"),
             ("RUSTFRP_ALLOW_PORTS", "6000-6100, 7000"),
+            ("RUSTFRP_RESERVED_PORTS", "6050"),
+            ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "20"),
             ("RUSTFRP_PUBLIC_HOST", "frp.example.com"),
             ("RUSTFRP_PUBLIC_URL", "https://frp.example.com/"),
             ("RUSTFRP_PANEL_DIR", "/srv/panel"),
@@ -196,7 +360,14 @@ mod tests {
             ),
             ("0.0.0.0:9000", 7100, "10.0.0.1")
         );
+        assert_eq!(c.node_addr, "0.0.0.0:7200");
+        assert!(!c.builtin_edge);
+        assert_eq!(c.metrics_token, "0123456789abcdef0123");
         assert_eq!(c.allow_ports, vec![(6000, 6100), (7000, 7000)]);
+        assert_eq!(
+            (c.reserved_ports.clone(), c.max_tunnels_per_client),
+            (vec![(6050, 6050)], 20)
+        );
         assert_eq!(
             (c.public_host.as_str(), c.public_url.as_str()),
             ("frp.example.com", "https://frp.example.com")
@@ -239,5 +410,19 @@ mod tests {
         assert!(cfg(&[("RUSTFRP_SESSION_HOURS", "0")]).is_err());
         assert!(cfg(&[("RUSTFRP_SESSION_HOURS", "721")]).is_err());
         assert_eq!(parse_ports("").unwrap(), vec![]);
+    }
+    #[test]
+    fn edge_certificate_configuration_requires_pair() {
+        assert!(cfg(&[("RUSTFRP_EDGE_TLS_CERT", "cert.pem")]).is_err());
+        assert!(cfg(&[("RUSTFRP_EDGE_TLS_KEY", "key.pem")]).is_err());
+        let c = cfg(&[
+            ("RUSTFRP_EDGE_TLS_CERT", "cert.pem"),
+            ("RUSTFRP_EDGE_TLS_KEY", "key.pem"),
+        ])
+        .unwrap();
+        assert_eq!(c.edge_tls_cert, Some(PathBuf::from("cert.pem")));
+        assert_eq!(c.edge_tls_key, Some(PathBuf::from("key.pem")));
+        let c = cfg(&[("RUSTFRP_EDGE_TLS_CERT", ""), ("RUSTFRP_EDGE_TLS_KEY", " ")]).unwrap();
+        assert!(c.edge_tls_cert.is_none());
     }
 }

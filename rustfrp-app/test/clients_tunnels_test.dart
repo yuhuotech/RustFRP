@@ -14,37 +14,51 @@ Future<void> openClients(WidgetTester tester) async {
 }
 
 Future<void> fillReason(WidgetTester tester, String reason) async {
-  await tester.enterText(find.widgetWithText(TextField, '操作理由（必填，会写入审计）').first, reason);
+  await tester.enterText(
+    find.widgetWithText(TextField, '操作理由（必填，会写入审计）').first,
+    reason,
+  );
   await settle(tester);
 }
 
 void main() {
-  testWidgets('clients list: rows show state, selecting shows details and tunnels', (tester) async {
-    final s = FakeServer();
-    final a = s.addClient('nas', isOnline: true);
-    final b = s.addClient('old-laptop', os: 'macos', disabled: true);
-    s.addTunnel(a['id']! as String, 'ssh', error: '');
-    await Harness.create(tester, s);
-    await openClients(tester);
-    expect(find.text('nas'), findsOneWidget);
-    expect(find.textContaining('已停用'), findsOneWidget);
-    expect(find.textContaining('Linux · 在线'), findsOneWidget);
+  clientTagAndRestartTests();
+  testWidgets(
+    'clients list: rows show state, selecting shows details and tunnels',
+    (tester) async {
+      final s = FakeServer();
+      final a = s.addClient('nas', isOnline: true);
+      final b = s.addClient('old-laptop', os: 'macos', disabled: true);
+      s.addTunnel(a['id']! as String, 'ssh', error: '');
+      await Harness.create(tester, s);
+      await openClients(tester);
+      expect(find.text('nas'), findsOneWidget);
+      expect(find.textContaining('已停用'), findsOneWidget);
+      expect(find.textContaining('Linux · 在线'), findsOneWidget);
 
-    await tester.tap(find.byKey(Key('client-row-${a['id']}')));
-    await settle(tester);
-    expect(find.text('设备信息'), findsOneWidget);
-    expect(find.text('隧道（1）'), findsOneWidget);
-    expect(find.byKey(const Key('client-new-tunnel')), findsOneWidget);
-    expect(find.text('在线'), findsWidgets);
+      await tester.tap(find.byKey(Key('client-row-${a['id']}')));
+      await settle(tester);
+      expect(find.text('设备信息'), findsOneWidget);
+      expect(find.text('隧道（1）'), findsOneWidget);
+      expect(find.byKey(const Key('client-new-tunnel')), findsOneWidget);
+      expect(find.text('在线'), findsWidgets);
 
-    await tester.tap(find.byKey(Key('client-row-${b['id']}')));
-    await settle(tester);
-    expect(find.text('这台客户端还没有隧道。'), findsOneWidget);
-    expect(find.text('已停用'), findsWidgets);
-    expect(find.byTooltip('强制下线'), findsNothing, reason: 'offline devices cannot be kicked');
-  });
+      await tapKey(tester, 'client-back');
+      await tester.tap(find.byKey(Key('client-row-${b['id']}')));
+      await settle(tester);
+      expect(find.text('这台客户端还没有隧道。'), findsOneWidget);
+      expect(find.text('已停用'), findsWidgets);
+      expect(
+        find.byTooltip('强制下线'),
+        findsNothing,
+        reason: 'offline devices cannot be kicked',
+      );
+    },
+  );
 
-  testWidgets('clients: empty state offers enrollment to admins only', (tester) async {
+  testWidgets('clients: empty state offers enrollment to admins only', (
+    tester,
+  ) async {
     await Harness.create(tester, FakeServer());
     await openClients(tester);
     expect(find.text('还没有客户端'), findsOneWidget);
@@ -61,7 +75,9 @@ void main() {
     final s = FakeServer();
     final c = s.addClient('nas', isOnline: true);
     final h = await Harness.create(tester, s);
-    h.container.read(selectedClientProvider.notifier).select(c['id']! as String);
+    h.container
+        .read(selectedClientProvider.notifier)
+        .select(c['id']! as String);
     await openClients(tester);
     await tester.tap(find.byTooltip('重命名'));
     await settle(tester);
@@ -77,59 +93,71 @@ void main() {
     expect(s.requests.length, before);
   });
 
-  testWidgets('disable, enable, kick and delete require a reason and update the list', (tester) async {
-    final s = FakeServer();
-    final c = s.addClient('nas', isOnline: true);
-    s.addTunnel(c['id']! as String, 'ssh');
-    final h = await Harness.create(tester, s);
-    h.container.read(selectedClientProvider.notifier).select(c['id']! as String);
-    await openClients(tester);
+  testWidgets(
+    'disable, enable, kick and delete require a reason and update the list',
+    (tester) async {
+      final s = FakeServer();
+      final c = s.addClient('nas', isOnline: true);
+      s.addTunnel(c['id']! as String, 'ssh');
+      final h = await Harness.create(tester, s);
+      h.container
+          .read(selectedClientProvider.notifier)
+          .select(c['id']! as String);
+      await openClients(tester);
 
-    // Disable: confirm stays disabled until a reason is typed.
-    await tester.tap(find.byTooltip('停用'));
-    await settle(tester);
-    expect(find.text('停用客户端'), findsOneWidget);
-    final confirm = find.widgetWithText(LButton, '停用');
-    expect(tester.widget<LButton>(confirm).onPressed, isNull);
-    await fillReason(tester, '设备丢失');
-    await tester.tap(confirm);
-    await settle(tester, 10);
-    expect(s.clients.single['disabled_at'], isNotNull);
-    expect(s.requests.where((r) => r.method == 'PATCH').last.body, contains('设备丢失'));
+      // Disable: confirm stays disabled until a reason is typed.
+      await tester.tap(find.byTooltip('停用'));
+      await settle(tester);
+      expect(find.text('停用客户端'), findsOneWidget);
+      final confirm = find.widgetWithText(LButton, '停用');
+      expect(tester.widget<LButton>(confirm).onPressed, isNull);
+      await fillReason(tester, '设备丢失');
+      await tester.tap(confirm);
+      await settle(tester, 10);
+      expect(s.clients.single['disabled_at'], isNotNull);
+      expect(
+        s.requests.where((r) => r.method == 'PATCH').last.body,
+        contains('设备丢失'),
+      );
 
-    // Enable again.
-    await tester.tap(find.byTooltip('启用'));
-    await settle(tester);
-    await fillReason(tester, '找回了');
-    await tester.tap(find.widgetWithText(LButton, '启用'));
-    await settle(tester, 10);
-    expect(s.clients.single['disabled_at'], isNull);
+      // Enable again.
+      await tester.tap(find.byTooltip('启用'));
+      await settle(tester);
+      await fillReason(tester, '找回了');
+      await tester.tap(find.widgetWithText(LButton, '启用'));
+      await settle(tester, 10);
+      expect(s.clients.single['disabled_at'], isNull);
 
-    // Kick shows a confirmation toast.
-    await tester.tap(find.byTooltip('强制下线'));
-    await settle(tester);
-    await fillReason(tester, '重置连接');
-    await tester.tap(find.widgetWithText(LButton, '下线'));
-    await settle(tester, 10);
-    expect(find.text('已发送下线指令'), findsOneWidget);
+      // Kick shows a confirmation toast.
+      await tester.tap(find.byTooltip('强制下线'));
+      await settle(tester);
+      await fillReason(tester, '重置连接');
+      await tester.tap(find.widgetWithText(LButton, '下线'));
+      await settle(tester, 10);
+      expect(find.text('已发送下线指令'), findsOneWidget);
 
-    // Delete removes the client and its tunnels, and clears the selection.
-    await tester.tap(find.byTooltip('删除客户端'));
-    await settle(tester);
-    await fillReason(tester, '退役');
-    await tester.tap(find.widgetWithText(LButton, '删除'));
-    await settle(tester, 10);
-    expect(s.clients, isEmpty);
-    expect(s.tunnels, isEmpty);
-    expect(h.container.read(selectedClientProvider), isNull);
-    expect(find.text('还没有客户端'), findsOneWidget);
-  });
+      // Delete removes the client and its tunnels, and clears the selection.
+      await tester.tap(find.byTooltip('删除客户端'));
+      await settle(tester);
+      await fillReason(tester, '退役');
+      await tester.tap(find.widgetWithText(LButton, '删除'));
+      await settle(tester, 10);
+      expect(s.clients, isEmpty);
+      expect(s.tunnels, isEmpty);
+      expect(h.container.read(selectedClientProvider), isNull);
+      expect(find.text('还没有客户端'), findsOneWidget);
+    },
+  );
 
-  testWidgets('a rejected write shows the server message as a toast', (tester) async {
+  testWidgets('a rejected write shows the server message as a toast', (
+    tester,
+  ) async {
     final s = FakeServer();
     final c = s.addClient('nas');
     final h = await Harness.create(tester, s);
-    h.container.read(selectedClientProvider.notifier).select(c['id']! as String);
+    h.container
+        .read(selectedClientProvider.notifier)
+        .select(c['id']! as String);
     await openClients(tester);
     await tester.tap(find.byTooltip('删除客户端'));
     await settle(tester);
@@ -141,7 +169,9 @@ void main() {
     expect(s.clients, isNotEmpty);
   });
 
-  testWidgets('selected client that no longer exists, and load errors', (tester) async {
+  testWidgets('selected client that no longer exists, and load errors', (
+    tester,
+  ) async {
     final s = FakeServer();
     final h = await Harness.create(tester, s);
     h.container.read(selectedClientProvider.notifier).select('ghost');
@@ -155,13 +185,29 @@ void main() {
     expect(find.byTooltip('无法连接控制器'), findsOneWidget);
   });
 
-  testWidgets('tunnels page: list, filter, toggle, edit, delete', (tester) async {
+  testWidgets('tunnels page: list, filter, toggle, edit, delete', (
+    tester,
+  ) async {
     final s = FakeServer();
     final c = s.addClient('nas', isOnline: true);
     final id = c['id']! as String;
     final ssh = s.addTunnel(id, 'ssh', remote: 6000);
-    s.addTunnel(id, 'web', local: 80, remote: 6001, state: 'error', error: 'listen on port 6001 failed');
-    s.addTunnel(id, 'db', local: 5432, remote: 0, state: 'stopped', enabled: false);
+    s.addTunnel(
+      id,
+      'web',
+      local: 80,
+      remote: 6001,
+      state: 'error',
+      error: 'listen on port 6001 failed',
+    );
+    s.addTunnel(
+      id,
+      'db',
+      local: 5432,
+      remote: 0,
+      state: 'stopped',
+      enabled: false,
+    );
     await Harness.create(tester, s);
     await tester.tap(find.byTooltip('隧道'));
     await settle(tester);
@@ -171,7 +217,7 @@ void main() {
     expect(find.textContaining('自动分配'), findsOneWidget);
     expect(find.text('已停用'), findsOneWidget);
 
-    // Filter column.
+    // Filters stay in the workspace header.
     await tapKey(tester, 'filter-error');
     expect(find.text('ssh'), findsNothing);
     expect(find.text('web'), findsOneWidget);
@@ -205,7 +251,9 @@ void main() {
     expect(s.tunnels.any((t) => t['name'] == 'ssh-renamed'), isFalse);
   });
 
-  testWidgets('create a tunnel: validation, server conflicts, success', (tester) async {
+  testWidgets('create a tunnel: validation, server conflicts, success', (
+    tester,
+  ) async {
     final s = FakeServer();
     final c = s.addClient('nas', isOnline: true);
     s.addTunnel(c['id']! as String, 'taken', remote: 6000);
@@ -216,7 +264,14 @@ void main() {
     expect(find.text('新建隧道'), findsWidgets);
 
     // Save is disabled until the form is valid.
-    GestureDetector saveGesture() => tester.widget<GestureDetector>(find.descendant(of: find.byKey(const Key('tunnel-save')), matching: find.byType(GestureDetector)).first);
+    GestureDetector saveGesture() => tester.widget<GestureDetector>(
+      find
+          .descendant(
+            of: find.byKey(const Key('tunnel-save')),
+            matching: find.byType(GestureDetector),
+          )
+          .first,
+    );
     expect(saveGesture().onTap, isNull);
     // Choose the client.
     await tester.tap(find.text('选择客户端'));
@@ -234,7 +289,11 @@ void main() {
     await tester.enterText(find.byKey(const Key('tunnel-remote-port')), '6000');
     await settle(tester);
     await tapKey(tester, 'tunnel-save');
-    expect(find.textContaining('already used'), findsOneWidget, reason: 'the server rejects the conflicting port; the dialog stays open');
+    expect(
+      find.textContaining('already used'),
+      findsOneWidget,
+      reason: 'the server rejects the conflicting port; the dialog stays open',
+    );
     expect(find.text('新建隧道'), findsWidgets);
 
     await tester.enterText(find.byKey(const Key('tunnel-remote-port')), '');
@@ -245,7 +304,9 @@ void main() {
     expect(s.tunnels.last['remote_port'], 0);
   });
 
-  testWidgets('new tunnel is disabled with no clients; a viewer cannot edit', (tester) async {
+  testWidgets('new tunnel is disabled with no clients; a viewer cannot edit', (
+    tester,
+  ) async {
     await Harness.create(tester, FakeServer());
     await tester.tap(find.byTooltip('隧道'));
     await settle(tester);
@@ -265,11 +326,15 @@ void main() {
     expect(find.byTooltip('编辑'), findsNothing);
   });
 
-  testWidgets('tunnel editor from a client page preselects that client', (tester) async {
+  testWidgets('tunnel editor from a client page preselects that client', (
+    tester,
+  ) async {
     final s = FakeServer();
     final c = s.addClient('nas', isOnline: true);
     final h = await Harness.create(tester, s);
-    h.container.read(selectedClientProvider.notifier).select(c['id']! as String);
+    h.container
+        .read(selectedClientProvider.notifier)
+        .select(c['id']! as String);
     await openClients(tester);
     await tapKey(tester, 'client-new-tunnel');
     await tester.enterText(find.byKey(const Key('tunnel-name')), 'rdp');
@@ -281,88 +346,376 @@ void main() {
     expect(find.text('rdp'), findsOneWidget);
   });
 
-  testWidgets('create UDP and HTTP tunnels; domains are required for web types; addresses are shown as URLs', (tester) async {
-    final s = FakeServer();
-    final c = s.addClient('nas', isOnline: true);
-    await Harness.create(tester, s);
-    await tester.tap(find.byTooltip('隧道'));
-    await settle(tester);
+  testWidgets(
+    'create UDP and HTTP tunnels; domains are required for web types; addresses are shown as URLs',
+    (tester) async {
+      final s = FakeServer();
+      final c = s.addClient('nas', isOnline: true);
+      await Harness.create(tester, s);
+      await tester.tap(find.byTooltip('隧道'));
+      await settle(tester);
 
-    // UDP
-    await tapKey(tester, 'new-tunnel');
-    await tester.tap(find.text('选择客户端'));
-    await settle(tester);
-    await tester.tap(find.text('nas').last);
-    await settle(tester);
-    await tester.tap(find.text('TCP'));
-    await settle(tester);
-    await tester.tap(find.text('UDP').last);
-    await settle(tester);
-    await tester.enterText(find.byKey(const Key('tunnel-name')), 'dns');
-    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '53');
-    await tester.enterText(find.byKey(const Key('tunnel-remote-port')), '5353');
-    await settle(tester);
-    await tapKey(tester, 'tunnel-save');
-    await settle(tester, 10);
-    expect(s.tunnels.single['kind'], 'udp');
-    expect(s.tunnels.single['remote_port'], 5353);
-    expect(find.textContaining('frp.example.com:5353'), findsOneWidget);
+      // UDP
+      await tapKey(tester, 'new-tunnel');
+      await tester.tap(find.text('选择客户端'));
+      await settle(tester);
+      await tester.tap(find.text('nas').last);
+      await settle(tester);
+      await tester.tap(find.text('TCP'));
+      await settle(tester);
+      await tester.tap(find.text('UDP').last);
+      await settle(tester);
+      await tester.enterText(find.byKey(const Key('tunnel-name')), 'dns');
+      await tester.enterText(find.byKey(const Key('tunnel-local-port')), '53');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-remote-port')),
+        '5353',
+      );
+      await settle(tester);
+      await tapKey(tester, 'tunnel-save');
+      await settle(tester, 10);
+      expect(s.tunnels.single['kind'], 'udp');
+      expect(s.tunnels.single['remote_port'], 5353);
+      expect(find.textContaining('frp.example.com:5353'), findsOneWidget);
 
-    // HTTP: the domain fields replace the public port; save stays disabled without a domain or subdomain.
-    await tapKey(tester, 'new-tunnel');
-    await tester.tap(find.text('选择客户端'));
-    await settle(tester);
-    await tester.tap(find.text('nas').last);
-    await settle(tester);
-    await tester.tap(find.text('TCP'));
-    await settle(tester);
-    await tester.tap(find.textContaining('HTTP（按域名）').last);
-    await settle(tester);
-    expect(find.byKey(const Key('tunnel-remote-port')), findsNothing);
-    expect(find.byKey(const Key('tunnel-rewrite')), findsOneWidget);
-    await tester.enterText(find.byKey(const Key('tunnel-name')), 'site');
-    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '80');
-    await settle(tester);
-    GestureDetector save() => tester.widget<GestureDetector>(find.descendant(of: find.byKey(const Key('tunnel-save')), matching: find.byType(GestureDetector)).first);
-    expect(save().onTap, isNull);
-    await tester.enterText(find.byKey(const Key('tunnel-domains')), 'WWW.example.com, b.example.com');
-    await tester.enterText(find.byKey(const Key('tunnel-rewrite')), 'internal.lan');
-    await settle(tester);
-    expect(save().onTap, isNotNull);
-    await tapKey(tester, 'tunnel-save');
-    await settle(tester, 10);
-    final web = s.tunnels.last;
-    expect(web['kind'], 'http');
-    expect(web['custom_domains'], ['WWW.example.com', 'b.example.com']);
-    expect(web['host_header_rewrite'], 'internal.lan');
-    expect(find.textContaining('http://WWW.example.com:8080'), findsOneWidget);
-    expect(find.textContaining('(+1)'), findsOneWidget);
+      // HTTP: the domain fields replace the public port; save stays disabled without a domain or subdomain.
+      await tapKey(tester, 'new-tunnel');
+      await tester.tap(find.text('选择客户端'));
+      await settle(tester);
+      await tester.tap(find.text('nas').last);
+      await settle(tester);
+      await tester.tap(find.text('TCP'));
+      await settle(tester);
+      await tester.tap(find.textContaining('HTTP（按域名）').last);
+      await settle(tester);
+      expect(find.byKey(const Key('tunnel-remote-port')), findsNothing);
+      expect(find.byKey(const Key('tunnel-rewrite')), findsOneWidget);
+      await tester.enterText(find.byKey(const Key('tunnel-name')), 'site');
+      await tester.enterText(find.byKey(const Key('tunnel-local-port')), '80');
+      await settle(tester);
+      GestureDetector save() => tester.widget<GestureDetector>(
+        find
+            .descendant(
+              of: find.byKey(const Key('tunnel-save')),
+              matching: find.byType(GestureDetector),
+            )
+            .first,
+      );
+      expect(save().onTap, isNull);
+      await tester.enterText(
+        find.byKey(const Key('tunnel-domains')),
+        'WWW.example.com, b.example.com',
+      );
+      await tester.enterText(
+        find.byKey(const Key('tunnel-rewrite')),
+        'internal.lan',
+      );
+      // HTTP 高级选项：路径前缀必须以 / 开头；请求头每行 Name: value。
+      await tester.enterText(find.byKey(const Key('tunnel-locations')), 'api');
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'location without a leading slash');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-locations')),
+        '/api, /rpc',
+      );
+      await tester.enterText(find.byKey(const Key('tunnel-headers')), 'oops');
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'header line without a colon');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-headers')),
+        'X-Env: prod\n\nX-Team:  core ',
+      );
+      await tester.enterText(
+        find.byKey(const Key('tunnel-http-user')),
+        'alice',
+      );
+      await tester.enterText(
+        find.byKey(const Key('tunnel-http-password')),
+        's3cret',
+      );
+      await tester.enterText(
+        find.byKey(const Key('tunnel-route-user')),
+        'alice',
+      );
+      await tester.ensureVisible(
+        find.byKey(const Key('tunnel-proxy-protocol')),
+      );
+      await tester.tap(find.byKey(const Key('tunnel-proxy-protocol')));
+      await settle(tester);
+      await tester.tap(find.text('v2（二进制）').last);
+      await settle(tester);
+      await settle(tester);
+      await tester.ensureVisible(find.byKey(const Key('tunnel-bandwidth')));
+      await tester.enterText(find.byKey(const Key('tunnel-bandwidth')), 'abc');
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'non-numeric limit is rejected');
+      await tester.enterText(find.byKey(const Key('tunnel-bandwidth')), '512');
+      await tester.tap(find.byKey(const Key('tunnel-bandwidth-mode')));
+      await settle(tester);
+      await tester.tap(find.text('在服务端限速').last);
+      await settle(tester);
+      expect(save().onTap, isNotNull);
+      await tapKey(tester, 'tunnel-save');
+      await settle(tester, 10);
+      final web = s.tunnels.last;
+      expect(web['locations'], ['/api', '/rpc']);
+      expect(web['request_headers'], {'X-Env': 'prod', 'X-Team': 'core'});
+      expect(web['http_user'], 'alice');
+      expect(web['route_by_http_user'], 'alice');
+      expect(web['http_password_set'], true);
+      expect(web['proxy_protocol'], 2);
+      expect(web['bandwidth_bps'], 512 * 1024);
+      expect(web['bandwidth_server'], true);
+      expect(s.httpPasswords[web['id']], 's3cret');
+      expect(web['kind'], 'http');
+      expect(web['custom_domains'], ['WWW.example.com', 'b.example.com']);
+      expect(web['host_header_rewrite'], 'internal.lan');
+      expect(
+        find.textContaining('http://WWW.example.com:8080'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('(+1)'), findsOneWidget);
 
-    // Editing keeps the type fixed and updates domains.
-    await tester.tap(find.byTooltip('编辑').last);
-    await settle(tester);
-    expect(find.text('HTTP'), findsWidgets);
-    await tester.enterText(find.byKey(const Key('tunnel-domains')), '');
-    await tester.enterText(find.byKey(const Key('tunnel-subdomain')), 'blog');
-    await settle(tester);
-    await tapKey(tester, 'tunnel-save');
-    await settle(tester, 10);
-    expect(s.tunnels.last['subdomain'], 'blog');
-    expect(find.textContaining('http://blog.t.example.com:8080'), findsOneWidget);
-    expect(c['id'], isNotNull);
-  });
+      // Editing keeps the type fixed and updates domains.
+      await tester.tap(find.byTooltip('编辑').last);
+      await settle(tester);
+      expect(find.text('HTTP'), findsWidgets);
+      await tester.enterText(find.byKey(const Key('tunnel-domains')), '');
+      await tester.enterText(find.byKey(const Key('tunnel-subdomain')), 'blog');
+      await settle(tester);
+      // 密码留空 = 保持原样（请求里不带 http_password）。
+      expect(find.text('已设置，留空保持不变'), findsOneWidget);
+      await tapKey(tester, 'tunnel-save');
+      await settle(tester, 10);
+      expect(s.tunnels.last['subdomain'], 'blog');
+      expect(s.httpPasswords[web['id']], 's3cret');
+      expect(s.tunnels.last['locations'], ['/api', '/rpc']);
+
+      // 再次编辑：换新密码；然后选择清除密码。
+      await tester.tap(find.byTooltip('编辑').last);
+      await settle(tester);
+      await tester.enterText(
+        find.byKey(const Key('tunnel-http-password')),
+        'rotated',
+      );
+      await settle(tester);
+      await tapKey(tester, 'tunnel-save');
+      await settle(tester, 10);
+      expect(s.httpPasswords[web['id']], 'rotated');
+      await tester.tap(find.byTooltip('编辑').last);
+      await settle(tester);
+      await tester.ensureVisible(
+        find.byKey(const Key('tunnel-clear-password')),
+      );
+      await tapKey(tester, 'tunnel-clear-password');
+      await tapKey(tester, 'tunnel-save');
+      await settle(tester, 10);
+      expect(s.httpPasswords.containsKey(web['id']), isFalse);
+      expect(s.tunnels.last['http_password_set'], false);
+      expect(
+        find.textContaining('http://blog.t.example.com:8080'),
+        findsOneWidget,
+      );
+      expect(c['id'], isNotNull);
+    },
+  );
 
   test('publicAddress covers every kind', () {
-    const node = NodeInfo(publicHost: 'h.com', vhostHttpPort: 80, vhostHttpsPort: 8443, subdomainHost: 't.com');
+    const node = NodeInfo(
+      publicHost: 'h.com',
+      vhostHttpPort: 80,
+      vhostHttpsPort: 8443,
+      subdomainHost: 't.com',
+    );
     Tunnel t(Map<String, Object?> j) => Tunnel.fromJson({'id': 'x', ...j});
-    expect(publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), node), 'h.com:6000');
-    expect(publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), null), ':6000');
+    expect(
+      publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), node),
+      'h.com:6000',
+    );
+    expect(
+      publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), null),
+      ':6000',
+    );
     expect(publicAddress(t({'kind': 'udp'}), node), '自动分配');
-    expect(publicAddress(t({'kind': 'http', 'custom_domains': ['a.com']}), node), 'http://a.com');
-    expect(publicAddress(t({'kind': 'https', 'custom_domains': ['a.com']}), node), 'https://a.com:8443');
-    expect(publicAddress(t({'kind': 'http', 'subdomain': 'x'}), node), 'http://x.t.com');
-    expect(publicAddress(t({'kind': 'http', 'subdomain': 'x'}), const NodeInfo()), '未配置域名');
-    expect(publicAddress(t({'kind': 'http', 'custom_domains': ['a.com']}), null), 'http://a.com');
-    expect(publicAddress(t({'kind': 'https', 'custom_domains': ['a.com']}), const NodeInfo(vhostHttpsPort: 443)), 'https://a.com');
+    expect(
+      publicAddress(
+        t({
+          'kind': 'http',
+          'custom_domains': ['a.com'],
+        }),
+        node,
+      ),
+      'http://a.com',
+    );
+    expect(
+      publicAddress(
+        t({
+          'kind': 'https',
+          'custom_domains': ['a.com'],
+        }),
+        node,
+      ),
+      'https://a.com:8443',
+    );
+    expect(
+      publicAddress(t({'kind': 'http', 'subdomain': 'x'}), node),
+      'http://x.t.com',
+    );
+    expect(
+      publicAddress(t({'kind': 'http', 'subdomain': 'x'}), const NodeInfo()),
+      '未配置域名',
+    );
+    expect(
+      publicAddress(
+        t({
+          'kind': 'http',
+          'custom_domains': ['a.com'],
+        }),
+        null,
+      ),
+      'http://a.com',
+    );
+    expect(
+      publicAddress(
+        t({
+          'kind': 'https',
+          'custom_domains': ['a.com'],
+        }),
+        const NodeInfo(vhostHttpsPort: 443),
+      ),
+      'https://a.com',
+    );
+  });
+  testWidgets('batch selected tunnels enable disable and failure recovery', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final client = s.addClient('batch-device');
+    final a = s.addTunnel(client['id']! as String, 'batch-a');
+    final b = s.addTunnel(client['id']! as String, 'batch-b');
+    await Harness.create(tester, s, size: const Size(1200, 1000));
+    await tester.tap(find.byTooltip('隧道'));
+    await settle(tester);
+    await tapKey(tester, 'select-tunnel-${a['id']}');
+    await tapKey(tester, 'select-tunnel-${b['id']}');
+    expect(find.text('已选 2 条'), findsOneWidget);
+    await tapKey(tester, 'batch-disable');
+    expect(a['enabled'], false);
+    expect(b['enabled'], false);
+    final request = s.requests.lastWhere(
+      (r) => r.url.path.endsWith('/tunnels/batch'),
+    );
+    expect(request.body, contains('批量停用'));
+    expect(find.text('已选 2 条'), findsNothing);
+    await tapKey(tester, 'select-tunnel-${a['id']}');
+    await tapKey(tester, 'batch-enable');
+    expect(a['enabled'], true);
+    await tapKey(tester, 'select-tunnel-${a['id']}');
+    await tapKey(tester, 'select-tunnel-${a['id']}');
+    expect(find.text('已选 1 条'), findsNothing);
+    await tapKey(tester, 'select-tunnel-${b['id']}');
+    await tapText(tester, '清除选择');
+    expect(find.text('已选 1 条'), findsNothing);
+    await tapKey(tester, 'select-tunnel-${a['id']}');
+    s.failNext = true;
+    await tapKey(tester, 'batch-disable');
+    expect(find.text('internal error'), findsOneWidget);
+    expect(a['enabled'], true);
+    expect(find.text('已选 1 条'), findsOneWidget);
+    await tapKey(tester, 'batch-disable');
+    expect(a['enabled'], false);
+    expect(tester.takeException(), isNull);
+  });
+  testWidgets('service templates fill editable defaults', (tester) async {
+    final s = FakeServer();
+    s.addClient('template-device');
+    await Harness.create(tester, s, size: const Size(1200, 1100));
+    await tester.tap(find.byTooltip('隧道'));
+    await settle(tester);
+    await tapKey(tester, 'new-tunnel');
+    for (final entry in [
+      ('SSH', 'SSH', '22'),
+      ('远程桌面 RDP', 'RDP', '3389'),
+      ('Web', 'Web', '80'),
+      ('MySQL', 'MySQL', '3306'),
+      ('PostgreSQL', 'PostgreSQL', '5432'),
+    ]) {
+      await tapKey(tester, 'tunnel-template');
+      await tapText(
+        tester,
+        entry.$1,
+        index: find.text(entry.$1).evaluate().length - 1,
+      );
+      expect(
+        tester
+            .widget<LTextField>(find.byKey(const Key('tunnel-name')))
+            .controller!
+            .text,
+        entry.$2,
+      );
+      expect(
+        tester
+            .widget<LTextField>(find.byKey(const Key('tunnel-local-port')))
+            .controller!
+            .text,
+        entry.$3,
+      );
+    }
+    await tapKey(tester, 'tunnel-template');
+    await tapText(tester, '自定义');
+    expect(
+      tester
+          .widget<LTextField>(find.byKey(const Key('tunnel-name')))
+          .controller!
+          .text,
+      'PostgreSQL',
+    );
+    await tester.enterText(find.byKey(const Key('tunnel-name')), 'my-service');
+    expect(
+      tester
+          .widget<LTextField>(find.byKey(const Key('tunnel-name')))
+          .controller!
+          .text,
+      'my-service',
+    );
+  });
+}
+
+void clientTagAndRestartTests() {
+  testWidgets('tags can be edited and an online agent can be restarted', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final a = s.addClient('nas', isOnline: true);
+    final b = s.addClient('offline-box');
+    await Harness.create(tester, s);
+    await openClients(tester);
+    await tester.tap(find.byKey(Key('client-row-${a['id']}')));
+    await settle(tester);
+
+    await tapKey(tester, 'client-tags');
+    await tester.enterText(
+      find.byKey(const Key('tags-field')),
+      'prod, nas，  ,web',
+    );
+    await tapKey(tester, 'tags-save');
+    await settle(tester, 10);
+    expect(a['tags'], ['prod', 'nas', 'web']);
+    expect(find.text('prod'), findsWidgets);
+
+    await tester.tap(find.byTooltip('重启 agent'));
+    await settle(tester);
+    await fillReason(tester, '升级后重启');
+    await tester.tap(find.widgetWithText(LButton, '重启').last);
+    await settle(tester, 10);
+    expect(s.restarts, [a['id']]);
+    expect(find.text('已发送重启指令'), findsOneWidget);
+
+    // 离线设备没有「重启」入口；列表副标题带标签。
+    await tapKey(tester, 'client-back');
+    expect(find.textContaining('prod / nas / web'), findsOneWidget);
+    await tester.tap(find.byKey(Key('client-row-${b['id']}')));
+    await settle(tester);
+    expect(find.byTooltip('重启 agent'), findsNothing);
   });
 }

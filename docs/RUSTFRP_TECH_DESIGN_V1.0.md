@@ -108,7 +108,7 @@ flowchart LR
 
 ### 2.1 总则：照抄 linkory，只换主色
 
-UI 完整沿用 linkory（其本身移植自 cc-switch v7 设计系统）：**token 化 + 共享控件 + 三栏布局 + 深浅色**。唯一的视觉变更是 **action 主色由橙色改为草绿色**；字号、圆角、间距、控件尺寸、语义色、阴影全部不变。
+UI 的颜色、字号、圆角、控件与深浅色沿用 linkory（其本身移植自 cc-switch v7 设计系统），action 主色为草绿。**按用户 2026-10-11 提供的 CC Switch 截图，布局改为可折叠菜单 + 内容区的两栏结构。** 菜单尺寸与间距按该参考调整，其余 token 保持不变。
 
 沿用的规则（原文见 linkory `docs/UI_SPEC.md`，本项目新建同名文档 `docs/UI_SPEC.md` 随代码维护）：
 
@@ -142,32 +142,35 @@ UI 完整沿用 linkory（其本身移植自 cc-switch v7 设计系统）：**to
 
 其余 token（`bgApp / bgSidebar / bgSubtle / bgSelected / bgCard / border / borderStrong / text1-3 / controlOff / direct / success / warning / danger / overlay / shadow*`）、字体回退链、`Type.*`（11/12/13/14/15/16/18/24）、`Radii`（6 / 10 / 14）全部原样复制。
 
-### 2.3 布局：三栏（与 linkory 相同）
+### 2.3 布局：两栏（按用户提供的 CC Switch 截图）
 
 ```
-┌──────┬────────────┬───────────────────────────────┐
-│ 72px │   280px    │          自适应               │
-│ 图标 │  列表栏    │  页头 52px                    │
-│ 栏   │ (节点/客户 │  ─────────────────────────    │
-│      │  端/隧道…) │  内容区                       │
-└──────┴────────────┴───────────────────────────────┘
+┌──────────────────────┬────────────────────────────────────┐
+│ 可折叠菜单            │ 自适应内容工作区                     │
+│ 展开 200px            │ PageHeader 52px                     │
+│ 收起 72px             │ 列表 / 详情 / 筛选 / 设置分类         │
+└──────────────────────┴────────────────────────────────────┘
 ```
 
-- **图标栏**：顶部 Logo（草绿底白色图形，固定品牌色；macOS 留 44px 红绿灯，Win/Linux 留 22px）；导航按钮 48×32；底部为连接状态点与设置；有可用更新时设置上方出现 `circleArrowUp`。
-- **列表栏**：随导航切换内容；行用 `HoverRow`；头像 `DeviceGlyph` 圆角 10，右下角在线点。
-- **内容区**：`PageHeader`（52px，右侧 actions，Win/Linux 末尾自绘窗口按钮）。
-- **窄屏（< 720）**：单栏 + 底部导航 + `DetailPage` 压栈，token 与控件不变。
+- 菜单顶部为品牌与展开/收起按钮；主功能在上部，连接状态与设置在下部。
+- 菜单行高 28px、文字 `Type.body`（13px）、图标 18px、图标与文字间距 8px。菜单文字统一常规字重，选中态只改背景与颜色。收起后保留图标与 tooltip。
+- 菜单折叠状态记入用户偏好，页面切换和应用重开后保持。
+- 不再有固定 280px 中间列表栏。客户端在工作区内从列表进入详情，详情有返回列表按钮；节点直接展示当前内置节点。
+- 隧道状态筛选在内容区顶部，设置分类采用内容区顶部横向导航。
+- 内容继续使用 `PageHeader`、共享控件与原有 token；颜色、字体大小与圆角不变。
+- 窄屏（<720）保留单栏、底部导航和详情压栈。
 
-### 2.4 导航与页面（本项目的信息架构）
+### 2.4 导航与页面
 
-| 图标栏 | 列表栏 | 内容区 | 备注 |
-|---|---|---|---|
-| 概览 `layoutDashboard` | 无（或快捷筛选） | 指标卡 + 趋势 + 最近事件 | 管理员模式；本机模式显示本机 agent 概览 |
-| 节点 `server` | 节点列表（名称 / 在线点 / 公网地址 / 隧道数） | 节点详情：状态、版本、端口范围、资源、隧道、日志 | 管理员 |
-| 客户端 `monitor` | 客户端列表（名称 / 在线点 / 系统） | 客户端详情：设备信息、隧道、日志、操作 | 管理员；含「接入新客户端」 |
-| 隧道 `waypoints` | 筛选分组（全部 / 运行中 / 异常 / 按类型） | 隧道表格或卡片 + 编辑抽屉 | 本机模式也有 |
-| 审计 `scrollText` | 筛选（操作者 / 动作 / 对象） | 审计表 | Owner / Admin |
-| 设置 `settings` | 设置分组（账号 / 通用 / 管理员 / 令牌 / 更新 / 关于） | 对应设置页 | — |
+| 菜单 | 工作区 | 备注 |
+|---|---|---|
+| 概览 | 指标卡、节点信息、最近客户端 | 无中间列表 |
+| 节点 | 当前内置节点详情 | 窄屏保留节点列表入口 |
+| 客户端 | 全宽列表 → 全宽设备详情 | 详情可返回列表，接入向导与管理操作保留 |
+| 隧道 | 顶部筛选 + 隧道卡片 | TCP / UDP / HTTP / HTTPS 行为不变 |
+| 审计 | 审计记录 | 按角色隐藏 |
+| 设置 | 顶部分类 + 对应设置页 | 分类按角色隐藏 |
+| 本机模式（桌面） | 本机连接、状态与启停 | 与控制台共用两栏菜单组件 |
 
 **接入向导**（M-05，页头「接入新客户端」触发 `LDialog`）：① 选平台（macOS / Linux / Windows，自动按当前浏览器 OS 预选）→ ② 命名、选节点、可选标签 → ③ 展示一次性接入命令（带复制按钮）与下载链接 → ④ 实时等待上线（订阅 WS 事件，成功后自动跳转到该客户端详情）。令牌默认 1 小时有效，用后即焚。
 
@@ -192,7 +195,7 @@ UI 完整沿用 linkory（其本身移植自 cc-switch v7 设计系统）：**to
 
 ### 2.6 品牌
 
-Logo 沿用 linkory 的结构（28×28 圆角方块 + 白色图形，固定品牌色），图形换成新标志（待设计，工作名 RustFRP），底色为 `#65A30D`。品牌资源放 `assets/brand/`（SVG 母版 + 多尺寸 PNG + 单色版），由 `tools/gen_icons.py` 生成各平台图标（沿用 linkory 做法）。
+Logo 沿用 linkory 的结构（28×28 圆角方块 + 白色图形，固定品牌色），图形为一笔贯通的倾斜双环，两个闭合环表示内外网，中心连接表示隧道互通；底色为以 `#65A30D` 为主色的草绿渐变。品牌资源放 `assets/brand/`（SVG 母版 + 多尺寸 PNG + 单色版），由 `tools/gen_icons.py` 生成各平台图标（沿用 linkory 做法）。
 
 ---
 
@@ -256,10 +259,13 @@ flowchart TB
 | **本机模式** | 用接入令牌接入、或选择「仅管理本机」 | 本机 agent 的回环管理接口 + Controller（经 agent 代理） | 概览 / 隧道 / 日志 / 设置 |
 | **控制台模式** | 用管理员账号登录 Controller | Controller REST + WS | 概览 / 节点 / 客户端 / 隧道 / 审计 / 设置（与 Web 一致） |
 
-本机 agent 作为系统服务常驻，**App 退出不影响隧道**。App 通过 `core/local_agent/` 与其通信：
+本机受管 agent 独立后台运行，**关闭界面不停止隧道**。桌面通过仅当前用户可读的发现文件重新连接它：
 
-- 接口：agent 在 `127.0.0.1:<随机端口>` 提供管理 HTTP；端口与一次性本地令牌写入仅当前用户可读的文件（`0600` / Windows ACL）。三系统统一，避免 Dart 不原生支持 Named Pipe 的问题。
-- 服务安装：App 首次启动调用 `rustfrp-agent service install`（macOS `launchd`、Linux `systemd --user`/system、Windows Service），需要提权时由 App 弹系统授权。
+- 仅监听 `127.0.0.1:<随机端口>`，采用有界、带本地令牌的 JSON 控制请求（非 HTTP，浏览器不能直接调用）。协议与共享 fixture 见 `rustfrp-protocol/LOCAL_CONTROL.md`。
+- macOS 首次用令牌接入并保存身份，然后交给 `launchd bootstrap gui/<uid>`；服务定义放在用户状态目录，**不含接入令牌**。Linux / Windows 使用独立后台进程，尚需实机验收。
+- 关闭窗口只关闭界面，重开恢复原进程的状态；仅显式「停止」发出带本地令牌的停止请求，不通过 PID 强杀。
+- 当前实现为受管本机连接、状态与启停。系统开机启动、托盘、本地 frp 配置编辑、日志页、应用更新和安装包仍待后续阶段完成；目前不向系统登录启动目录写入服务定义。
+- 设计增量内存：仅在显式 `--local-control` 时分配监听器、几个状态标量和约 2 KiB 请求缓冲；请求串行处理，读写 2 秒超时，无额外 per-connection 线程或无界容器。
 
 ### 3.4 Flutter 平台差异隔离
 
@@ -618,11 +624,18 @@ sequenceDiagram
 
 Edge 与 Client 持久化「最后一份已确认快照」（`state_dir/last_snapshot.json`，原子写）。启动时若连不上 Controller，用缓存配置先跑起来，后台持续重连。设备认证用 Edge 本地缓存的公钥列表，因此无需 Controller 在线。
 
+**实现补充（节点协议，`rustfrp-core::node`）**：外置 Edge 经 Controller 的节点端口接入——一条 TLS 连接，帧同 `wire`（4 字节长度 + JSON，≤ 64 KiB）。
+Controller 先发 `Challenge{nonce}`，节点用身份密钥签名应答 `Hello`，首次接入则带一次性令牌（`kind=node`）。随后 Controller 逐条下发设备
+（`SnapshotBegin → Device* → SnapshotEnd`，之后是 `Device/Remove/Kick` 增量），节点回报 `Online/Offline/Proxy/Resync/Traffic`，
+并把设备的首次接入请求（`Enroll`）转交 Controller。节点设备名册持久化到状态目录，登录只查本地名册，所以 Controller 不在线时数据面与设备重连都不受影响。
+
 ### 6.4 HTTP / HTTPS 路由
 
 - `http`：Edge 读取请求头直到 Host（流式、最多 16 KiB 头部缓冲，池化），按 `域名 + 路径最长前缀` 匹配隧道；Basic Auth、Host 改写、自定义头在转发前对**头部**处理，Body 不缓冲。
 - `https`：只解析 TLS ClientHello 的 SNI，**不解密**，按 SNI 选隧道后原样转发。
 - 同端口复用：80/443 可与其它 TCP 隧道分流（P1）。
+
+**实现补充（http 逐请求路由）**：`rustfrp-core::http1` 用 `httparse` 严格解析请求头（拒绝 Content-Length 与 Transfer-Encoding 并存、冲突的 Content-Length、重复 Host、非 chunked 结尾的 TE、CONNECT），`ChunkedScanner` 只数边界不缓冲正文，因此**保持连接上的每个请求都独立选路与鉴权**：同域名下按「最长路径前缀 → 与请求 Basic 用户名一致的 `routeByHTTPUser` → 未限定用户」选路（同 frp），Basic Auth 在 Edge 校验（定时无关比较），`requestHeaders.set` / Host 改写只作用于头部。一个访问者连接最多同时连 8 条后端流（不同路由各一条）；切换后端前，`ResponseTracker` 观察上一条后端的响应并等它完整送完，保证流水线请求的响应顺序；无法判定边界（协议升级、畸形响应）时关闭连接而不是冒险乱序。`Upgrade`（WebSocket）在头之后转为原样透传。尚未实现 `responseHeaders` 与 PROXY protocol。
 
 ---
 
@@ -674,7 +687,7 @@ Edge 与 Client 持久化「最后一份已确认快照」（`state_dir/last_sna
 
 ## 10. 待确认事项
 
-1. ~~名称/域名~~ 已定：RustFRP，`rustfrp.com`。**Logo 待设计**。
+1. ~~名称/域名~~ 已定：RustFRP，`rustfrp.com`。**Logo 已完成**：一笔贯通的倾斜双环，见 `assets/brand/README.md`。
 2. **草绿色具体色值**：按 §2.2 的 lime 系先落地，设计评审后可微调（只改 5 个 token）。
 3. **success 是否同步调整**：当前保持 linkory 原值，以不违背「其他部分保持不变」；若实机觉得与主色太近再议。
 4. **Edge 与 Controller 同端口分流**是否接受（省端口，但实现复杂度稍高）；备选：独立端口。
@@ -682,3 +695,28 @@ Edge 与 Client 持久化「最后一份已确认快照」（`state_dir/last_sna
 6. ~~官网英文版、托管位置~~ 已定：仅中文，自有服务器。
 7. ~~macOS 签名账号~~ 已有开发者账号；开发完成后由我指导配置证书、签名、公证与 CI 密钥。
 8. 是否需要 V1.1 的「frp 线协议兼容模式」用于灰度迁移（§0.2.5）。
+
+
+## 当前实现补充：受管安装入口
+
+Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用 Flutter 静态目录。
+接入命令的 POSIX 参数使用单引号转义，Windows 返回可直接粘贴到 PowerShell 的表达式，保留设备名中的引号、中文及特殊字符。
+脚本按系统/架构选择 `/downloads/` 下的原始 agent，通过 HTTPS 下载并校验对应 SHA256 文件，失败保留旧 agent。
+下载目录由外部静态服务器托管，避免管理 API 整包读取发布二进制。
+当前仅提供用户级安装与前台接入，尚未注册托盘、开机启动或系统服务；发布签名验证、平台发布产物与官网仍待开发。
+目录约定、验证命令与增量内存评估见 [installer/README.md](../installer/README.md)。
+
+
+### 本轮验收记录
+
+宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；颜色与字号 token 无变更。
+Flutter 89 项测试、覆盖率门槛、Web 同源构建、macOS release 构建与真实字体截图通过。
+macOS 隔离实例实测：首次接入错误提示、有效接入、停止、复用身份启动、菜单收起、重开保留折叠与原 PID、窗口完全退出后真实 TCP 隧道继续回显；最后通过本地控制接口停止并清理临时 launchd 任务。
+Rust 全仓测试、fmt / clippy、覆盖率与全链路冒烟通过。正常数据面的内存基准空载约 4.31 MB，100 连接约 6.12–6.23 MB；本机控制开启、承载单条 TCP 隧道的 agent RSS 实测约 4.34 MB。
+
+菜单顶部品牌区：logo 22px、名称使用常规 13px；桌面顶部留 44px，Web 留 24px。收起时整行隐藏品牌图形与名称，只显示水平居中的展开按钮。
+
+
+## 运维增量：在线备份与有界清理
+
+2026-10-11 完成 `rustfrp-server backup <new-file>`、只读源库快照、私有权限/不覆盖/原子发布、schema v3 到期索引及逐表有界清理；删除与系统审计同事务，审计失败回滚。配置与恢复流程见 [BACKUP_AND_RETENTION.md](BACKUP_AND_RETENTION.md)，全项目差距和下一阶段见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。流量桶保留仍未实现，不将 SV-11 全部标记完成。

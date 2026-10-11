@@ -74,7 +74,7 @@ fn resolve_token(
 }
 
 /// 该代理里配置了、但当前版本尚未实现的选项（不会静默忽略：调用方会把它们打印出来）。
-fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static str> {
+pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static str> {
     let mut v = Vec::new();
     let mut flag = |on: bool, name: &'static str| {
         if on {
@@ -83,24 +83,28 @@ fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static str> {
     };
     flag(p.transport.use_encryption, "transport.useEncryption");
     flag(p.transport.use_compression, "transport.useCompression");
+    // frp 本身不支持 udp 限速；tcp / http / https 由 Limiter 实现。
     flag(
-        !p.transport.bandwidth_limit.is_empty(),
-        "transport.bandwidthLimit",
+        p.kind == "udp" && !p.transport.bandwidth_limit.is_empty(),
+        "transport.bandwidthLimit (udp)",
     );
+    // udp 上 frp 本身不支持 PROXY protocol。
     flag(
-        !p.transport.proxy_protocol_version.is_empty(),
-        "transport.proxyProtocolVersion",
+        p.kind == "udp" && !p.transport.proxy_protocol_version.is_empty(),
+        "transport.proxyProtocolVersion (udp)",
     );
     flag(!p.health_check.kind.is_empty(), "healthCheck");
     flag(!p.load_balancer.group.is_empty(), "loadBalancer");
-    flag(!p.locations.is_empty(), "locations");
+    // http 代理已支持这些选项；其他类型上配置它们没有意义，按「未支持」提示。
+    let other = p.kind != "http";
+    flag(other && !p.locations.is_empty(), "locations");
     flag(
-        !p.http_user.is_empty() || !p.http_password.is_empty(),
+        other && (!p.http_user.is_empty() || !p.http_password.is_empty()),
         "httpUser / httpPassword",
     );
-    flag(!p.request_headers.set.is_empty(), "requestHeaders");
+    flag(other && !p.request_headers.set.is_empty(), "requestHeaders");
     flag(!p.response_headers.set.is_empty(), "responseHeaders");
-    flag(!p.route_by_http_user.is_empty(), "routeByHTTPUser");
+    flag(other && !p.route_by_http_user.is_empty(), "routeByHTTPUser");
     v
 }
 
@@ -141,6 +145,29 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
             host_header_rewrite: p.host_header_rewrite.clone(),
+            bandwidth_bps: if p.kind == "udp" {
+                0
+            } else {
+                u64::try_from(p.transport.bandwidth_limit.bytes()).unwrap_or(0)
+            },
+            bandwidth_server: p.transport.bandwidth_limit_mode == "server",
+            proxy_protocol: if p.kind == "udp" {
+                0
+            } else {
+                rustfrp_core::proxyproto::parse_version(&p.transport.proxy_protocol_version)
+                    .map_err(|e| format!("proxy [{}]: {e}", p.name))?
+            },
+            http: if p.kind == "http" {
+                rustfrp_core::wire::HttpOpts {
+                    locations: p.locations.clone(),
+                    http_user: p.http_user.clone(),
+                    http_password: p.http_password.clone(),
+                    route_by_http_user: p.route_by_http_user.clone(),
+                    request_headers: p.request_headers.set.clone(),
+                }
+            } else {
+                Default::default()
+            },
         });
         for opt in ignored_options(p) {
             notes.push(format!(
@@ -286,6 +313,47 @@ mod tests {
     }
 
     #[test]
+    fn proxy_protocol_versions_map_and_bad_values_are_rejected() {
+        let fs = MemFs::new();
+        let base = |extra: &str| {
+            format!("serverAddr='x'\n[[proxies]]\nname='a'\ntype='tcp'\nlocalPort=1\n{extra}\n[[proxies]]\nname='u'\ntype='udp'\nlocalPort=2\nremotePort=3\n")
+        };
+        let versions = |src: &str| {
+            client(src, &fs)
+                .unwrap()
+                .cfg
+                .proxies
+                .iter()
+                .map(|p| p.proxy_protocol)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&base("")), vec![0, 0]);
+        assert_eq!(
+            versions(&base("transport.proxyProtocolVersion='v1'")),
+            vec![1, 0]
+        );
+        assert_eq!(
+            versions(&base("transport.proxyProtocolVersion='v2'")),
+            vec![2, 0]
+        );
+        let err = client(&base("transport.proxyProtocolVersion='v9'"), &fs)
+            .err()
+            .unwrap();
+        assert!(err.contains("proxy [a]") && err.contains("v9"), "{err}");
+        // udp 上配置了：frp 本身不支持，给出提示而不是静默忽略。
+        let src = "serverAddr='x'\n[[proxies]]\nname='u'\ntype='udp'\nlocalPort=2\nremotePort=3\ntransport.proxyProtocolVersion='v1'\n";
+        let plan = client(src, &fs).unwrap();
+        assert_eq!(plan.cfg.proxies[0].proxy_protocol, 0);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("proxyProtocolVersion (udp)")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
     fn client_basic_mapping() {
         let src = r#"
 serverAddr = "10.0.0.1"
@@ -307,7 +375,7 @@ type = "http"
 localPort = 80
 customDomains = ["a.com"]
 hostHeaderRewrite = "internal.lan"
-transport.bandwidthLimit = "1MB"
+transport.useEncryption = true
 [[proxies]]
 name = "dns"
 type = "udp"
@@ -355,7 +423,7 @@ bindPort = 1
             ("./frpc.log", "debug")
         );
         assert_eq!(p.notes.len(), 4);
-        assert!(p.notes[0].contains("transport.bandwidthLimit"));
+        assert!(p.notes[0].contains("transport.useEncryption"));
         assert!(p.notes[1].contains("type \"sudp\""));
         assert!(p.notes[2].contains("plugins"));
         assert!(p.notes[3].contains("visitor [v]"));

@@ -33,17 +33,25 @@ class Harness {
 
     final tick = StreamController<int>.broadcast();
     addTearDown(tick.close);
-    final container = ProviderContainer(retry: (_, _) => null, overrides: [
-      prefsProvider.overrideWithValue(p),
-      apiFactoryProvider.overrideWithValue((base) => server.api(base)),
-      sameOriginProvider.overrideWithValue(sameOrigin),
-      tickProvider.overrideWith((ref) => tick.stream),
-    ]);
+    final container = ProviderContainer(
+      retry: (_, _) => null,
+      overrides: [
+        prefsProvider.overrideWithValue(p),
+        apiFactoryProvider.overrideWithValue((base) => server.api(base)),
+        sameOriginProvider.overrideWithValue(sameOrigin),
+        tickProvider.overrideWith((ref) => tick.stream),
+      ],
+    );
     addTearDown(container.dispose);
     server.loggedIn = login;
     // A previous app in the same test must be torn down completely (widget states would otherwise be reused).
     await tester.pumpWidget(const SizedBox());
-    await tester.pumpWidget(UncontrolledProviderScope(container: container, child: const RustFrpApp()));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const RustFrpApp(),
+      ),
+    );
     await settle(tester);
     return Harness._(server, container, tick);
   }

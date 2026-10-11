@@ -82,13 +82,19 @@ class RustFrpColors extends ThemeExtension<RustFrpColors> {
     dangerText: Color(0xFFB91C1C),
     dangerSoft: Color(0xFFFEE2E2),
     overlay: Color(0x5C09090B),
-    shadowSm: [BoxShadow(color: Color(0x0F101828), blurRadius: 2, offset: Offset(0, 1))],
+    shadowSm: [
+      BoxShadow(color: Color(0x0F101828), blurRadius: 2, offset: Offset(0, 1)),
+    ],
     shadowMd: [
       BoxShadow(color: Color(0x14101828), blurRadius: 12, offset: Offset(0, 4)),
       BoxShadow(color: Color(0x0F101828), blurRadius: 3, offset: Offset(0, 1)),
     ],
     shadowLg: [
-      BoxShadow(color: Color(0x29101828), blurRadius: 40, offset: Offset(0, 20)),
+      BoxShadow(
+        color: Color(0x29101828),
+        blurRadius: 40,
+        offset: Offset(0, 20),
+      ),
       BoxShadow(color: Color(0x14101828), blurRadius: 12, offset: Offset(0, 4)),
     ],
   );
@@ -123,13 +129,19 @@ class RustFrpColors extends ThemeExtension<RustFrpColors> {
     dangerText: Color(0xFFFCA5A5),
     dangerSoft: Color(0xFF3A1414),
     overlay: Color(0x8C000000),
-    shadowSm: [BoxShadow(color: Color(0x66000000), blurRadius: 2, offset: Offset(0, 1))],
+    shadowSm: [
+      BoxShadow(color: Color(0x66000000), blurRadius: 2, offset: Offset(0, 1)),
+    ],
     shadowMd: [
       BoxShadow(color: Color(0x73000000), blurRadius: 12, offset: Offset(0, 4)),
       BoxShadow(color: Color(0x66000000), blurRadius: 3, offset: Offset(0, 1)),
     ],
     shadowLg: [
-      BoxShadow(color: Color(0x80000000), blurRadius: 40, offset: Offset(0, 20)),
+      BoxShadow(
+        color: Color(0x80000000),
+        blurRadius: 40,
+        offset: Offset(0, 20),
+      ),
       BoxShadow(color: Color(0x66000000), blurRadius: 12, offset: Offset(0, 4)),
     ],
   );
@@ -138,7 +150,8 @@ class RustFrpColors extends ThemeExtension<RustFrpColors> {
   RustFrpColors copyWith() => this;
 
   @override
-  RustFrpColors lerp(ThemeExtension<RustFrpColors>? other, double t) => t < 0.5 ? this : (other as RustFrpColors? ?? this);
+  RustFrpColors lerp(ThemeExtension<RustFrpColors>? other, double t) =>
+      t < 0.5 ? this : (other as RustFrpColors? ?? this);
 }
 
 /// Radii (tailwind: control 6, panel 10, dialog 14).
@@ -169,8 +182,12 @@ class Type {
     ...fontFamilyFallback, // CJK glyphs, including the bundled Web font.
   ];
 
-  static TextStyle _s(double size, double lh, FontWeight w) =>
-      TextStyle(fontSize: size, height: lh / size, fontWeight: w, fontFamilyFallback: fontFamilyFallback);
+  static TextStyle _s(double size, double lh, FontWeight w) => TextStyle(
+    fontSize: size,
+    height: lh / size,
+    fontWeight: w,
+    fontFamilyFallback: fontFamilyFallback,
+  );
 
   static final badge = _s(11, 16, FontWeight.w500);
   static final caption = _s(12, 18, FontWeight.w400);
@@ -197,14 +214,15 @@ ThemeData buildTheme(Brightness b) {
     splashFactory: NoSplash.splashFactory,
     highlightColor: Colors.transparent,
     hoverColor: Colors.transparent,
-    colorScheme: ColorScheme.fromSeed(seedColor: c.action, brightness: b).copyWith(
-      primary: c.action,
-      onPrimary: c.actionFg,
-      surface: c.bgApp,
-      onSurface: c.text1,
-      outline: c.border,
-      error: c.danger,
-    ),
+    colorScheme: ColorScheme.fromSeed(seedColor: c.action, brightness: b)
+        .copyWith(
+          primary: c.action,
+          onPrimary: c.actionFg,
+          surface: c.bgApp,
+          onSurface: c.text1,
+          outline: c.border,
+          error: c.danger,
+        ),
     textTheme: TextTheme(bodyMedium: Type.body.copyWith(color: c.text1)),
     extensions: [c],
   );
