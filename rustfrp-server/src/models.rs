@@ -138,6 +138,9 @@ pub struct Tunnel {
     /// http：转发前设置的请求头。
     #[serde(default)]
     pub request_headers: std::collections::BTreeMap<String, String>,
+    /// http：转发给访问者前设置的响应头。
+    #[serde(default)]
+    pub response_headers: std::collections::BTreeMap<String, String>,
     /// PROXY protocol 版本：0 = 不写，1 / 2 = v1 / v2。
     #[serde(default)]
     pub proxy_protocol: u8,

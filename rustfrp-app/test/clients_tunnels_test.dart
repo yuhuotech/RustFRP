@@ -426,6 +426,16 @@ void main() {
         'X-Env: prod\n\nX-Team:  core ',
       );
       await tester.enterText(
+        find.byKey(const Key('tunnel-response-headers')),
+        'bad line',
+      );
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'response header without a colon');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-response-headers')),
+        'X-Frame-Options: deny',
+      );
+      await tester.enterText(
         find.byKey(const Key('tunnel-http-user')),
         'alice',
       );
@@ -460,6 +470,7 @@ void main() {
       final web = s.tunnels.last;
       expect(web['locations'], ['/api', '/rpc']);
       expect(web['request_headers'], {'X-Env': 'prod', 'X-Team': 'core'});
+      expect(web['response_headers'], {'X-Frame-Options': 'deny'});
       expect(web['http_user'], 'alice');
       expect(web['route_by_http_user'], 'alice');
       expect(web['http_password_set'], true);

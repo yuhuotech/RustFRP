@@ -429,6 +429,13 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
             .join('\n') ??
         '',
   );
+  late final _respHeaders = TextEditingController(
+    text:
+        widget.existing?.responseHeaders.entries
+            .map((e) => '${e.key}: ${e.value}')
+            .join('\n') ??
+        '',
+  );
   bool _clearPassword = false;
   late int _proxyProtocol = widget.existing?.proxyProtocol ?? 0;
   late final _bandwidth = TextEditingController(
@@ -445,6 +452,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
     final n = int.tryParse(t);
     return n == null || n < 0 || n > 1 << 30 ? null : n * 1024;
   }
+
   bool _busy = false;
   String _template = 'custom';
   void _applyTemplate(String? value) {
@@ -485,6 +493,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       _httpPassword,
       _routeUser,
       _headers,
+      _respHeaders,
       _bandwidth,
     ]) {
       c.dispose();
@@ -507,9 +516,12 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       .toList();
 
   /// 每行 `Name: value`；有非空行缺少冒号时返回 null（表单不合法）。
-  Map<String, String>? get _headerMap {
+  Map<String, String>? get _headerMap => _parseHeaders(_headers.text);
+  Map<String, String>? get _respHeaderMap => _parseHeaders(_respHeaders.text);
+
+  static Map<String, String>? _parseHeaders(String text) {
     final out = <String, String>{};
-    for (final line in _headers.text.split('\n')) {
+    for (final line in text.split('\n')) {
       if (line.trim().isEmpty) continue;
       final i = line.indexOf(':');
       if (i <= 0) return null;
@@ -520,7 +532,9 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
 
   bool get _httpValid =>
       _kind != 'http' ||
-      (_locationList.every((l) => l.startsWith('/')) && _headerMap != null);
+      (_locationList.every((l) => l.startsWith('/')) &&
+          _headerMap != null &&
+          _respHeaderMap != null);
   bool get _valid =>
       _client != null &&
       _httpValid &&
@@ -554,6 +568,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           httpPassword: _kind == 'http' ? _httpPassword.text : '',
           routeByHttpUser: _kind == 'http' ? _routeUser.text.trim() : '',
           requestHeaders: _kind == 'http' ? _headerMap! : const {},
+          responseHeaders: _kind == 'http' ? _respHeaderMap! : const {},
           proxyProtocol: _kind == 'udp' ? 0 : _proxyProtocol,
           bandwidthBps: _kind == 'udp' ? 0 : _bandwidthBps!,
           bandwidthServer: _kind != 'udp' && _bandwidthServer,
@@ -579,6 +594,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               : (_httpPassword.text.isEmpty ? null : _httpPassword.text),
           routeByHttpUser: _kind == 'http' ? _routeUser.text.trim() : null,
           requestHeaders: _kind == 'http' ? _headerMap : null,
+          responseHeaders: _kind == 'http' ? _respHeaderMap : null,
           proxyProtocol: _kind == 'udp' ? null : _proxyProtocol,
           bandwidthBps: _kind == 'udp' ? null : _bandwidthBps,
           bandwidthServer: _kind == 'udp' ? null : _bandwidthServer,
@@ -837,6 +853,16 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
                 key: const Key('tunnel-headers'),
                 controller: _headers,
                 hint: 'X-Env: prod',
+                maxLines: 3,
+                height: 72,
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 12),
+              label('追加 / 覆盖响应头（每行 Name: value；不可改 Content-Length 等分帧头）'),
+              LTextField(
+                key: const Key('tunnel-response-headers'),
+                controller: _respHeaders,
+                hint: 'X-Frame-Options: deny',
                 maxLines: 3,
                 height: 72,
                 onChanged: (_) => setState(() {}),

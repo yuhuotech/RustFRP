@@ -57,6 +57,8 @@ pub struct HttpRoute {
     pub route_by_user: String,
     /// 转发前设置的请求头。
     pub set_headers: Vec<(String, String)>,
+    /// 转发给访问者前设置的响应头。
+    pub response_headers: Vec<(String, String)>,
 }
 
 impl Default for HttpRoute {
@@ -67,6 +69,7 @@ impl Default for HttpRoute {
             password: String::new(),
             route_by_user: String::new(),
             set_headers: Vec::new(),
+            response_headers: Vec::new(),
         }
     }
 }
@@ -93,12 +96,29 @@ impl HttpRoute {
             }
             set_headers.push((k.clone(), v.clone()));
         }
+        let mut response_headers = Vec::new();
+        for (k, v) in &o.response_headers {
+            // 改写分帧 / 连接管理头会让代理无法再判断响应边界。
+            let framing = [
+                "content-length",
+                "transfer-encoding",
+                "connection",
+                "upgrade",
+            ]
+            .iter()
+            .any(|f| k.eq_ignore_ascii_case(f));
+            if framing || !valid_header(k, v) {
+                return Err(format!("invalid response header \"{k}\""));
+            }
+            response_headers.push((k.clone(), v.clone()));
+        }
         Ok(Self {
             locations,
             user: o.http_user.clone(),
             password: o.http_password.clone(),
             route_by_user: o.route_by_http_user.clone(),
             set_headers,
+            response_headers,
         })
     }
 }
@@ -457,6 +477,8 @@ struct PumpCtx {
     traffic: Arc<pipe::Traffic>,
     alive: Arc<std::sync::atomic::AtomicBool>,
     tracked: Arc<Tracked>,
+    /// 转发给访问者前设置的响应头。
+    response_headers: Arc<HttpRoute>,
     /// 本后端流的编号。
     limiter: Option<Arc<pipe::Limiter>>,
     uid: u64,
@@ -477,17 +499,31 @@ async fn pump_response(mut read: tokio::io::ReadHalf<rustfrp_core::mux::Stream>,
         };
         let chunk = buf.get(..n).unwrap_or(&[]);
         let mut w = c.client.lock().await;
-        if w.write_all(chunk).await.is_err() {
+        // 要改写响应头时，先经跟踪器得到实际输出（头未收齐则为空），再写给访问者。
+        let rewritten = (!c.response_headers.response_headers.is_empty()).then(|| {
+            let mut out = Vec::with_capacity(chunk.len() + 64);
+            c.tracked
+                .update(|t| t.rewrite(chunk, &c.response_headers.response_headers, &mut out));
+            out
+        });
+        let wrote = match &rewritten {
+            Some(out) => w.write_all(out).await,
+            None => w.write_all(chunk).await,
+        };
+        if wrote.is_err() {
             c.tracked.update(ResponseTracker::close);
             c.done.cancel();
             return;
         }
-        c.traffic.record_out(n as u64);
+        c.traffic
+            .record_out(rewritten.as_ref().map_or(n, Vec::len) as u64);
         drop(w);
         if let Some(l) = &c.limiter {
             l.pace(n).await;
         }
-        c.tracked.update(|t| t.feed(chunk));
+        if rewritten.is_none() {
+            c.tracked.update(|t| t.feed(chunk));
+        }
     }
     c.alive.store(false, Relaxed);
     // 后端在响应完整送达之后才关闭（保持连接被后端回收）：访问者连接不受影响；
@@ -725,6 +761,7 @@ async fn http_conn(
                         traffic: route.traffic.clone(),
                         alive: alive.clone(),
                         tracked: tracked.clone(),
+                        response_headers: route.http.clone(),
                         limiter: route.limiter.clone(),
                         uid,
                         current: current.clone(),

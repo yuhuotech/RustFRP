@@ -440,6 +440,7 @@ class FakeServer {
         t['http_user'] = body['http_user'] ?? '';
         t['route_by_http_user'] = body['route_by_http_user'] ?? '';
         t['request_headers'] = body['request_headers'] ?? <String, String>{};
+        t['response_headers'] = body['response_headers'] ?? <String, String>{};
         t['proxy_protocol'] = body['proxy_protocol'] ?? 0;
         t['bandwidth_bps'] = body['bandwidth_bps'] ?? 0;
         t['bandwidth_server'] = body['bandwidth_server'] ?? false;
@@ -465,6 +466,7 @@ class FakeServer {
           'http_user',
           'route_by_http_user',
           'request_headers',
+          'response_headers',
           'proxy_protocol',
           'bandwidth_bps',
           'bandwidth_server',

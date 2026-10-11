@@ -802,6 +802,8 @@ pub struct TunnelPatch {
     pub route_by_http_user: Option<String>,
     /// http：转发前设置的请求头。
     pub request_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// http：转发给访问者前设置的响应头。
+    pub response_headers: Option<std::collections::BTreeMap<String, String>>,
     /// PROXY protocol 版本。
     pub proxy_protocol: Option<u8>,
     /// 带宽上限（字节 / 秒）。
@@ -846,6 +848,7 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         http_password_set: !opts.http_password.is_empty(),
         route_by_http_user: opts.route_by_http_user,
         request_headers: opts.request_headers,
+        response_headers: opts.response_headers,
         proxy_protocol: u8::try_from(r.get::<_, i64>(17)?).unwrap_or(0),
         bandwidth_bps: u64::try_from(r.get::<_, i64>(18)?).unwrap_or(0),
         bandwidth_server: r.get::<_, i64>(19)? != 0,
@@ -1033,7 +1036,10 @@ fn check_http_opts(kind: &str, o: HttpOpts) -> Res<HttpOpts> {
         ));
     }
     let bad = |m: &str| Err(StoreError::Invalid(m.into()));
-    if o.locations.len() > MAX_LOCATIONS || o.request_headers.len() > MAX_REQUEST_HEADERS {
+    if o.locations.len() > MAX_LOCATIONS
+        || o.request_headers.len() > MAX_REQUEST_HEADERS
+        || o.response_headers.len() > MAX_REQUEST_HEADERS
+    {
         return bad("too many locations or request headers");
     }
     let mut locations: Vec<String> = Vec::new();
@@ -1048,6 +1054,20 @@ fn check_http_opts(kind: &str, o: HttpOpts) -> Res<HttpOpts> {
     for (k, v) in &o.request_headers {
         if !rustfrp_core::http1::valid_header(k, v) || k.len() > 64 || v.len() > 1024 {
             return bad("invalid request header");
+        }
+    }
+    for (k, v) in &o.response_headers {
+        // 改写分帧 / 连接管理头会让 Edge 无法再判断响应边界。
+        let framing = [
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "upgrade",
+        ]
+        .iter()
+        .any(|f| k.eq_ignore_ascii_case(f));
+        if framing || !rustfrp_core::http1::valid_header(k, v) || k.len() > 64 || v.len() > 1024 {
+            return bad("invalid response header");
         }
     }
     for v in [&o.http_user, &o.http_password, &o.route_by_http_user] {
@@ -1240,6 +1260,10 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             .request_headers
             .clone()
             .unwrap_or_else(|| cur_opts.request_headers.clone()),
+        response_headers: p
+            .response_headers
+            .clone()
+            .unwrap_or_else(|| cur_opts.response_headers.clone()),
     };
     let enabled = p.enabled.unwrap_or(cur.enabled);
     let k = check_tunnel(
@@ -1670,6 +1694,18 @@ mod tests {
             },
             HttpOpts {
                 request_headers: [("Bad Name".to_string(), "v".to_string())].into(),
+                ..Default::default()
+            },
+            HttpOpts {
+                response_headers: headers(17),
+                ..Default::default()
+            },
+            HttpOpts {
+                response_headers: [("Bad Name".to_string(), "v".to_string())].into(),
+                ..Default::default()
+            },
+            HttpOpts {
+                response_headers: [("Content-Length".to_string(), "1".to_string())].into(),
                 ..Default::default()
             },
             HttpOpts {

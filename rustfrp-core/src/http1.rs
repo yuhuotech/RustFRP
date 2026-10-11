@@ -530,15 +530,35 @@ impl ResponseTracker {
         self.state = RespState::Head;
     }
 
-    /// 喂入后端返回的字节。
+    /// 喂入后端返回的字节（只观察，不改写）。
     pub fn feed(&mut self, data: &[u8]) {
+        self.process(data, &[], None);
+    }
+
+    /// 喂入后端返回的字节，并把应转发给访问者的字节追加到 `out`：
+    /// 每个最终响应（非 1xx）的头里，`set` 中的头被覆盖（不存在则追加），其余字节原样。
+    /// 头尚未收齐时先扣住不输出；无法继续跟踪时把扣住的字节原样放出。
+    pub fn rewrite(&mut self, data: &[u8], set: &[(String, String)], out: &mut Vec<u8>) {
+        self.process(data, set, Some(out));
+    }
+
+    fn process(&mut self, data: &[u8], set: &[(String, String)], mut out: Option<&mut Vec<u8>>) {
         let mut data = data;
+        let mut pass = |bytes: &[u8]| {
+            if let Some(o) = out.as_deref_mut() {
+                o.extend_from_slice(bytes);
+            }
+        };
         while !data.is_empty() {
             match &mut self.state {
-                RespState::Opaque | RespState::UntilClose => return,
+                RespState::Opaque | RespState::UntilClose => {
+                    pass(data);
+                    return;
+                }
                 RespState::Length(left) => {
                     let take = usize::try_from(*left).unwrap_or(usize::MAX).min(data.len());
                     *left -= take as u64;
+                    pass(data.get(..take).unwrap_or(&[]));
                     data = data.get(take..).unwrap_or(&[]);
                     if *left == 0 {
                         self.complete();
@@ -546,12 +566,17 @@ impl ResponseTracker {
                 }
                 RespState::Chunked(sc) => match sc.feed(data) {
                     Ok((n, done)) => {
+                        pass(data.get(..n).unwrap_or(&[]));
                         data = data.get(n..).unwrap_or(&[]);
                         if done {
                             self.complete();
                         }
                     }
-                    Err(_) => self.state = RespState::Opaque,
+                    Err(_) => {
+                        self.state = RespState::Opaque;
+                        pass(data);
+                        return;
+                    }
                 },
                 RespState::Head => {
                     let carried = !self.head.is_empty();
@@ -575,23 +600,42 @@ impl ResponseTracker {
                             }
                             if self.head.len() >= crate::vhost::MAX_HEAD {
                                 self.state = RespState::Opaque;
+                                pass(&self.head);
+                                self.head.clear();
                             }
                             return;
                         }
                         RespHead::Bad => {
                             self.state = RespState::Opaque;
+                            if carried {
+                                pass(&self.head);
+                                self.head.clear();
+                            } else {
+                                pass(data);
+                            }
                             return;
                         }
                     };
                     // 头之后的字节一定来自本次 `data` 的末尾。
                     let total = if carried { self.head.len() } else { data.len() };
                     let remainder = total.saturating_sub(n);
+                    let raw_head = if carried {
+                        self.head.get(..n).unwrap_or(&[])
+                    } else {
+                        data.get(..n).unwrap_or(&[])
+                    };
+                    if !set.is_empty() && code != 101 && !(100..200).contains(&code) {
+                        pass(&replace_headers(raw_head, set));
+                    } else {
+                        pass(raw_head);
+                    }
                     data = data
                         .get(data.len().saturating_sub(remainder)..)
                         .unwrap_or(&[]);
                     self.head.clear();
                     if code == 101 {
                         self.state = RespState::Opaque;
+                        pass(data);
                         return;
                     }
                     // 1xx 是临时响应，最终响应还在后面；只有最终响应才可能要求关闭连接。
@@ -614,6 +658,36 @@ impl ResponseTracker {
             }
         }
     }
+}
+
+/// 重写响应头：去掉 `set` 里同名的头，再在头部末尾追加 `set`（`raw` 是含结尾空行的完整头）。
+fn replace_headers(raw: &[u8], set: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 64);
+    let body_start = raw.len().saturating_sub(2);
+    let mut first = true;
+    for line in raw
+        .get(..body_start)
+        .unwrap_or(&[])
+        .split_inclusive(|b| *b == b'\n')
+    {
+        let name = line.split(|b| *b == b':').next().unwrap_or(&[]);
+        let replaced = !first
+            && set
+                .iter()
+                .any(|(k, _)| name.trim_ascii().eq_ignore_ascii_case(k.as_bytes()));
+        if !replaced {
+            out.extend_from_slice(line);
+        }
+        first = false;
+    }
+    for (k, v) in set {
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 enum RespHead {
@@ -673,6 +747,73 @@ mod tests {
     }
     fn ok(s: &str) -> RequestHead {
         head(s).unwrap().unwrap()
+    }
+
+    fn rewritten(parts: &[&[u8]], set: &[(&str, &str)]) -> String {
+        let set: Vec<(String, String)> = set
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut t = ResponseTracker::new();
+        t.on_request(false);
+        t.on_request(false);
+        let mut out = Vec::new();
+        for p in parts {
+            t.rewrite(p, &set, &mut out);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn response_headers_are_replaced_and_added_on_every_final_response() {
+        let two = b"HTTP/1.1 200 OK\r\nX-Old: 1\r\nx-frame: a\r\nContent-Length: 2\r\n\r\nhiHTTP/1.1 404 NF\r\nContent-Length: 0\r\n\r\n";
+        let want = "HTTP/1.1 200 OK\r\nX-Old: 1\r\nContent-Length: 2\r\nX-Frame: deny\r\nX-New: n\r\n\r\nhiHTTP/1.1 404 NF\r\nContent-Length: 0\r\nX-Frame: deny\r\nX-New: n\r\n\r\n";
+        let set = [("X-Frame", "deny"), ("X-New", "n")];
+        assert_eq!(rewritten(&[two], &set), want);
+        // 任意切分（含逐字节）结果相同。
+        let bytes: Vec<&[u8]> = two.chunks(1).collect();
+        assert_eq!(rewritten(&bytes, &set), want);
+        assert_eq!(rewritten(&[&two[..30], &two[30..]], &set), want);
+    }
+
+    #[test]
+    fn rewriting_skips_interim_and_upgrade_and_passes_bodies_and_garbage_through() {
+        let set = [("X-A", "b")];
+        // 1xx 不改写，随后的最终响应改写；chunked 正文原样。
+        let s = rewritten(
+            &[b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"],
+            &set,
+        );
+        assert_eq!(
+            s,
+            "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+        );
+        // 101：头原样，其后全部透传。
+        let s = rewritten(&[b"HTTP/1.1 101 Switching\r\nUpgrade: x\r\n\r\nRAW"], &set);
+        assert_eq!(s, "HTTP/1.1 101 Switching\r\nUpgrade: x\r\n\r\nRAW");
+        // 畸形响应与以关闭为界的正文：原样放出。
+        assert_eq!(
+            rewritten(&[b"garbage\r\n\r\nmore"], &set),
+            "garbage\r\n\r\nmore"
+        );
+        let s = rewritten(&[b"HTTP/1.1 200 OK\r\n\r\nbody", b"-more"], &set);
+        assert_eq!(s, "HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nbody-more");
+        // 坏的 chunked 正文：从出错处起透传。
+        let s = rewritten(
+            &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"],
+            &set,
+        );
+        assert!(s.ends_with("zz\r\n"), "{s}");
+        // 头无限长：超过上限后原样放出。
+        let mut big = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        big.extend(vec![b'a'; crate::vhost::MAX_HEAD]);
+        let s = rewritten(&[&big], &set);
+        assert_eq!(s.len(), big.len());
+        // 没有要设置的头：与观察模式一致。
+        assert_eq!(
+            rewritten(&[b"HTTP/1.1 204 NC\r\n\r\n"], &[]),
+            "HTTP/1.1 204 NC\r\n\r\n"
+        );
     }
 
     #[test]

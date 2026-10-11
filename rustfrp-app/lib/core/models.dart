@@ -214,6 +214,7 @@ class Tunnel {
     this.httpPasswordSet = false,
     this.routeByHttpUser = '',
     this.requestHeaders = const {},
+    this.responseHeaders = const {},
     this.proxyProtocol = 0,
     this.bandwidthBps = 0,
     this.bandwidthServer = false,
@@ -240,6 +241,9 @@ class Tunnel {
   /// 是否设置了 Basic 认证密码（密码本身永不由服务器返回）。
   final bool httpPasswordSet;
   final Map<String, String> requestHeaders;
+
+  /// 转发给访问者前设置（覆盖）的响应头。
+  final Map<String, String> responseHeaders;
 
   bool get isWeb => kind == 'http' || kind == 'https';
   final int localPort, remotePort, statusPort, createdAt, updatedAt;
@@ -288,6 +292,12 @@ class Tunnel {
             if (e.key is String && e.value is String)
               e.key as String: e.value as String,
       },
+      responseHeaders: {
+        if (m['response_headers'] is Map)
+          for (final e in (m['response_headers'] as Map).entries)
+            if (e.key is String && e.value is String)
+              e.key as String: e.value as String,
+      },
     );
   }
 
@@ -317,7 +327,8 @@ class Tunnel {
       other.proxyProtocol == proxyProtocol &&
       other.bandwidthBps == bandwidthBps &&
       other.bandwidthServer == bandwidthServer &&
-      mapEquals(other.requestHeaders, requestHeaders);
+      mapEquals(other.requestHeaders, requestHeaders) &&
+      mapEquals(other.responseHeaders, responseHeaders);
   @override
   int get hashCode => Object.hashAll([
     id,
@@ -344,6 +355,7 @@ class Tunnel {
     bandwidthBps,
     bandwidthServer,
     ...requestHeaders.entries.map((e) => Object.hash(e.key, e.value)),
+    ...responseHeaders.entries.map((e) => Object.hash('r', e.key, e.value)),
   ]);
 }
 

@@ -459,6 +459,53 @@ async fn request_headers_are_set_and_host_is_rewritten_without_touching_the_body
 }
 
 #[tokio::test]
+async fn response_headers_are_set_on_every_response_and_framing_headers_are_refused() {
+    let rig = start().await;
+    let (port, _) = backend("r").await;
+    let opts = |k: &str| HttpOpts {
+        response_headers: [
+            (k.to_string(), "deny".to_string()),
+            ("X-Served-By".to_string(), "edge".to_string()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let (mut rx, cancel) = run_client(
+        &rig,
+        vec![
+            web("r", port, "r.example.com", opts("X-Frame-Options")),
+            web("f", port, "f.example.com", opts("Content-Length")),
+            web("c", port, "c.example.com", opts("connection")),
+        ],
+    );
+    let ev = events(&mut rx, 3).await;
+    assert!(matches!(ev[0], Event::ProxyStarted { .. }), "{:?}", ev[0]);
+    for e in &ev[1..] {
+        assert!(
+            matches!(e, Event::ProxyFailed { error, .. } if error.contains("invalid response header")),
+            "{e:?}"
+        );
+    }
+    // 同一条保持连接上的两个请求，每个响应都被改写，正文与分帧不变。
+    let mut s = TcpStream::connect(rig.http).await.unwrap();
+    let mut buf = Vec::new();
+    for _ in 0..2 {
+        s.write_all(b"GET / HTTP/1.1\r\nHost: r.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let r = read_response(&mut s, &mut buf).await.unwrap();
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+        assert!(
+            r.contains("X-Frame-Options: deny\r\n") && r.contains("X-Served-By: edge\r\n"),
+            "{r}"
+        );
+        assert!(r.ends_with("backend=r"), "{r}");
+    }
+    cancel.cancel();
+    rig.stop.cancel();
+}
+
+#[tokio::test]
 async fn bodies_are_framed_so_pipelined_next_requests_route_independently() {
     let rig = start().await;
     let ((pa, sa), (pb, sb)) = (backend("a").await, backend("b").await);

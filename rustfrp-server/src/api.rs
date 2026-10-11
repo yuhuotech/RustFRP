@@ -1116,6 +1116,8 @@ struct CreateTunnel {
     #[serde(default)]
     request_headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
+    response_headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
     proxy_protocol: u8,
     #[serde(default)]
     bandwidth_bps: u64,
@@ -1177,6 +1179,7 @@ async fn create_tunnel(
             http_password: b.http_password,
             route_by_http_user: b.route_by_http_user,
             request_headers: b.request_headers,
+            response_headers: b.response_headers,
         },
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
@@ -1287,6 +1290,7 @@ struct PatchTunnel {
     http_password: Option<String>,
     route_by_http_user: Option<String>,
     request_headers: Option<std::collections::BTreeMap<String, String>>,
+    response_headers: Option<std::collections::BTreeMap<String, String>>,
     proxy_protocol: Option<u8>,
     bandwidth_bps: Option<u64>,
     bandwidth_server: Option<bool>,
@@ -1320,6 +1324,7 @@ async fn patch_tunnel(
         http_password: b.http_password,
         route_by_http_user: b.route_by_http_user,
         request_headers: b.request_headers,
+        response_headers: b.response_headers,
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
         bandwidth_server: b.bandwidth_server,

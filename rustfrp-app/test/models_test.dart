@@ -158,6 +158,13 @@ void main() {
       ('alice', true, 'bob'),
     );
     expect(h.requestHeaders, {'X-A': '1'});
+    expect(
+      Tunnel.fromJson({
+        'id': 'r',
+        'response_headers': {'X-B': '2', 'bad': 3},
+      }).responseHeaders,
+      {'X-B': '2'},
+    );
     expect(Tunnel.fromJson({'id': 'p', 'proxy_protocol': 2}).proxyProtocol, 2);
     expect(h == Tunnel.fromJson({'id': 'h', 'proxy_protocol': 1}), isFalse);
     final bw = Tunnel.fromJson({

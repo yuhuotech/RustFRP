@@ -117,6 +117,7 @@ fn http_opts(p: &Proxy) -> rustfrp_core::wire::HttpOpts {
         http_password: p.http_password.clone(),
         route_by_http_user: p.route_by_http_user.clone(),
         request_headers: p.request_headers.set.clone(),
+        response_headers: p.response_headers.set.clone(),
     }
 }
 fn apply(
@@ -163,6 +164,7 @@ fn apply(
                     http_password: Some(p.http_password.clone()).filter(|_| p.kind == "http"),
                     route_by_http_user: Some(http_opts(&p).route_by_http_user),
                     request_headers: Some(http_opts(&p).request_headers),
+                    response_headers: Some(http_opts(&p).response_headers),
                     proxy_protocol: Some(proxy_protocol(&p)),
                     bandwidth_bps: Some(bandwidth(&p)),
                     bandwidth_server: Some(p.transport.bandwidth_limit_mode == "server"),
@@ -243,7 +245,10 @@ fn warnings(loaded: &frpcfg::LoadedClient) -> Vec<String> {
                 p.kind != "http" && !p.request_headers.set.is_empty(),
                 "requestHeaders",
             ),
-            (!p.response_headers.set.is_empty(), "responseHeaders"),
+            (
+                p.kind != "http" && !p.response_headers.set.is_empty(),
+                "responseHeaders",
+            ),
             (
                 p.kind != "http" && !p.route_by_http_user.is_empty(),
                 "routeByHTTPUser",
@@ -361,6 +366,7 @@ pub fn export(c: &Connection, cfg: &Config, client: &str) -> Result<String, Stor
             p.http_password = opts.http_password;
             p.route_by_http_user = opts.route_by_http_user;
             p.request_headers.set = opts.request_headers;
+            p.response_headers.set = opts.response_headers;
             p.transport.bandwidth_limit =
                 rustfrp_core::frpcfg::Bandwidth::parse(&bandwidth_text(t.bandwidth_bps))
                     .map_err(invalid)?;
@@ -538,16 +544,11 @@ mod tests {
                 "requestHeaders",
                 "routeByHTTPUser",
                 "bandwidthLimit",
+                "responseHeaders",
             ] {
                 assert!(!all.contains(ok), "{ok}: {all}");
             }
-            for pending in [
-                "encryption",
-                "compression",
-                "healthCheck",
-                "loadBalancer",
-                "responseHeaders",
-            ] {
+            for pending in ["encryption", "compression", "healthCheck", "loadBalancer"] {
                 assert!(all.contains(pending), "{pending}: {all}");
             }
             for kind in ["tcp", "udp", "https"] {
@@ -568,7 +569,7 @@ mod tests {
                 subdomain_host: "example.com".into(),
                 ..Default::default()
             };
-            let text = "serverAddr='x'\n[[proxies]]\nname='web'\ntype='http'\nlocalPort=80\ncustomDomains=['a.example.com']\nlocations=['/api','/rpc']\nhttpUser='alice'\nhttpPassword='s3cret'\nrouteByHTTPUser='alice'\nrequestHeaders.set.X-Env='prod'\n";
+            let text = "serverAddr='x'\n[[proxies]]\nname='web'\ntype='http'\nlocalPort=80\ncustomDomains=['a.example.com']\nlocations=['/api','/rpc']\nhttpUser='alice'\nhttpPassword='s3cret'\nrouteByHTTPUser='alice'\nrequestHeaders.set.X-Env='prod'\nresponseHeaders.set.X-Frame-Options='deny'\n";
             let p = preview(&mut c, &cfg, "c", text).unwrap();
             assert!(!p.warnings.join("\n").contains("Basic Auth"));
             assert_eq!(import(&mut c, &cfg, "c", text, ("a", "r", "")).unwrap(), 1);
@@ -588,6 +589,7 @@ mod tests {
                 "routeByHTTPUser = \"alice\"",
                 "/rpc",
                 "X-Env",
+                "X-Frame-Options",
             ] {
                 assert!(out.contains(want), "{want}\n{out}");
             }
@@ -595,7 +597,12 @@ mod tests {
             let plain = "serverAddr='x'\n[[proxies]]\nname='web'\ntype='http'\nlocalPort=80\ncustomDomains=['a.example.com']\n";
             assert_eq!(import(&mut c, &cfg, "c", plain, ("a", "r", "")).unwrap(), 1);
             let t = store::list_tunnels(&c, Some("c")).unwrap().remove(0);
-            assert!(t.locations.is_empty() && !t.http_password_set && t.request_headers.is_empty());
+            assert!(
+                t.locations.is_empty()
+                    && !t.http_password_set
+                    && t.request_headers.is_empty()
+                    && t.response_headers.is_empty()
+            );
             // 其他代理类型带这些字段会在严格解析阶段被拒绝（frp 的字段只属于 http 代理）。
             let tcp = "serverAddr='x'\n[[proxies]]\nname='t'\ntype='tcp'\nlocalPort=22\nremotePort=6000\nhttpUser='u'\n";
             assert!(preview(&mut c, &cfg, "c", tcp).is_err());

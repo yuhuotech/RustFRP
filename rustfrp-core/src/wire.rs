@@ -71,6 +71,9 @@ pub struct HttpOpts {
     /// 转发前设置（覆盖）的请求头。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub request_headers: BTreeMap<String, String>,
+    /// 转发给访问者前设置（覆盖）的响应头。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_headers: BTreeMap<String, String>,
 }
 
 impl HttpOpts {

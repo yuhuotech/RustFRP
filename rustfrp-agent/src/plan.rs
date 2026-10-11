@@ -103,7 +103,10 @@ pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static s
         "httpUser / httpPassword",
     );
     flag(other && !p.request_headers.set.is_empty(), "requestHeaders");
-    flag(!p.response_headers.set.is_empty(), "responseHeaders");
+    flag(
+        other && !p.response_headers.set.is_empty(),
+        "responseHeaders",
+    );
     flag(other && !p.route_by_http_user.is_empty(), "routeByHTTPUser");
     v
 }
@@ -164,6 +167,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
                     http_password: p.http_password.clone(),
                     route_by_http_user: p.route_by_http_user.clone(),
                     request_headers: p.request_headers.set.clone(),
+                    response_headers: p.response_headers.set.clone(),
                 }
             } else {
                 Default::default()
