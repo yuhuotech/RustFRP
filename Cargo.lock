@@ -1045,6 +1045,7 @@ dependencies = [
 name = "rustfrp-agent"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "rcgen",
  "rustfrp-core",
  "rustls",

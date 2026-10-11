@@ -77,15 +77,28 @@ pub struct Limited<T> {
     io: T,
     limiter: std::sync::Arc<Limiter>,
     sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// 写入也记账（给「自己产生响应数据」的本地插件用）。
+    pace_writes: bool,
+    write_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<T> Limited<T> {
-    /// 包装 `io`。
+    /// 包装 `io`：只限读取方向。
     pub fn new(io: T, limiter: std::sync::Arc<Limiter>) -> Self {
         Self {
             io,
             limiter,
             sleep: None,
+            pace_writes: false,
+            write_sleep: None,
+        }
+    }
+
+    /// 包装 `io`：读写两个方向共用同一个限速器。
+    pub fn both(io: T, limiter: std::sync::Arc<Limiter>) -> Self {
+        Self {
+            pace_writes: true,
+            ..Self::new(io, limiter)
         }
     }
 }
@@ -121,7 +134,20 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Limited<T> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+        if let Some(sleep) = self.write_sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            self.write_sleep = None;
+        }
+        let result = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+        if let (true, std::task::Poll::Ready(Ok(n))) = (self.pace_writes, &result) {
+            let wait = self.limiter.charge(*n);
+            if !wait.is_zero() {
+                self.write_sleep = Some(Box::pin(tokio::time::sleep(wait)));
+            }
+        }
+        result
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
@@ -326,6 +352,31 @@ mod tests {
         // 小速率也至少容得下一个读缓冲。
         let tiny = Limiter::new(100).unwrap();
         assert!(tiny.charge(BUF_SIZE).is_zero());
+    }
+
+    #[tokio::test]
+    async fn both_directions_share_the_limiter_when_requested() {
+        let limiter = Limiter::new(64 * 1024).unwrap();
+        let (a, mut b) = duplex(1 << 20);
+        let mut limited = Limited::both(a, limiter);
+        let drain = tokio::spawn(async move {
+            let mut total = 0;
+            let mut buf = vec![0u8; 16 * 1024];
+            while total < 128 * 1024 {
+                total += b.read(&mut buf).await.unwrap();
+            }
+        });
+        // 128 KiB 写入：前 64 KiB 是突发额度，其余约需 1 秒。
+        let start = std::time::Instant::now();
+        for _ in 0..(128 * 1024 / BUF_SIZE) {
+            limited.write_all(&vec![1u8; BUF_SIZE]).await.unwrap();
+        }
+        drain.await.unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(700),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

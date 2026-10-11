@@ -157,6 +157,79 @@ pub fn client_config_pinned(
     Ok(Arc::new(cfg))
 }
 
+/// 应用层（本地插件）服务端配置：TLS 1.2 / 1.3，ALPN 为 `http/1.1`。
+pub fn app_server_config(id: Identity) -> Result<Arc<ServerConfig>, TunnelError> {
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(tls_err)?
+        .with_no_client_auth()
+        .with_single_cert(id.certs, id.key)
+        .map_err(tls_err)?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// 应用层（本地插件）客户端配置：不校验证书（与 frp 插件的 `InsecureSkipVerify` 一致），TLS 1.2 / 1.3。
+pub fn app_client_config() -> Result<Arc<ClientConfig>, TunnelError> {
+    let mut cfg = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(tls_err)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyApp(provider())))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// 接受任意证书、同时支持 TLS 1.2 / 1.3 签名校验。
+#[derive(Debug)]
+struct AcceptAnyApp(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAnyApp {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 #[derive(Debug)]
 struct AcceptAny(
     Arc<CryptoProvider>,
@@ -249,6 +322,28 @@ mod tests {
     async fn accepts_any_certificate_by_default_like_frp() {
         let id = self_signed(vec!["localhost".into()]).unwrap();
         let got = handshake(client_config(None).unwrap(), server_config(id).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(got, b"pong");
+    }
+
+    #[tokio::test]
+    async fn app_configs_interoperate_and_accept_any_certificate() {
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let got = handshake(app_client_config().unwrap(), app_server_config(id).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(got, b"pong");
+        // TLS 1.2 only 的服务端也能握手（本地被代理服务可能很旧）。
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let mut old = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(id.certs, id.key)
+            .unwrap();
+        old.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let got = handshake(app_client_config().unwrap(), Arc::new(old))
             .await
             .unwrap();
         assert_eq!(got, b"pong");

@@ -53,6 +53,8 @@ pub struct ProxyCfg {
     pub bandwidth_server: bool,
     /// 负载均衡组与健康检查。
     pub lb: rustfrp_core::wire::LbOpts,
+    /// 本地插件（代替连接本地端口）。
+    pub plugin: Option<crate::plugin::PluginCfg>,
 }
 
 /// 首次接入所需信息。
@@ -383,6 +385,8 @@ struct Local {
     proxy_protocol: u8,
     /// 客户端侧限速（整个代理共享）。
     limiter: Option<Arc<pipe::Limiter>>,
+    /// 本地插件；有插件时不连接本地端口。
+    plugin: Option<Arc<crate::plugin::Plugin>>,
 }
 
 type Locals = Arc<Mutex<HashMap<String, Local>>>;
@@ -477,6 +481,20 @@ async fn talk(
     let own_proxies: &[ProxyCfg] = if managed { &[] } else { &cfg.proxies };
     let mut watches: Vec<Watch> = Vec::new();
     for p in own_proxies {
+        let plugin = match p.plugin.clone().map(crate::plugin::Plugin::new).transpose() {
+            Ok(pl) => pl.map(Arc::new),
+            Err(error) => {
+                log.error(&format!("proxy [{}] start error: {error}", p.name));
+                emit(
+                    events,
+                    Event::ProxyFailed {
+                        name: p.name.clone(),
+                        error,
+                    },
+                );
+                continue;
+            }
+        };
         let spec = ProxySpec {
             name: p.name.clone(),
             kind: p.kind.clone(),
@@ -515,6 +533,7 @@ async fn talk(
                             port: p.local_port,
                             proxy_protocol: p.proxy_protocol,
                             limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server),
+                            plugin: plugin.clone(),
                         },
                     );
                 if let Some(h) = &p.lb.health {
@@ -577,7 +596,7 @@ async fn talk(
                         Some(_) => {}
                     }
                     if let Err(e) = crate::local_control::update_tunnels(&cfg.local_tunnels,&set) { break lost(e.into(),true); }
-                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server) })).collect();
+                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server), plugin: None })).collect();
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
                     monitors.sync(
                         set.proxies
@@ -658,6 +677,24 @@ async fn handle_work(
     };
     if t.kind == "udp" {
         return udp_work(stream, &t, cfg).await;
+    }
+    if let Some(plugin) = &t.plugin {
+        return match t.limiter {
+            Some(l) => {
+                plugin
+                    .serve(
+                        pipe::Limited::both(stream, l),
+                        &cfg.traffic,
+                        cfg.local_dial_timeout,
+                    )
+                    .await
+            }
+            None => {
+                plugin
+                    .serve(stream, &cfg.traffic, cfg.local_dial_timeout)
+                    .await
+            }
+        };
     }
     let mut local = within(cfg.local_dial_timeout, "dial local service", async {
         Ok(TcpStream::connect((t.host.as_str(), t.port)).await?)

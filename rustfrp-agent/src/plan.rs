@@ -73,6 +73,40 @@ fn resolve_token(
     }
 }
 
+/// frp 的 `plugin` → 插件配置（证书文件在这里读入）。
+fn plugin_cfg(
+    x: &rustfrp_core::frpcfg::Plugin,
+    fs: &dyn ConfigFs,
+) -> Result<crate::plugin::PluginCfg, String> {
+    let read = |path: &str, what: &str| -> Result<String, String> {
+        if path.is_empty() {
+            return Ok(String::new());
+        }
+        fs.read_to_string(path)
+            .map_err(|e| format!("read plugin {what} {path}: {e}"))
+    };
+    Ok(crate::plugin::PluginCfg {
+        kind: x.kind.clone(),
+        local_addr: x.local_addr.clone(),
+        unix_path: x.unix_path.clone(),
+        host_header_rewrite: x.host_header_rewrite.clone(),
+        request_headers: x
+            .request_headers
+            .set
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        crt_pem: read(&x.crt_path, "crtPath")?,
+        key_pem: read(&x.key_path, "keyPath")?,
+        http_user: x.http_user.clone(),
+        http_password: x.http_password.clone(),
+        username: x.username.clone(),
+        password: x.password.clone(),
+        local_path: x.local_path.clone(),
+        strip_prefix: x.strip_prefix.clone(),
+    })
+}
+
 /// frp 的 `loadBalancer` / `healthCheck` → 线协议（默认值与 frp 一致：超时 3s、失败 1 次、间隔 10s）。
 pub fn lb_opts(p: &rustfrp_core::frpcfg::Proxy) -> rustfrp_core::wire::LbOpts {
     if p.kind == "udp" {
@@ -159,13 +193,17 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             ));
             continue;
         }
-        if p.plugin.as_ref().is_some_and(|x| !x.kind.is_empty()) {
-            notes.push(format!(
-                "proxy [{}]: plugins are not supported yet, skipped",
-                p.name
-            ));
-            continue;
-        }
+        let plugin = match p.plugin.as_ref().filter(|x| !x.kind.is_empty()) {
+            Some(x) if !crate::plugin::KINDS.contains(&x.kind.as_str()) => {
+                notes.push(format!(
+                    "proxy [{}]: plugin \"{}\" is not supported yet, skipped",
+                    p.name, x.kind
+                ));
+                continue;
+            }
+            Some(x) => Some(plugin_cfg(x, fs).map_err(|e| format!("proxy [{}]: {e}", p.name))?),
+            None => None,
+        };
         let name = if c.user.is_empty() {
             p.name.clone()
         } else {
@@ -193,6 +231,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
                     .map_err(|e| format!("proxy [{}]: {e}", p.name))?
             },
             lb: lb_opts(p),
+            plugin,
             http: if p.kind == "http" {
                 rustfrp_core::wire::HttpOpts {
                     locations: p.locations.clone(),
@@ -431,6 +470,51 @@ mod tests {
     }
 
     #[test]
+    fn plugins_map_with_certificates_read_and_unsupported_ones_are_reported() {
+        let fs = MemFs::new().with("c.crt", "CERT").with("c.key", "KEY");
+        let src = "serverAddr='x'\n\
+[[proxies]]\nname='t'\ntype='https'\ncustomDomains=['a.com']\nplugin.type='https2http'\nplugin.localAddr='127.0.0.1:80'\nplugin.crtPath='c.crt'\nplugin.keyPath='c.key'\nplugin.hostHeaderRewrite='in.lan'\nplugin.requestHeaders.set.X-A='1'\n\
+[[proxies]]\nname='s'\ntype='tcp'\nremotePort=1\nplugin.type='static_file'\nplugin.localPath='/srv'\nplugin.stripPrefix='st'\nplugin.httpUser='u'\nplugin.httpPassword='p'\n\
+[[proxies]]\nname='v'\ntype='tcp'\nremotePort=2\nplugin.type='virtual_net'\n";
+        let plan = client(src, &fs).unwrap();
+        assert_eq!(plan.cfg.proxies.len(), 2);
+        let t = plan.cfg.proxies[0].plugin.clone().unwrap();
+        assert_eq!(
+            (
+                t.crt_pem.as_str(),
+                t.key_pem.as_str(),
+                t.host_header_rewrite.as_str()
+            ),
+            ("CERT", "KEY", "in.lan")
+        );
+        assert_eq!(
+            t.request_headers,
+            vec![("X-A".to_string(), "1".to_string())]
+        );
+        let s = plan.cfg.proxies[1].plugin.clone().unwrap();
+        assert_eq!(
+            (
+                s.local_path.as_str(),
+                s.strip_prefix.as_str(),
+                s.http_user.as_str(),
+                s.http_password.as_str()
+            ),
+            ("/srv", "st", "u", "p")
+        );
+        assert!(
+            plan.notes.iter().any(|n| n.contains("virtual_net")),
+            "{:?}",
+            plan.notes
+        );
+        // 证书文件读不到：启动前就报错，而不是静默降级成自签名。
+        let err = client(src, &MemFs::new()).err().unwrap();
+        assert!(
+            err.contains("proxy [t]") && err.contains("crtPath"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn client_basic_mapping() {
         let src = r#"
 serverAddr = "10.0.0.1"
@@ -477,7 +561,7 @@ bindPort = 1
             ("10.0.0.1", 7100)
         );
         assert_eq!(p.cfg.token, "tk");
-        assert_eq!(p.cfg.proxies.len(), 3);
+        assert_eq!(p.cfg.proxies.len(), 4);
         assert_eq!(
             (p.cfg.proxies[0].name.as_str(), p.cfg.proxies[0].remote_port),
             ("alice.ssh", 6000)
@@ -499,11 +583,14 @@ bindPort = 1
             (p.log_to.as_str(), p.log_level.as_str()),
             ("./frpc.log", "debug")
         );
-        assert_eq!(p.notes.len(), 4);
+        assert_eq!(
+            p.cfg.proxies[3].plugin.as_ref().map(|x| x.kind.as_str()),
+            Some("socks5")
+        );
+        assert_eq!(p.notes.len(), 3);
         assert!(p.notes[0].contains("transport.useEncryption"));
         assert!(p.notes[1].contains("type \"sudp\""));
-        assert!(p.notes[2].contains("plugins"));
-        assert!(p.notes[3].contains("visitor [v]"));
+        assert!(p.notes[2].contains("visitor [v]"));
     }
 
     #[test]

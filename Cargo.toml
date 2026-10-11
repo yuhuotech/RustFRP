@@ -19,7 +19,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"] 
 futures = { version = "0.3", default-features = false, features = ["std"] }
 yamux = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 sha2 = "0.10"
 ring = "0.17"

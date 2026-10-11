@@ -19,6 +19,7 @@ pub mod local_control;
 pub mod log;
 pub mod managed;
 pub mod plan;
+pub mod plugin;
 pub mod proxy_rt;
 pub mod service;
 

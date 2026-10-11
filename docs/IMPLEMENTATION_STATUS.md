@@ -39,7 +39,8 @@
 | TCP / UDP / HTTPS SNI | 已实现 | 独立与受管实际链路已测；进一步容量、性能和平台验收仍需完成 |
 | HTTP | 已实现待整体验收 | 逐请求（保持连接上每个请求）按域名/通配/子域 + 路径前缀（locations）+ routeByHTTPUser 选路，Basic Auth（Edge 校验，密码永不经 REST 返回）、Host 改写、requestHeaders.set、responseHeaders.set（逐响应改写，禁止改 Content-Length / Transfer-Encoding / Connection / Upgrade）、Upgrade 透传、请求走私防护、流水线响应保序；独立模式与受管模式（Controller 存储/下发/热更新/导入导出/面板表单）均已支持，真实全栈测试通过；PROXY protocol、限速、responseHeaders、健康检查与负载均衡组已实现并在兼容报告中列出 |
 | STCP / SUDP / visitors / TCPMUX | 未实现 | 配置识别/报告不等于能力，尚缺运行时与端到端验收 |
-| 通用加密/压缩/插件 | 未实现（PROXY protocol 已实现） | 逐代理有提示；需对照上游字段与行为完成、加入兼容样例和内存基准 |
+| 本地插件 | 独立模式已实现 | `socks5`（可选 RFC 1929 认证）、`http_proxy`（CONNECT + 绝对形式明文请求，Proxy-Authorization Basic）、`static_file`（只读，拒绝路径穿越与符号链接逃逸，目录索引 / 前缀剥离 / Basic）、`unix_domain_socket`、`http2https` / `https2http` / `https2https`（按请求改写 Host 与请求头，仅 HTTP/1.1，证书缺省生成自签名）、`tls2raw`；`virtual_net` 等未实现并在兼容报告中列出。受管模式（Controller 存储 / 下发 / 面板）尚未接入 |
+| 通用加密/压缩 | 未实现（PROXY protocol 已实现） | 逐代理有提示；需对照上游字段与行为完成、加入兼容样例和内存基准 |
 | G8 配置兼容 / 导入导出 | 部分完成 | TOML/YAML/JSON、includes、环境模板、默认/校验/导出已有；INI convert 已接入 CLI、环境模板、includes 展开与兼容报告，正在做覆盖率/语法边界验收；reload、受管配置导入预览/摘要确认/事务应用和 TOML 导出 API 已接入并测试；仍缺面板导入向导与完整运行选项编辑；OIDC、webServer、httpPlugins 等配置的运行能力须逐字段补齐或明确报告 |
 | 管理面离线不影响数据面 | 已实现待整体验收 | 内置节点与 Controller 同进程，杀 Controller 仍会中断内置节点的隧道；使用独立节点时 AT-05 通过（同机回环全栈测试）。需要在真实多机环境复验 |
 | G7 官网 / 部署 / P07 发布 | 未实现 | 静态中文官网、快速开始、compose/systemd/nginx/caddy、Release 多平台与签名、安全审计报告待补 |
