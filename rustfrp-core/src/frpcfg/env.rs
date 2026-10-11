@@ -11,6 +11,10 @@ pub trait ConfigFs {
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
     /// 目录是否存在。
     fn dir_exists(&self, dir: &str) -> bool;
+    /// 写文件（覆盖）。含密钥的文件应只允许当前用户读写。
+    fn write_private(&self, path: &str, content: &str) -> io::Result<()>;
+    /// 创建目录（含父目录）。
+    fn create_dir_all(&self, dir: &str) -> io::Result<()>;
 }
 
 /// 环境变量来源。
@@ -47,6 +51,22 @@ impl ConfigFs for StdFs {
     fn dir_exists(&self, dir: &str) -> bool {
         std::path::Path::new(dir).is_dir()
     }
+
+    fn write_private(&self, path: &str, content: &str) -> io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)?.write_all(content.as_bytes())
+    }
+
+    fn create_dir_all(&self, dir: &str) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// 真实进程环境。
@@ -69,10 +89,10 @@ impl Env for MapEnv {
     }
 }
 
-/// 内存文件系统（测试与「面板预览导入」场景使用）。
+/// 内存文件系统（测试与「面板预览导入」场景使用）。克隆共享同一份内容。
 #[derive(Debug, Default, Clone)]
 pub struct MemFs {
-    files: BTreeMap<String, String>,
+    files: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
 }
 
 impl MemFs {
@@ -82,9 +102,15 @@ impl MemFs {
     }
 
     /// 写入一个文件，返回自身以便链式调用。
-    pub fn with(mut self, path: &str, content: &str) -> Self {
-        self.files.insert(path.to_string(), content.to_string());
+    pub fn with(self, path: &str, content: &str) -> Self {
+        self.map().insert(path.to_string(), content.to_string());
         self
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
+        self.files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -97,7 +123,7 @@ fn split_dir(path: &str) -> (&str, &str) {
 
 impl ConfigFs for MemFs {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
-        self.files
+        self.map()
             .get(path)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{path}: no such file")))
@@ -111,7 +137,7 @@ impl ConfigFs for MemFs {
             ));
         }
         Ok(self
-            .files
+            .map()
             .keys()
             .filter_map(|p| {
                 let (d, f) = split_dir(p);
@@ -121,7 +147,16 @@ impl ConfigFs for MemFs {
     }
 
     fn dir_exists(&self, dir: &str) -> bool {
-        self.files.keys().any(|p| split_dir(p).0 == dir)
+        self.map().keys().any(|p| split_dir(p).0 == dir)
+    }
+
+    fn write_private(&self, path: &str, content: &str) -> io::Result<()> {
+        self.map().insert(path.to_string(), content.to_string());
+        Ok(())
+    }
+
+    fn create_dir_all(&self, _dir: &str) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -148,6 +183,14 @@ mod tests {
             io::ErrorKind::NotFound
         );
         assert!(fs.dir_exists("a") && fs.dir_exists(".") && !fs.dir_exists("zzz"));
+        fs.create_dir_all("new").unwrap();
+        fs.write_private("new/f", "x").unwrap();
+        assert_eq!(fs.read_to_string("new/f").unwrap(), "x");
+        assert_eq!(
+            fs.clone().read_to_string("new/f").unwrap(),
+            "x",
+            "clones share content"
+        );
     }
 
     #[test]
@@ -181,6 +224,34 @@ mod tests {
         assert!(StdFs.dir_exists(d));
         assert!(!StdFs.dir_exists(&format!("{d}/b.toml")));
         assert!(StdFs.list_files(&format!("{d}/none")).is_err());
+        StdFs.create_dir_all(&format!("{d}/a/b")).unwrap();
+        StdFs
+            .write_private(&format!("{d}/a/b/secret"), "one")
+            .unwrap();
+        StdFs
+            .write_private(&format!("{d}/a/b/secret"), "two")
+            .unwrap();
+        assert_eq!(
+            StdFs.read_to_string(&format!("{d}/a/b/secret")).unwrap(),
+            "two",
+            "overwrites"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(format!("{d}/a/b/secret"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "private files are not group/world accessible"
+            );
+        }
+        assert!(StdFs
+            .write_private(&format!("{d}/missing-dir/x"), "x")
+            .is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

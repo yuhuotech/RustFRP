@@ -26,14 +26,21 @@ agent-cov:
 	RUSTC_BOOTSTRAP=1 $(CARGO) llvm-cov --branch -p rustfrp-agent --ignore-filename-regex 'rustfrp-agent/src/main.rs' --lcov --output-path target/cov/agent.lcov
 	python3 tools/cov/check_lcov.py target/cov/agent.lcov --name rustfrp-agent --list-gaps
 
+server-cov:
+	mkdir -p target/cov
+	$(CARGO) llvm-cov clean --workspace
+	RUSTC_BOOTSTRAP=1 $(CARGO) llvm-cov --branch -p rustfrp-server --ignore-filename-regex 'rustfrp-server/src/main.rs' --lcov --output-path target/cov/server.lcov
+	python3 tools/cov/check_lcov.py target/cov/server.lcov --name rustfrp-server --list-gaps
+
 # 全仓库
-cov: core-cov agent-cov
+cov: core-cov agent-cov server-cov
 
 .PHONY: cov-baseline bench-mem
-# 新增模块导致比例变化时，在同一提交里重设基线（需在提交信息中说明原因）。
-cov-baseline: cov
-	python3 tools/cov/check_lcov.py target/cov/core.lcov --name rustfrp-core --update-baseline --min 90
-	python3 tools/cov/check_lcov.py target/cov/agent.lcov --name rustfrp-agent --update-baseline --min 90
+# 新增模块导致比例变化时，在同一提交里重设基线（需在提交信息中说明原因）。先运行 make core-cov agent-cov server-cov 生成 lcov。
+cov-baseline:
+	python3 tools/cov/check_lcov.py target/cov/core.lcov --name rustfrp-core --update-baseline --rebaseline --min 90
+	python3 tools/cov/check_lcov.py target/cov/agent.lcov --name rustfrp-agent --update-baseline --rebaseline --min 90
+	python3 tools/cov/check_lcov.py target/cov/server.lcov --name rustfrp-server --update-baseline --rebaseline --min 90
 
 # 内存基准：先 cargo build --release；超预算则失败
 bench-mem:

@@ -15,4 +15,5 @@ pub mod cli;
 pub mod client;
 pub mod edge;
 pub mod log;
+pub mod managed;
 pub mod plan;

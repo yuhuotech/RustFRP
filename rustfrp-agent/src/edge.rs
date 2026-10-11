@@ -1,7 +1,14 @@
 //! 边缘节点（frps 角色）：监听 Client 的隧道连接，并在公网端口上转发访问者流量。
+//!
+//! 两种工作方式由 [`Policy`] 决定：
+//! * **独立模式**（[`TokenPolicy`]，等价 frps）：客户端自己用 `NewProxy` 注册代理；
+//! * **受管模式**：由 Controller 的策略放行客户端，并通过 `watch` 通道下发整份配置，Edge 对账后增删代理。
 
-use std::collections::HashSet;
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -11,16 +18,89 @@ use rustfrp_core::mux::{self, MuxConfig, Session, Stream};
 use rustfrp_core::pipe;
 use rustfrp_core::tls::{self, Identity};
 use rustfrp_core::wire::{
-    read_frame, write_frame, ClientMsg, Login, ProxySpec, ServerMsg, StartWork, PROTOCOL_VERSION,
+    read_frame, write_frame, ClientMsg, ConfigSet, Login, ManagedProxy, ProxySpec, ServerMsg,
+    StartWork, PROTOCOL_VERSION,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::log::Logger;
+
+/// 装箱的异步返回值。
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// 代理运行状态变化（受管模式下回报给 Controller）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyState {
+    /// 已在该端口监听。
+    Running(u16),
+    /// 启动失败。
+    Failed(String),
+    /// 已停止（被移除或客户端断开）。
+    Stopped,
+}
+
+/// 一条代理状态事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEvent {
+    /// 设备 ID。
+    pub client_id: String,
+    /// 代理名。
+    pub name: String,
+    /// 新状态。
+    pub state: ProxyState,
+}
+
+/// 受管客户端的准入结果。
+pub struct Managed {
+    /// 设备 ID。
+    pub client_id: String,
+    /// 本次是否刚完成接入（需要把 `client_id` 告诉客户端）。
+    pub just_enrolled: bool,
+    /// 配置通道：每次变更都会收到最新的一整份配置。
+    pub config: watch::Receiver<Arc<ConfigSet>>,
+    /// 代理状态事件回报。
+    pub events: mpsc::Sender<ProxyEvent>,
+    /// 存活凭据：会话结束时被丢弃（Controller 据此把设备标为离线）。
+    pub guard: Box<dyn Any + Send>,
+}
+
+/// 登录准入结果。
+pub enum Admission {
+    /// 独立模式：客户端自己注册代理。
+    Standalone,
+    /// 受管模式。
+    Managed(Managed),
+}
+
+/// 登录策略。
+pub trait Policy: Send + Sync + 'static {
+    /// 判断是否放行该登录；`Err` 的内容会原样返回给客户端。
+    fn login<'a>(&'a self, login: &'a Login) -> BoxFut<'a, Result<Admission, String>>;
+}
+
+/// 与 frps 一致的令牌策略；令牌为空表示不校验。
+pub struct TokenPolicy {
+    /// 令牌。
+    pub token: String,
+}
+
+impl Policy for TokenPolicy {
+    fn login<'a>(&'a self, login: &'a Login) -> BoxFut<'a, Result<Admission, String>> {
+        Box::pin(async move {
+            if !self.token.is_empty()
+                && !auth::verify(&self.token, login.timestamp, &login.auth, auth::unix_now())
+            {
+                return Err("token in login doesn't match token from configuration".into());
+            }
+            Ok(Admission::Standalone)
+        })
+    }
+}
 
 /// 边缘节点运行参数。
 #[derive(Debug, Clone)]
@@ -98,14 +178,28 @@ pub struct Edge {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     cfg: Arc<EdgeConfig>,
+    policy: Arc<dyn Policy>,
     log: Logger,
 }
 
 impl Edge {
-    /// 绑定监听端口。`identity` 为空时生成自签名证书。
+    /// 绑定监听端口（独立模式，令牌取自 `cfg.token`）。`identity` 为空时生成自签名证书。
     pub async fn bind(
         cfg: EdgeConfig,
         identity: Option<Identity>,
+        log: Logger,
+    ) -> Result<Edge, TunnelError> {
+        let policy = Arc::new(TokenPolicy {
+            token: cfg.token.clone(),
+        });
+        Self::bind_with_policy(cfg, identity, policy, log).await
+    }
+
+    /// 绑定监听端口并使用自定义登录策略。
+    pub async fn bind_with_policy(
+        cfg: EdgeConfig,
+        identity: Option<Identity>,
+        policy: Arc<dyn Policy>,
         log: Logger,
     ) -> Result<Edge, TunnelError> {
         let id = match identity {
@@ -118,6 +212,7 @@ impl Edge {
             listener,
             acceptor,
             cfg: Arc::new(cfg),
+            policy,
             log,
         })
     }
@@ -138,6 +233,7 @@ impl Edge {
                     let ctx = ClientCtx {
                         cfg: self.cfg.clone(),
                         acceptor: self.acceptor.clone(),
+                        policy: self.policy.clone(),
                         names: names.clone(),
                         log: self.log.clone(),
                         cancel: shutdown.child_token(),
@@ -157,6 +253,7 @@ impl Edge {
 struct ClientCtx {
     cfg: Arc<EdgeConfig>,
     acceptor: TlsAcceptor,
+    policy: Arc<dyn Policy>,
     names: Arc<Names>,
     log: Logger,
     cancel: CancellationToken,
@@ -165,7 +262,7 @@ struct ClientCtx {
 async fn within<T>(
     d: Duration,
     what: &'static str,
-    f: impl std::future::Future<Output = Result<T, TunnelError>>,
+    f: impl Future<Output = Result<T, TunnelError>>,
 ) -> Result<T, TunnelError> {
     timeout(d, f)
         .await
@@ -191,18 +288,6 @@ async fn handle_client(tcp: TcpStream, ctx: ClientCtx) -> Result<(), TunnelError
     result
 }
 
-fn login_error(login: &Login, cfg: &EdgeConfig) -> Option<String> {
-    if login.version != PROTOCOL_VERSION {
-        return Some(format!("unsupported protocol version {}", login.version));
-    }
-    if !cfg.token.is_empty()
-        && !auth::verify(&cfg.token, login.timestamp, &login.auth, auth::unix_now())
-    {
-        return Some("token in login doesn't match token from configuration".into());
-    }
-    None
-}
-
 async fn control_loop(
     session: &Session,
     inbound: &mut mpsc::Receiver<Stream>,
@@ -217,25 +302,45 @@ async fn control_loop(
     let ClientMsg::Login(login) = first else {
         return Err(TunnelError::Wire("expected login".into()));
     };
-    if let Some(error) = login_error(&login, &ctx.cfg) {
-        write_frame(
-            &mut wr,
-            &ServerMsg::LoginResp {
-                ok: false,
-                error: error.clone(),
-                run_id: String::new(),
-            },
-        )
-        .await?;
-        return Err(TunnelError::Auth(error));
-    }
+    let admission = if login.version != PROTOCOL_VERSION {
+        Err(format!("unsupported protocol version {}", login.version))
+    } else {
+        ctx.policy.login(&login).await
+    };
+    let reject = |error: String| ServerMsg::LoginResp {
+        ok: false,
+        error,
+        run_id: String::new(),
+        client_id: String::new(),
+        managed: false,
+    };
+    let admission = match admission {
+        Ok(a) => a,
+        Err(error) => {
+            write_frame(&mut wr, &reject(error.clone())).await?;
+            return Err(TunnelError::Auth(error));
+        }
+    };
     let run_id = random_id();
+    let (client_id, managed) = match &admission {
+        Admission::Standalone => (String::new(), false),
+        Admission::Managed(m) => (
+            if m.just_enrolled {
+                m.client_id.clone()
+            } else {
+                String::new()
+            },
+            true,
+        ),
+    };
     write_frame(
         &mut wr,
         &ServerMsg::LoginResp {
             ok: true,
             error: String::new(),
             run_id: run_id.clone(),
+            client_id,
+            managed,
         },
     )
     .await?;
@@ -244,48 +349,242 @@ async fn control_loop(
         login.client_id
     ));
 
+    let reader = spawn_reader(rd);
+    match admission {
+        Admission::Standalone => serve_standalone(session, reader, &mut wr, ctx).await,
+        Admission::Managed(m) => serve_managed(session, reader, &mut wr, ctx, m).await,
+    }
+}
+
+type Reader = mpsc::Receiver<Result<ClientMsg, TunnelError>>;
+
+/// 读帧不是取消安全的，所以放到独立任务里，主循环只看通道。
+fn spawn_reader(mut rd: ReadHalf<Stream>) -> Reader {
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            let m = read_frame::<_, ClientMsg>(&mut rd).await;
+            let stop = m.is_err();
+            if tx.send(m).await.is_err() || stop {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// 取下一条控制消息，带心跳超时。通道关闭视为连接结束。
+async fn next_msg(reader: &mut Reader, ctx: &ClientCtx) -> Result<ClientMsg, TunnelError> {
+    match timeout(ctx.cfg.heartbeat_timeout, reader.recv()).await {
+        Err(_) => Err(TunnelError::Timeout("heartbeat")),
+        Ok(None) => Err(TunnelError::Closed),
+        Ok(Some(m)) => m,
+    }
+}
+
+async fn serve_standalone(
+    session: &Session,
+    mut reader: Reader,
+    wr: &mut WriteHalf<Stream>,
+    ctx: &ClientCtx,
+) -> Result<(), TunnelError> {
     let mut owned: Vec<String> = Vec::new();
-    let result = serve_control(session, &mut rd, &mut wr, ctx, &mut owned).await;
+    let result = async {
+        loop {
+            let msg = tokio::select! {
+                _ = ctx.cancel.cancelled() => return Ok(()),
+                m = next_msg(&mut reader, ctx) => m?,
+            };
+            match msg {
+                ClientMsg::Ping => write_frame(wr, &ServerMsg::Pong).await?,
+                ClientMsg::NewProxy(spec) => {
+                    let resp = match start_proxy(session, &spec, ctx, &mut owned).await {
+                        Ok(port) => ServerMsg::NewProxyResp {
+                            name: spec.name,
+                            remote_port: port,
+                            error: String::new(),
+                        },
+                        Err(error) => {
+                            ctx.log
+                                .warn(&format!("proxy [{}] rejected: {error}", spec.name));
+                            ServerMsg::NewProxyResp {
+                                name: spec.name,
+                                remote_port: 0,
+                                error,
+                            }
+                        }
+                    };
+                    write_frame(wr, &resp).await?;
+                }
+                ClientMsg::Applied { .. } => {}
+                ClientMsg::Login(_) => return Err(TunnelError::Wire("duplicate login".into())),
+            }
+        }
+    }
+    .await;
     for name in &owned {
         ctx.names.release(name);
     }
     result
 }
 
-async fn serve_control(
+/// 受管代理的运行记录。
+struct Running {
+    spec: ManagedProxy,
+    stop: CancellationToken,
+}
+
+async fn serve_managed(
     session: &Session,
-    rd: &mut ReadHalf<Stream>,
+    mut reader: Reader,
     wr: &mut WriteHalf<Stream>,
     ctx: &ClientCtx,
-    owned: &mut Vec<String>,
+    m: Managed,
 ) -> Result<(), TunnelError> {
-    loop {
-        let msg: ClientMsg = tokio::select! {
-            _ = ctx.cancel.cancelled() => return Ok(()),
-            m = within(ctx.cfg.heartbeat_timeout, "heartbeat", read_frame(rd)) => m?,
-        };
-        match msg {
-            ClientMsg::Ping => write_frame(wr, &ServerMsg::Pong).await?,
-            ClientMsg::NewProxy(spec) => {
-                let resp = match start_proxy(session, &spec, ctx, owned).await {
-                    Ok(port) => ServerMsg::NewProxyResp {
-                        name: spec.name,
-                        remote_port: port,
-                        error: String::new(),
-                    },
-                    Err(error) => {
-                        ctx.log
-                            .warn(&format!("proxy [{}] rejected: {error}", spec.name));
-                        ServerMsg::NewProxyResp {
-                            name: spec.name,
-                            remote_port: 0,
-                            error,
-                        }
+    let Managed {
+        client_id,
+        config,
+        events,
+        guard,
+        ..
+    } = m;
+    let mut config = config;
+    let mut running: HashMap<String, Running> = HashMap::new();
+    let emit = |name: &str, state: ProxyState| {
+        let _ = events.try_send(ProxyEvent {
+            client_id: client_id.clone(),
+            name: name.to_string(),
+            state,
+        });
+    };
+
+    let result = async {
+        // 先应用并下发当前配置，之后每次变更都重新对账。
+        let mut current = config.borrow_and_update().clone();
+        loop {
+            reconcile(session, &current, &mut running, ctx, &emit).await;
+            write_frame(wr, &ServerMsg::Config((*current).clone())).await?;
+            loop {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Ok(()),
+                    changed = config.changed() => {
+                        changed.map_err(|_| TunnelError::Closed)?;
+                        current = config.borrow_and_update().clone();
+                        break;
                     }
-                };
-                write_frame(wr, &resp).await?;
+                    msg = next_msg(&mut reader, ctx) => match msg? {
+                        ClientMsg::Ping => write_frame(wr, &ServerMsg::Pong).await?,
+                        ClientMsg::Applied { revision } => ctx.log.debug(&format!("client [{client_id}] applied revision {revision}")),
+                        ClientMsg::NewProxy(_) | ClientMsg::Login(_) => {
+                            return Err(TunnelError::Wire("unexpected message for a managed client".into()));
+                        }
+                    },
+                }
             }
-            ClientMsg::Login(_) => return Err(TunnelError::Wire("duplicate login".into())),
+        }
+    }
+    .await;
+
+    for (name, r) in running.drain() {
+        r.stop.cancel();
+        ctx.names.release(&name);
+        emit(&name, ProxyState::Stopped);
+    }
+    drop(guard);
+    result
+}
+
+/// 让实际运行的代理与期望配置一致：停掉多余 / 已变更的，启动新增 / 已变更的。
+async fn reconcile(
+    session: &Session,
+    desired: &ConfigSet,
+    running: &mut HashMap<String, Running>,
+    ctx: &ClientCtx,
+    emit: &impl Fn(&str, ProxyState),
+) {
+    let wanted: HashMap<&str, &ManagedProxy> = desired
+        .proxies
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+    let stale: Vec<String> = running
+        .iter()
+        .filter(|(name, r)| {
+            wanted
+                .get(name.as_str())
+                .is_none_or(|w| !same_listener(&r.spec, w))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in stale {
+        if let Some(r) = running.remove(&name) {
+            r.stop.cancel();
+            ctx.names.release(&name);
+            emit(&name, ProxyState::Stopped);
+        }
+    }
+    for p in &desired.proxies {
+        if let Some(r) = running.get_mut(&p.name) {
+            // 只有本地目标变化时无需重启监听，由客户端侧更新映射即可。
+            r.spec = p.clone();
+            continue;
+        }
+        match start_managed(session, p, ctx).await {
+            Ok((port, stop)) => {
+                running.insert(
+                    p.name.clone(),
+                    Running {
+                        spec: p.clone(),
+                        stop,
+                    },
+                );
+                emit(&p.name, ProxyState::Running(port));
+            }
+            Err(e) => {
+                ctx.log.warn(&format!("proxy [{}] failed: {e}", p.name));
+                emit(&p.name, ProxyState::Failed(e));
+            }
+        }
+    }
+}
+
+fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
+    a.kind == b.kind && a.remote_port == b.remote_port
+}
+
+async fn start_managed(
+    session: &Session,
+    p: &ManagedProxy,
+    ctx: &ClientCtx,
+) -> Result<(u16, CancellationToken), String> {
+    if p.kind != "tcp" {
+        return Err(format!("proxy type [{}] is not supported yet", p.kind));
+    }
+    if !ctx.names.claim(&p.name) {
+        return Err(format!("proxy [{}] already exists", p.name));
+    }
+    match bind_proxy_port(p.remote_port, &ctx.cfg).await {
+        Ok((listener, port)) => {
+            let stop = ctx.cancel.child_token();
+            let sub = ClientCtx {
+                cancel: stop.clone(),
+                ..ctx.clone()
+            };
+            tokio::spawn(accept_visitors(
+                listener,
+                p.name.clone(),
+                session.clone(),
+                sub,
+            ));
+            ctx.log.info(&format!(
+                "proxy [{}] start, listening on port {port}",
+                p.name
+            ));
+            Ok((port, stop))
+        }
+        Err(e) => {
+            ctx.names.release(&p.name);
+            Err(e)
         }
     }
 }

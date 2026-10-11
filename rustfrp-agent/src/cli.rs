@@ -1,6 +1,8 @@
 //! 命令行解析：兼容 frp 的 `-c` / `--strict_config` / `--allow-unsafe` / `verify`，
 //! 并识别被命名为 `frpc` / `frps` 的可执行文件（argv[0]）。
 
+use crate::managed::ManagedOpts;
+
 /// 运行角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -28,8 +30,10 @@ pub enum Command {
 pub struct Options {
     /// 角色。
     pub mode: Mode,
-    /// 配置文件路径。
+    /// 配置文件路径（受管模式下为空）。
     pub config: String,
+    /// 受管模式参数（`--controller`）；与 `-c` 二选一。
+    pub managed: Option<ManagedOpts>,
     /// 严格模式（frp 默认开启）。
     pub strict: bool,
     /// 放行的不安全特性。
@@ -42,6 +46,7 @@ rustfrp-agent — frp-compatible tunnel agent (client / edge)
 
 USAGE:
   rustfrp-agent --mode <client|edge> -c <config> [options]
+  rustfrp-agent --mode client --controller <host[:port]> --enroll-token <token> [--name <n>]
   rustfrp-agent verify --mode <client|edge> -c <config>
   frpc -c <config>        (when the binary is named frpc)
   frps -c <config>        (when the binary is named frps)
@@ -51,6 +56,11 @@ OPTIONS:
       --mode <client|edge>     role (implied by the binary name frpc / frps)
       --strict_config[=bool]   reject unknown fields (default: true)
       --allow-unsafe <a,b>     allow unsafe features, e.g. TokenSourceExec
+      --controller <host[:port]>  managed mode: connect to a RustFRP controller (default port 7000)
+      --enroll-token <token>   one-time token from the panel (first run only)
+      --name <name>            device name shown in the panel (default: host name)
+      --state-dir <dir>        where the device identity is stored (default: ~/.rustfrp)
+      --ca-file <pem>          verify the controller certificate against this CA
   -v, --version                print version
   -h, --help                   print this help
 ";
@@ -68,6 +78,13 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         _ => None,
     };
     let (mut config, mut strict, mut allow_unsafe) = (None::<String>, true, Vec::<String>::new());
+    let (mut controller, mut token, mut name, mut state_dir, mut ca_file) = (
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+    );
     let (mut verify, mut version, mut help) = (false, false, false);
 
     let mut it = args.iter();
@@ -108,6 +125,11 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
                     }
                 }
             }
+            "--controller" => controller = Some(value(key)?),
+            "--enroll-token" => token = Some(value(key)?),
+            "--name" => name = Some(value(key)?),
+            "--state-dir" => state_dir = Some(value(key)?),
+            "--ca-file" => ca_file = Some(value(key)?),
             "--allow-unsafe" => allow_unsafe.extend(
                 value(key)?
                     .split(',')
@@ -124,10 +146,33 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         return Ok(Command::Version);
     }
     let mode = mode.ok_or("missing --mode <client|edge> (or run as frpc / frps)")?;
-    let config = config.ok_or("missing -c <config>")?;
+    let managed = match controller {
+        Some(controller) => {
+            if mode != Mode::Client {
+                return Err("--controller is only valid with --mode client".into());
+            }
+            if config.is_some() {
+                return Err("--controller and -c cannot be combined".into());
+            }
+            Some(ManagedOpts {
+                controller,
+                enroll_token: token,
+                name,
+                state_dir,
+                ca_file,
+            })
+        }
+        None => None,
+    };
+    let config = match (&managed, config) {
+        (Some(_), _) => String::new(),
+        (None, Some(c)) => c,
+        (None, None) => return Err("missing -c <config>".into()),
+    };
     let opts = Options {
         mode,
         config,
+        managed,
         strict,
         allow_unsafe,
     };
@@ -154,6 +199,7 @@ mod tests {
         Options {
             mode,
             config: "a.toml".into(),
+            managed: None,
             strict,
             allow_unsafe: unsafe_.iter().map(|s| s.to_string()).collect(),
         }
@@ -218,6 +264,53 @@ mod tests {
         assert_eq!(p("x", &["-h"]), Ok(Command::Help));
         assert_eq!(p("x", &["help", "-v"]), Ok(Command::Help));
         assert!(HELP.contains("USAGE"));
+    }
+
+    #[test]
+    fn managed_mode() {
+        let got = p(
+            "rustfrp-agent",
+            &[
+                "--mode",
+                "client",
+                "--controller",
+                "h:7100",
+                "--enroll-token",
+                "t",
+                "--name",
+                "n",
+                "--state-dir",
+                "/s",
+                "--ca-file",
+                "/c.pem",
+            ],
+        )
+        .unwrap();
+        let Command::Run(o) = got else { panic!() };
+        assert_eq!(o.config, "");
+        assert_eq!(
+            o.managed,
+            Some(ManagedOpts {
+                controller: "h:7100".into(),
+                enroll_token: Some("t".into()),
+                name: Some("n".into()),
+                state_dir: Some("/s".into()),
+                ca_file: Some("/c.pem".into())
+            })
+        );
+        let Command::Run(o) = p("x", &["--mode", "client", "--controller", "h"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.managed.unwrap().enroll_token, None);
+        assert!(p("x", &["--mode", "edge", "--controller", "h"])
+            .unwrap_err()
+            .contains("only valid with --mode client"));
+        assert!(p(
+            "x",
+            &["--mode", "client", "--controller", "h", "-c", "a.toml"]
+        )
+        .unwrap_err()
+        .contains("cannot be combined"));
     }
 
     #[test]

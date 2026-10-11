@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--name", default="default")
     ap.add_argument("--baseline", default="tools/cov/baseline.json")
     ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument("--rebaseline", action="store_true", help="重设基线：仍须满足门槛，但忽略「低于旧基线」（新增模块时在同一提交里使用，并在提交信息说明原因）")
     ap.add_argument("--list-gaps", action="store_true")
     a = ap.parse_args()
 
@@ -68,7 +69,7 @@ def main():
     prev = base.get(a.name, {})
     for k, v in cur.items():
         p = prev.get(k)
-        if v is not None and p is not None and v + 0.05 < p:
+        if not a.rebaseline and v is not None and p is not None and v + 0.05 < p:
             failed.append(f"{k} 低于基线：{v:.2f}% < {p:.2f}%")
 
     if a.update_baseline and not failed:

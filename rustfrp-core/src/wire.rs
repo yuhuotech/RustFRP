@@ -28,6 +28,53 @@ pub struct Login {
     /// 元数据。
     #[serde(default)]
     pub metas: BTreeMap<String, String>,
+    /// 接入请求：首次由 Controller 签发身份时携带（此时 `client_id` / `auth` 为空）。
+    #[serde(default)]
+    pub enroll: Option<Enroll>,
+}
+
+/// 接入请求：用一次性令牌换取设备身份。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enroll {
+    /// 一次性接入令牌。
+    pub token: String,
+    /// 设备名。
+    pub name: String,
+    /// 设备公钥（十六进制 Ed25519）。
+    pub pubkey: String,
+    /// 操作系统。
+    #[serde(default)]
+    pub os: String,
+    /// CPU 架构。
+    #[serde(default)]
+    pub arch: String,
+    /// Agent 版本。
+    #[serde(default)]
+    pub version: String,
+}
+
+/// 受管代理：Controller 下发给 Edge 与 Client 的完整定义。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProxy {
+    /// 代理名。
+    pub name: String,
+    /// `tcp`。
+    pub kind: String,
+    /// 远程端口，0 = 自动分配。
+    pub remote_port: u16,
+    /// 本地目标主机。
+    pub local_ip: String,
+    /// 本地目标端口。
+    pub local_port: u16,
+}
+
+/// 一版受管配置（全量快照；幂等，可重复下发）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConfigSet {
+    /// 单调递增的版本号。
+    pub revision: u64,
+    /// 全部代理。
+    pub proxies: Vec<ManagedProxy>,
 }
 
 /// 代理注册信息。
@@ -51,6 +98,11 @@ pub enum ClientMsg {
     NewProxy(ProxySpec),
     /// 心跳。
     Ping,
+    /// 已应用某版受管配置。
+    Applied {
+        /// 版本号。
+        revision: u64,
+    },
 }
 
 /// Edge → Client。
@@ -65,7 +117,15 @@ pub enum ServerMsg {
         error: String,
         /// 本次会话标识。
         run_id: String,
+        /// 接入成功时由 Controller 签发的设备 ID（其余情况为空）。
+        #[serde(default)]
+        client_id: String,
+        /// 为 true 表示由 Controller 管理：随后会下发 `Config`，客户端不需要自己注册代理。
+        #[serde(default)]
+        managed: bool,
     },
+    /// 下发受管配置。
+    Config(ConfigSet),
     /// 代理注册结果。
     NewProxyResp {
         /// 代理名。
@@ -138,6 +198,7 @@ mod tests {
             timestamp: 1,
             auth: "a".into(),
             metas: BTreeMap::new(),
+            enroll: None,
         }
     }
 
@@ -152,6 +213,18 @@ mod tests {
                 remote_port: 6000,
             }),
             ClientMsg::Ping,
+            ClientMsg::Applied { revision: 7 },
+            ClientMsg::Login(Login {
+                enroll: Some(Enroll {
+                    token: "t".into(),
+                    name: "laptop".into(),
+                    pubkey: "ab".into(),
+                    os: "macos".into(),
+                    arch: "arm64".into(),
+                    version: "0.1".into(),
+                }),
+                ..login()
+            }),
         ];
         for m in &c {
             write_frame(&mut a, m).await.unwrap();
@@ -162,12 +235,24 @@ mod tests {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: "c1".into(),
+                managed: true,
             },
             ServerMsg::NewProxyResp {
                 name: "n".into(),
                 remote_port: 1,
                 error: String::new(),
             },
+            ServerMsg::Config(ConfigSet {
+                revision: 7,
+                proxies: vec![ManagedProxy {
+                    name: "web".into(),
+                    kind: "tcp".into(),
+                    remote_port: 6000,
+                    local_ip: "127.0.0.1".into(),
+                    local_port: 80,
+                }],
+            }),
             ServerMsg::Pong,
         ];
         for m in &s {
@@ -180,6 +265,23 @@ mod tests {
         };
         write_frame(&mut a, &w).await.unwrap();
         assert_eq!(read_frame::<_, StartWork>(&mut b).await.unwrap(), w);
+    }
+
+    #[test]
+    fn old_peers_without_new_fields_still_parse() {
+        let login: ClientMsg = serde_json::from_str(
+            r#"{"t":"login","version":1,"user":"","client_id":"c","timestamp":1,"auth":"a"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            login,
+            ClientMsg::Login(Login { enroll: None, .. })
+        ));
+        let resp: ServerMsg =
+            serde_json::from_str(r#"{"t":"login_resp","ok":true,"error":"","run_id":"r"}"#)
+                .unwrap();
+        assert!(matches!(resp, ServerMsg::LoginResp { managed: false, .. }));
+        assert_eq!(ConfigSet::default().revision, 0);
     }
 
     #[tokio::test]

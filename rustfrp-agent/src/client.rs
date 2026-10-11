@@ -1,16 +1,18 @@
 //! 客户端（frpc 角色）：连接边缘节点，注册代理，并把到来的流转发给本地服务。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rustfrp_core::auth::{auth_key, random_id, unix_now};
 use rustfrp_core::error::TunnelError;
+use rustfrp_core::identity::DeviceKey;
 use rustfrp_core::mux::{self, MuxConfig, Session, Stream};
 use rustfrp_core::pipe;
 use rustfrp_core::tls;
 use rustfrp_core::wire::{
-    read_frame, write_frame, ClientMsg, Login, ProxySpec, ServerMsg, StartWork, PROTOCOL_VERSION,
+    read_frame, write_frame, ClientMsg, Enroll, Login, ProxySpec, ServerMsg, StartWork,
+    PROTOCOL_VERSION,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
@@ -34,6 +36,32 @@ pub struct ProxyCfg {
     pub local_port: u16,
     /// 请求的远程端口，0 = 由服务端分配。
     pub remote_port: u16,
+}
+
+/// 首次接入所需信息。
+#[derive(Debug, Clone)]
+pub struct EnrollInfo {
+    /// 一次性接入令牌。
+    pub token: String,
+    /// 设备名。
+    pub name: String,
+    /// 操作系统。
+    pub os: String,
+    /// CPU 架构。
+    pub arch: String,
+    /// Agent 版本。
+    pub version: String,
+}
+
+/// 受管模式：由 Controller 签发身份并下发配置。
+#[derive(Debug, Clone)]
+pub struct ManagedCfg {
+    /// 设备密钥。
+    pub key: Arc<DeviceKey>,
+    /// 已签发的设备 ID；为空表示尚未接入，必须提供 `enroll`。
+    pub client_id: Option<String>,
+    /// 首次接入信息。
+    pub enroll: Option<EnrollInfo>,
 }
 
 /// 客户端运行参数。
@@ -69,6 +97,8 @@ pub struct ClientConfig {
     pub backoff: (Duration, Duration),
     /// 多路复用参数。
     pub mux: MuxConfig,
+    /// 受管模式（`None` 为独立模式，等价 frpc）。
+    pub managed: Option<ManagedCfg>,
 }
 
 impl Default for ClientConfig {
@@ -89,6 +119,7 @@ impl Default for ClientConfig {
             local_dial_timeout: Duration::from_secs(5),
             backoff: (Duration::from_secs(1), Duration::from_secs(30)),
             mux: MuxConfig::default(),
+            managed: None,
         }
     }
 }
@@ -111,6 +142,18 @@ pub enum Event {
         name: String,
         /// 原因。
         error: String,
+    },
+    /// 接入成功：Controller 签发了设备 ID，调用方应把它与密钥一起持久化。
+    Enrolled {
+        /// 设备 ID。
+        client_id: String,
+    },
+    /// 已应用一版受管配置。
+    ConfigApplied {
+        /// 版本号。
+        revision: u64,
+        /// 代理数量。
+        proxies: usize,
     },
     /// 连接断开（随后会重连）。
     Disconnected(String),
@@ -152,11 +195,13 @@ pub async fn run(
     let connector = build_connector(&cfg)?;
     let cfg = Arc::new(cfg);
     let mut delay = cfg.backoff.0;
+    // 接入成功后由服务端签发的设备 ID：此后重连改用签名登录，不再使用（已作废的）一次性令牌。
+    let issued: Issued = Arc::default();
     let mut ever_logged_in = false;
     loop {
         let end = tokio::select! {
             _ = cancel.cancelled() => SessionEnd::Cancelled,
-            end = session_once(&cfg, &connector, &log, &events, &cancel) => end,
+            end = session_once(&cfg, &connector, &log, &events, &cancel, &issued) => end,
         };
         match end {
             SessionEnd::Cancelled => return Ok(()),
@@ -204,12 +249,15 @@ async fn within<T>(
         .map_err(|_| TunnelError::Timeout(what))?
 }
 
+type Issued = Arc<Mutex<Option<String>>>;
+
 async fn session_once(
     cfg: &Arc<ClientConfig>,
     connector: &TlsConnector,
     log: &Logger,
     events: &Option<mpsc::Sender<Event>>,
     cancel: &CancellationToken,
+    issued: &Issued,
 ) -> SessionEnd {
     let lost = |reason: String| SessionEnd::Lost {
         reason,
@@ -236,31 +284,62 @@ async fn session_once(
         Err(e) => return lost(e.to_string()),
     };
     let (session, mut inbound, driver) = mux::spawn(tls, false, cfg.mux);
-    let end = talk(cfg, &session, &mut inbound, log, events, cancel).await;
+    let end = talk(cfg, &session, &mut inbound, log, events, cancel, issued).await;
     driver.abort();
     end
 }
 
-fn login_msg(cfg: &ClientConfig) -> ClientMsg {
+fn login_msg(cfg: &ClientConfig, issued: &Issued) -> ClientMsg {
     let ts = unix_now();
-    let client_id = if cfg.client_id.is_empty() {
-        random_id()
-    } else {
-        cfg.client_id.clone()
-    };
-    ClientMsg::Login(Login {
+    let mut login = Login {
         version: PROTOCOL_VERSION,
         user: cfg.user.clone(),
-        client_id,
+        client_id: String::new(),
         timestamp: ts,
-        auth: if cfg.token.is_empty() {
-            String::new()
-        } else {
-            auth_key(&cfg.token, ts)
-        },
+        auth: String::new(),
         metas: Default::default(),
-    })
+        enroll: None,
+    };
+    match &cfg.managed {
+        None => {
+            login.client_id = if cfg.client_id.is_empty() {
+                random_id()
+            } else {
+                cfg.client_id.clone()
+            };
+            if !cfg.token.is_empty() {
+                login.auth = auth_key(&cfg.token, ts);
+            }
+        }
+        Some(m) => match (
+            &m.client_id.clone().or_else(|| {
+                issued
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }),
+            &m.enroll,
+        ) {
+            (Some(id), _) => {
+                login.client_id = id.clone();
+                login.auth = m.key.sign_login(id, ts);
+            }
+            (None, info) => {
+                login.enroll = info.as_ref().map(|i| Enroll {
+                    token: i.token.clone(),
+                    name: i.name.clone(),
+                    pubkey: m.key.public_hex(),
+                    os: i.os.clone(),
+                    arch: i.arch.clone(),
+                    version: i.version.clone(),
+                });
+            }
+        },
+    }
+    ClientMsg::Login(login)
 }
+
+type Locals = Arc<Mutex<HashMap<String, (String, u16)>>>;
 
 async fn talk(
     cfg: &Arc<ClientConfig>,
@@ -269,6 +348,7 @@ async fn talk(
     log: &Logger,
     events: &Option<mpsc::Sender<Event>>,
     cancel: &CancellationToken,
+    issued: &Issued,
 ) -> SessionEnd {
     let lost = |reason: String, logged_in: bool| SessionEnd::Lost { reason, logged_in };
     let ctrl = match session.open().await {
@@ -276,10 +356,10 @@ async fn talk(
         Err(e) => return lost(e.to_string(), false),
     };
     let (mut rd, mut wr) = tokio::io::split(ctrl);
-    if let Err(e) = write_frame(&mut wr, &login_msg(cfg)).await {
+    if let Err(e) = write_frame(&mut wr, &login_msg(cfg, issued)).await {
         return lost(e.to_string(), false);
     }
-    match within(
+    let managed = match within(
         cfg.handshake_timeout,
         "login response",
         read_frame::<_, ServerMsg>(&mut rd),
@@ -287,17 +367,29 @@ async fn talk(
     .await
     {
         Ok(ServerMsg::LoginResp {
-            ok: true, run_id, ..
-        }) => log.info(&format!("login to server success, run id [{run_id}]")),
+            ok: true,
+            run_id,
+            client_id,
+            managed,
+            ..
+        }) => {
+            log.info(&format!("login to server success, run id [{run_id}]"));
+            if !client_id.is_empty() {
+                *issued.lock().unwrap_or_else(PoisonError::into_inner) = Some(client_id.clone());
+                emit(events, Event::Enrolled { client_id });
+            }
+            managed
+        }
         Ok(ServerMsg::LoginResp { error, .. }) => return SessionEnd::Rejected(error),
         Ok(_) => return lost("unexpected message in login".into(), false),
         Err(e) => return lost(e.to_string(), false),
-    }
+    };
     emit(events, Event::Connected);
 
-    // 注册全部代理（顺序进行，逐个读应答）。
-    let mut locals: HashMap<String, (String, u16)> = HashMap::new();
-    for p in &cfg.proxies {
+    // 独立模式：注册全部代理（顺序进行，逐个读应答）。受管模式由服务端下发配置，这里不注册。
+    let locals: Locals = Arc::default();
+    let own_proxies: &[ProxyCfg] = if managed { &[] } else { &cfg.proxies };
+    for p in own_proxies {
         let spec = ProxySpec {
             name: p.name.clone(),
             kind: p.kind.clone(),
@@ -318,7 +410,10 @@ async fn talk(
                 remote_port,
                 error,
             }) if error.is_empty() => {
-                locals.insert(name.clone(), (p.local_ip.clone(), p.local_port));
+                locals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.clone(), (p.local_ip.clone(), p.local_port));
                 emit(events, Event::ProxyStarted { name, remote_port });
             }
             Ok(ServerMsg::NewProxyResp { name, error, .. }) => {
@@ -329,8 +424,6 @@ async fn talk(
             Err(e) => return lost(e.to_string(), true),
         }
     }
-    let locals = Arc::new(locals);
-
     // 控制流读取放到独立任务（读帧不是取消安全的），主循环只看通道。
     let (pong_tx, mut pong_rx) = mpsc::channel::<Result<ServerMsg, TunnelError>>(4);
     let reader = tokio::spawn(async move {
@@ -357,6 +450,14 @@ async fn talk(
             _ = tokio::time::sleep_until(deadline) => break lost("heartbeat timeout".into(), true),
             msg = pong_rx.recv() => match msg {
                 Some(Ok(ServerMsg::Pong)) => deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout,
+                Some(Ok(ServerMsg::Config(set))) => {
+                    let map = set.proxies.iter().map(|p| (p.name.clone(), (p.local_ip.clone(), p.local_port))).collect();
+                    *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
+                    emit(events, Event::ConfigApplied { revision: set.revision, proxies: set.proxies.len() });
+                    if let Err(e) = write_frame(&mut wr, &ClientMsg::Applied { revision: set.revision }).await {
+                        break lost(e.to_string(), true);
+                    }
+                }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break lost(e.to_string(), true),
                 None => break lost("control stream closed".into(), true),
@@ -380,19 +481,24 @@ async fn talk(
 
 async fn handle_work(
     mut stream: Stream,
-    locals: &HashMap<String, (String, u16)>,
+    locals: &Locals,
     cfg: &ClientConfig,
 ) -> Result<(), TunnelError> {
     let start: StartWork =
         within(cfg.handshake_timeout, "start work", read_frame(&mut stream)).await?;
-    let Some((host, port)) = locals.get(&start.proxy) else {
+    let target = locals
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&start.proxy)
+        .cloned();
+    let Some((host, port)) = target else {
         return Err(TunnelError::Wire(format!(
             "unknown proxy [{}]",
             start.proxy
         )));
     };
     let mut local = within(cfg.local_dial_timeout, "dial local service", async {
-        Ok(TcpStream::connect((host.as_str(), *port)).await?)
+        Ok(TcpStream::connect((host.as_str(), port)).await?)
     })
     .await?;
     let _ = local.set_nodelay(true);

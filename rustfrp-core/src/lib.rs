@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod error;
 pub mod frpcfg;
+pub mod identity;
 pub mod mux;
 pub mod pipe;
 pub mod tls;

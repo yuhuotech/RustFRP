@@ -1,12 +1,17 @@
 {
   "rustfrp-core": {
-    "lines": 99.12,
-    "functions": 97.03,
-    "branches": 98.04
+    "lines": 99.06,
+    "functions": 96.89,
+    "branches": 98.07
   },
   "rustfrp-agent": {
-    "lines": 98.6,
-    "functions": 97.03,
-    "branches": 91.07
+    "lines": 98.31,
+    "functions": 94.63,
+    "branches": 91.77
+  },
+  "rustfrp-server": {
+    "lines": 96.81,
+    "functions": 94.68,
+    "branches": 95.6
   }
 }

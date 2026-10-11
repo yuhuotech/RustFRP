@@ -75,6 +75,7 @@ fn login(version: u32) -> ClientMsg {
         timestamp: ts,
         auth: auth_key("", ts),
         metas: Default::default(),
+        enroll: None,
     })
 }
 
@@ -345,6 +346,8 @@ async fn client_handles_an_unexpected_reply_while_registering() {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -371,6 +374,8 @@ async fn client_notices_when_the_control_stream_ends() {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -397,6 +402,8 @@ async fn client_notices_when_the_server_closes_the_connection() {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -421,6 +428,8 @@ async fn client_times_out_when_pongs_never_arrive() {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -449,6 +458,8 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
                 ok: true,
                 error: String::new(),
                 run_id: "r".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -460,6 +471,8 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
                 ok: true,
                 error: String::new(),
                 run_id: "x".into(),
+                client_id: String::new(),
+                managed: false,
             },
         )
         .await
@@ -530,12 +543,16 @@ async fn login_rejection_after_a_successful_login_does_not_exit() {
                     ok: true,
                     error: String::new(),
                     run_id: "r".into(),
+                    client_id: String::new(),
+                    managed: false,
                 }
             } else {
                 ServerMsg::LoginResp {
                     ok: false,
                     error: "nope".into(),
                     run_id: String::new(),
+                    client_id: String::new(),
+                    managed: false,
                 }
             };
             write_frame(&mut ctrl, &resp).await.unwrap();
@@ -563,4 +580,29 @@ async fn login_rejection_after_a_successful_login_does_not_exit() {
     );
     cancel.cancel();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn standalone_edge_tolerates_applied_acks_and_a_closed_control_stream() {
+    let (port, stop) = start_edge(EdgeConfig::default()).await;
+    let mut r = raw_client(port).await;
+    expect_login_ok(&mut r).await;
+    write_frame(&mut r.ctrl, &ClientMsg::Applied { revision: 3 })
+        .await
+        .unwrap();
+    write_frame(&mut r.ctrl, &ClientMsg::Ping).await.unwrap();
+    assert_eq!(
+        timeout(T, read_frame::<_, ServerMsg>(&mut r.ctrl))
+            .await
+            .unwrap()
+            .unwrap(),
+        ServerMsg::Pong
+    );
+    // 客户端正常关闭控制流（而不是掉线）：边缘节点干净地结束该会话。
+    r.ctrl.shutdown().await.unwrap();
+    drop(r);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut again = raw_client(port).await;
+    expect_login_ok(&mut again).await;
+    stop.cancel();
 }

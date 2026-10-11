@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::{Command, Mode, Options, HELP};
 use crate::edge::Edge;
 use crate::log::{Level, Logger};
-use crate::{client, plan};
+use crate::{client, managed, plan};
 
 /// 程序版本。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -111,6 +111,9 @@ async fn run(
     err: &mut dyn Write,
     cancel: CancellationToken,
 ) -> i32 {
+    if let Some(m) = &o.managed {
+        return run_managed(m, fs, env, err, cancel).await;
+    }
     let opts = LoadOptions {
         strict: o.strict,
         fs,
@@ -171,6 +174,51 @@ async fn run(
     }
 }
 
+/// 受管客户端：身份来自状态目录，配置由 Controller 下发。
+async fn run_managed(
+    m: &managed::ManagedOpts,
+    fs: &dyn ConfigFs,
+    env: &dyn Env,
+    err: &mut dyn Write,
+    cancel: CancellationToken,
+) -> i32 {
+    let prepared = managed::state_dir(m, env).and_then(|dir| {
+        let id = managed::load_or_create(fs, &dir)?;
+        let cfg = managed::client_config(m, &id, fs, env)?;
+        Ok((dir, id, cfg))
+    });
+    let (dir, id, cfg) = match prepared {
+        Ok(v) => v,
+        Err(e) => return fail(err, "managed", e),
+    };
+    let log = Logger::new(Level::Info, Box::new(std::io::stderr()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let key = id.key.clone();
+    let persist = async {
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                client::Event::Enrolled { client_id } => {
+                    match managed::save(fs, &dir, &key, Some(&client_id)) {
+                        Ok(()) => log.info(&format!("enrolled as device [{client_id}]")),
+                        Err(e) => log.error(&e),
+                    }
+                }
+                client::Event::ConfigApplied { revision, proxies } => log.info(&format!(
+                    "applied config revision {revision} ({proxies} tunnels)"
+                )),
+                client::Event::Disconnected(r) => log.warn(&format!("disconnected: {r}")),
+                _ => {}
+            }
+        }
+    };
+    let run = client::run(cfg, log.clone(), Some(tx), cancel);
+    let (result, ()) = tokio::join!(run, persist);
+    match result {
+        Ok(()) => 0,
+        Err(e) => fail(err, "managed", e),
+    }
+}
+
 fn fail(err: &mut dyn Write, config: &str, e: impl std::fmt::Display) -> i32 {
     let _ = writeln!(err, "{config}: {e}");
     1
@@ -187,6 +235,7 @@ mod tests {
         Options {
             mode,
             config: config.into(),
+            managed: None,
             strict: true,
             allow_unsafe: vec![],
         }

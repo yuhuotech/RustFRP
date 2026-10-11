@@ -1,0 +1,32 @@
+[package]
+name = "rustfrp-server"
+description = "RustFRP controller: management API, SQLite store and embedded edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustfrp-server"
+path = "src/main.rs"
+
+[dependencies]
+rustfrp-core = { path = "../rustfrp-core" }
+rustfrp-agent = { path = "../rustfrp-agent" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+rusqlite.workspace = true
+argon2.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[lints]
+workspace = true
