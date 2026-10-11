@@ -32,12 +32,12 @@
 | SV-04/05 端口/域名、设备鉴权 | 部分完成 | 范围与冲突、设备停用删除、保留端口（`RUSTFRP_RESERVED_PORTS`，Edge/管理/vhost 监听端口自动保留）、单客户端隧道数上限（`RUSTFRP_MAX_TUNNELS_PER_CLIENT`，创建与配置导入同事务回滚）已有；连接速率、外置 Edge 鉴权缓存待补 |
 | SV-06 TLS | 部分完成 | 数据面 TLS1.3、CA 文件已有；正式 PEM 配置、默认自签名持久化、受管固定叶证书 SHA256、CA/指纹联合校验与安装命令/桌面透传正在验收；控制面 HTTPS 部署闭环仍待补 |
 | SV-07 限速 | 已实现 | `bandwidthLimit` / `bandwidthLimitMode`：令牌桶，每代理双向与全部连接共享；client / server 两种位置；tcp / http / https，udp 不支持（兼容报告提示）；Controller 存储/下发/导入导出/面板 KB/s 字段；端到端测试验证限速 |
-| SV-08 健康检查、负载均衡 | 未实现 | frp 字段有兼容报告，运行时未实现 |
+| SV-08 健康检查、负载均衡 | 已实现 | `healthCheck`（tcp / http 2xx，timeout / maxFailed / interval / path / httpHeaders）由客户端探测，状态变化经 `ClientMsg::Health` 通知 Edge；`loadBalancer.group/groupKey`：tcp 同组共用一个公网端口，http / https 同组同路径共用域名，在健康成员间轮转；组密钥 / 端口不一致被拒绝；受管模式下 Controller 存储 / 校验冲突 / 下发 / 导入导出 / 面板表单，不健康时隧道状态显示为异常 |
 | SV-09 Prometheus | 已实现待整体验收 | `RUSTFRP_METRICS_TOKEN`（≥16 字符）开启 `/metrics`，Bearer 认证（定时无关比较），默认不提供；指标：客户端/隧道/节点数、内置节点实时连接与字节、24h 流量、进程内存/CPU/运行时长 |
 | SV-10 备份恢复 | 已实现当前要求 | `backup <new-file>` 只读在线快照、完整性/旧版本/权限/不覆盖验证及停服恢复操作流程，见 BACKUP_AND_RETENTION.md；不提供覆盖运行中数据库的自动 restore |
 | SV-11 数据保留 | 部分完成 | 审计保留天数、会话/接入令牌到期、有索引的有界清理、事务审计/回滚/错误日志/取消已实现；流量分钟桶与采样游标已补 7 天保留、每轮每表最多 2048 行和事务审计；配置化与最终整体验收待补 |
 | TCP / UDP / HTTPS SNI | 已实现 | 独立与受管实际链路已测；进一步容量、性能和平台验收仍需完成 |
-| HTTP | 已实现待整体验收 | 逐请求（保持连接上每个请求）按域名/通配/子域 + 路径前缀（locations）+ routeByHTTPUser 选路，Basic Auth（Edge 校验，密码永不经 REST 返回）、Host 改写、requestHeaders.set、responseHeaders.set（逐响应改写，禁止改 Content-Length / Transfer-Encoding / Connection / Upgrade）、Upgrade 透传、请求走私防护、流水线响应保序；独立模式与受管模式（Controller 存储/下发/热更新/导入导出/面板表单）均已支持，真实全栈测试通过；PROXY protocol、限速与 responseHeaders 已实现；健康检查等仍未实现并在兼容报告中列出 |
+| HTTP | 已实现待整体验收 | 逐请求（保持连接上每个请求）按域名/通配/子域 + 路径前缀（locations）+ routeByHTTPUser 选路，Basic Auth（Edge 校验，密码永不经 REST 返回）、Host 改写、requestHeaders.set、responseHeaders.set（逐响应改写，禁止改 Content-Length / Transfer-Encoding / Connection / Upgrade）、Upgrade 透传、请求走私防护、流水线响应保序；独立模式与受管模式（Controller 存储/下发/热更新/导入导出/面板表单）均已支持，真实全栈测试通过；PROXY protocol、限速、responseHeaders、健康检查与负载均衡组已实现并在兼容报告中列出 |
 | STCP / SUDP / visitors / TCPMUX | 未实现 | 配置识别/报告不等于能力，尚缺运行时与端到端验收 |
 | 通用加密/压缩/插件 | 未实现（PROXY protocol 已实现） | 逐代理有提示；需对照上游字段与行为完成、加入兼容样例和内存基准 |
 | G8 配置兼容 / 导入导出 | 部分完成 | TOML/YAML/JSON、includes、环境模板、默认/校验/导出已有；INI convert 已接入 CLI、环境模板、includes 展开与兼容报告，正在做覆盖率/语法边界验收；reload、受管配置导入预览/摘要确认/事务应用和 TOML 导出 API 已接入并测试；仍缺面板导入向导与完整运行选项编辑；OIDC、webServer、httpPlugins 等配置的运行能力须逐字段补齐或明确报告 |

@@ -191,6 +191,65 @@ enum TunnelState {
 }
 
 @immutable
+/// 对本地服务的健康检查。
+class HealthCheck {
+  const HealthCheck({
+    required this.kind,
+    this.timeoutSecs = 3,
+    this.maxFailed = 1,
+    this.intervalSecs = 10,
+    this.path = '',
+    this.headers = const {},
+  });
+
+  /// `tcp` / `http`。
+  final String kind, path;
+  final int timeoutSecs, maxFailed, intervalSecs;
+  final Map<String, String> headers;
+
+  factory HealthCheck.fromJson(Map<String, dynamic> m) => HealthCheck(
+    kind: _str(m['kind']),
+    timeoutSecs: _int(m['timeout_secs']),
+    maxFailed: _int(m['max_failed']),
+    intervalSecs: _int(m['interval_secs']),
+    path: _str(m['path']),
+    headers: {
+      if (m['headers'] is Map)
+        for (final e in (m['headers'] as Map).entries)
+          if (e.key is String && e.value is String)
+            e.key as String: e.value as String,
+    },
+  );
+
+  Map<String, dynamic> toJson() => {
+    'kind': kind,
+    'timeout_secs': timeoutSecs,
+    'max_failed': maxFailed,
+    'interval_secs': intervalSecs,
+    'path': path,
+    'headers': headers,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is HealthCheck &&
+      other.kind == kind &&
+      other.path == path &&
+      other.timeoutSecs == timeoutSecs &&
+      other.maxFailed == maxFailed &&
+      other.intervalSecs == intervalSecs &&
+      mapEquals(other.headers, headers);
+  @override
+  int get hashCode => Object.hash(
+    kind,
+    path,
+    timeoutSecs,
+    maxFailed,
+    intervalSecs,
+    Object.hashAll(headers.entries.map((e) => Object.hash(e.key, e.value))),
+  );
+}
+
 class Tunnel {
   const Tunnel({
     required this.id,
@@ -218,7 +277,17 @@ class Tunnel {
     this.proxyProtocol = 0,
     this.bandwidthBps = 0,
     this.bandwidthServer = false,
+    this.lbGroup = '',
+    this.lbGroupKeySet = false,
+    this.healthCheck,
   });
+
+  /// 负载均衡组名（同组隧道共用端口 / 域名，连接在健康成员间轮转）；空 = 不入组。
+  final String lbGroup;
+
+  /// 是否设置了组密钥（密钥本身不由服务器返回）。
+  final bool lbGroupKeySet;
+  final HealthCheck? healthCheck;
 
   /// PROXY protocol 版本：0 = 不写，1 / 2 = v1 / v2。
   final int proxyProtocol;
@@ -286,6 +355,11 @@ class Tunnel {
       proxyProtocol: _int(m['proxy_protocol']),
       bandwidthBps: _int(m['bandwidth_bps']),
       bandwidthServer: m['bandwidth_server'] == true,
+      lbGroup: _str(m['lb_group']),
+      lbGroupKeySet: m['lb_group_key_set'] == true,
+      healthCheck: m['health_check'] is Map<String, dynamic>
+          ? HealthCheck.fromJson(m['health_check'] as Map<String, dynamic>)
+          : null,
       requestHeaders: {
         if (m['request_headers'] is Map)
           for (final e in (m['request_headers'] as Map).entries)
@@ -327,6 +401,9 @@ class Tunnel {
       other.proxyProtocol == proxyProtocol &&
       other.bandwidthBps == bandwidthBps &&
       other.bandwidthServer == bandwidthServer &&
+      other.lbGroup == lbGroup &&
+      other.lbGroupKeySet == lbGroupKeySet &&
+      other.healthCheck == healthCheck &&
       mapEquals(other.requestHeaders, requestHeaders) &&
       mapEquals(other.responseHeaders, responseHeaders);
   @override
@@ -354,6 +431,9 @@ class Tunnel {
     proxyProtocol,
     bandwidthBps,
     bandwidthServer,
+    lbGroup,
+    lbGroupKeySet,
+    healthCheck,
     ...requestHeaders.entries.map((e) => Object.hash(e.key, e.value)),
     ...responseHeaders.entries.map((e) => Object.hash('r', e.key, e.value)),
   ]);

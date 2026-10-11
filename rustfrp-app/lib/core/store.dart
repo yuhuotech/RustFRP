@@ -335,6 +335,9 @@ class Actions {
     int proxyProtocol = 0,
     int bandwidthBps = 0,
     bool bandwidthServer = false,
+    String lbGroup = '',
+    String lbGroupKey = '',
+    HealthCheck? healthCheck,
     required String reason,
   }) => _do(
     () => _api.createTunnel(
@@ -356,6 +359,9 @@ class Actions {
       proxyProtocol: proxyProtocol,
       bandwidthBps: bandwidthBps,
       bandwidthServer: bandwidthServer,
+      lbGroup: lbGroup,
+      lbGroupKey: lbGroupKey,
+      healthCheck: healthCheck,
       reason: reason,
     ),
   );
@@ -379,6 +385,9 @@ class Actions {
     int? proxyProtocol,
     int? bandwidthBps,
     bool? bandwidthServer,
+    String? lbGroup,
+    String? lbGroupKey,
+    HealthCheck? healthCheck,
     required String reason,
   }) => _do(
     () => _api.patchTunnel(
@@ -400,6 +409,9 @@ class Actions {
       proxyProtocol: proxyProtocol,
       bandwidthBps: bandwidthBps,
       bandwidthServer: bandwidthServer,
+      lbGroup: lbGroup,
+      lbGroupKey: lbGroupKey,
+      healthCheck: healthCheck,
       reason: reason,
     ),
   );

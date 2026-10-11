@@ -619,6 +619,152 @@ async fn managed_http_and_udp_proxies_follow_config_changes() {
     rig.stop.cancel();
 }
 
+/// 连上就写 `tag` 的 tcp 服务。
+async fn tagged(tag: &'static str) -> (u16, CancellationToken) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let stop = CancellationToken::new();
+    let s2 = stop.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = s2.cancelled() => return,
+                a = l.accept() => {
+                    let Ok((mut s, _)) = a else { continue };
+                    tokio::spawn(async move {
+                        let _ = s.write_all(tag.as_bytes()).await;
+                        let _ = s.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+    (port, stop)
+}
+
+async fn read_all(port: u16) -> String {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let _ = timeout(Duration::from_secs(2), s.read_to_string(&mut out)).await;
+    out
+}
+
+#[tokio::test]
+async fn managed_health_checks_report_state_and_groups_rotate_members() {
+    use rustfrp_core::wire::{HealthSpec, LbOpts};
+    let mut rig = rig().await;
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let (mut rx, cancel, _task) = spawn_client(managed_client(rig.port, key, None, Some("good")));
+    until(&mut rx, |e| matches!(e, Event::ConfigApplied { .. })).await;
+    let spec = HealthSpec {
+        kind: "tcp".into(),
+        timeout_secs: 1,
+        max_failed: 1,
+        interval_secs: 1,
+        ..Default::default()
+    };
+    // 本地服务先不存在：代理要等第一次探测成功。
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = l.local_addr().unwrap().port();
+    drop(l);
+    let mut hc = mp("hc", 0, local);
+    hc.lb = LbOpts {
+        health: Some(spec.clone()),
+        ..Default::default()
+    };
+    let (ga, stop_a) = tagged("A").await;
+    let (gb, _stop_b) = tagged("B").await;
+    let member = |name: &str, local: u16, remote: u16| {
+        let mut m = mp(name, remote, local);
+        m.lb = LbOpts {
+            group: "g".into(),
+            group_key: "k".into(),
+            health: Some(spec.clone()),
+        };
+        m
+    };
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 1,
+        proxies: vec![hc.clone(), member("ga", ga, 0)],
+        ..Default::default()
+    }));
+    let waiting = until(&mut rig.events, |e| e.name == "hc").await;
+    assert!(
+        matches!(&waiting.state, ProxyState::Failed(m) if m.contains("health check")),
+        "{waiting:?}"
+    );
+    let group_port = match until(&mut rig.events, |e| {
+        e.name == "ga" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await
+    .state
+    {
+        ProxyState::Running(p) => p,
+        _ => unreachable!(),
+    };
+    // 服务出现 → 变健康并回报运行中。
+    let svc = TcpListener::bind(("127.0.0.1", local)).await.unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = svc.accept().await {
+            let _ = s.write_all(b"HC").await;
+        }
+    });
+    let hc_port = match until(&mut rig.events, |e| {
+        e.name == "hc" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await
+    .state
+    {
+        ProxyState::Running(p) => p,
+        _ => unreachable!(),
+    };
+    assert_eq!(read_all(hc_port).await, "HC");
+    // 第二个成员加入同一个端口：连接在两者之间轮转。
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 2,
+        proxies: vec![hc, member("ga", ga, 0), member("gb", gb, group_port)],
+        ..Default::default()
+    }));
+    until(&mut rig.events, |e| {
+        e.name == "gb" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        seen.insert(read_all(group_port).await);
+    }
+    assert_eq!(seen, ["A".to_string(), "B".to_string()].into(), "{seen:?}");
+    // 成员 A 的服务停止：被探测为不健康并回报，流量全部转给 B。
+    stop_a.cancel();
+    until(&mut rig.events, |e| {
+        e.name == "ga"
+            && matches!(&e.state, ProxyState::Failed(m) if m.contains("health check failed"))
+    })
+    .await;
+    for _ in 0..4 {
+        assert_eq!(read_all(group_port).await, "B");
+    }
+    // 配置里去掉带健康检查的代理：监控任务一并停止，端口关闭。
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 3,
+        proxies: vec![],
+        ..Default::default()
+    }));
+    until(&mut rig.events, |e| {
+        e.name == "hc" && e.state == ProxyState::Stopped
+    })
+    .await;
+    until(&mut rx, |e| {
+        matches!(e, Event::ConfigApplied { revision: 3, .. })
+    })
+    .await;
+    assert!(read_all(hc_port).await.is_empty());
+    cancel.cancel();
+    rig.stop.cancel();
+}
+
 // ---------- 命令行入口：身份持久化与重连 ----------
 
 mod cli_flow {

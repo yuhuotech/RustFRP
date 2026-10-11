@@ -79,6 +79,7 @@ fn spec(p: &Proxy, client: &str, enabled: bool) -> store::NewTunnel {
         proxy_protocol: proxy_protocol(p),
         bandwidth_bps: bandwidth(p),
         bandwidth_server: p.transport.bandwidth_limit_mode == "server",
+        lb: rustfrp_agent::plan::lb_opts(p),
     }
 }
 /// frp 的 `transport.bandwidthLimit`（字节 / 秒）；udp 上 frp 不支持。
@@ -147,6 +148,7 @@ fn apply(
             if t.kind != p.kind {
                 return Err(invalid(format!("tunnel {} type cannot be changed", p.name)));
             }
+            let lb = rustfrp_agent::plan::lb_opts(&p);
             store::update_tunnel(
                 c,
                 &t.id,
@@ -168,6 +170,9 @@ fn apply(
                     proxy_protocol: Some(proxy_protocol(&p)),
                     bandwidth_bps: Some(bandwidth(&p)),
                     bandwidth_server: Some(p.transport.bandwidth_limit_mode == "server"),
+                    lb_group: Some(lb.group.clone()),
+                    lb_group_key: Some(lb.group_key.clone()),
+                    health_check: Some(lb.health.clone().unwrap_or_default()),
                 },
                 now,
             )?;
@@ -234,8 +239,14 @@ fn warnings(loaded: &frpcfg::LoadedClient) -> Vec<String> {
                 p.kind == "udp" && !p.transport.proxy_protocol_version.is_empty(),
                 "PROXY protocol on udp",
             ),
-            (!p.health_check.kind.is_empty(), "healthCheck"),
-            (!p.load_balancer.group.is_empty(), "loadBalancer"),
+            (
+                p.kind == "udp" && !p.health_check.kind.is_empty(),
+                "healthCheck on udp",
+            ),
+            (
+                p.kind == "udp" && !p.load_balancer.group.is_empty(),
+                "loadBalancer on udp",
+            ),
             (p.kind != "http" && !p.locations.is_empty(), "locations"),
             (
                 p.kind != "http" && (!p.http_user.is_empty() || !p.http_password.is_empty()),
@@ -375,6 +386,23 @@ pub fn export(c: &Connection, cfg: &Config, client: &str) -> Result<String, Stor
             } else {
                 String::new()
             };
+            let lb = store::tunnel_lb(c, &t.id)?;
+            p.load_balancer.group = lb.group;
+            p.load_balancer.group_key = lb.group_key;
+            if let Some(h) = lb.health {
+                p.health_check.kind = h.kind;
+                p.health_check.timeout_seconds = i64::from(h.timeout_secs);
+                p.health_check.max_failed = i64::from(h.max_failed);
+                p.health_check.interval_seconds = i64::from(h.interval_secs);
+                p.health_check.path = h.path;
+                p.health_check.http_headers = h
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| rustfrp_core::frpcfg::HttpHeader { name, value })
+                    .collect();
+            } else {
+                p.health_check = Default::default();
+            }
             p.transport.proxy_protocol_version = match t.proxy_protocol {
                 1 => "v1".into(),
                 2 => "v2".into(),
@@ -545,10 +573,12 @@ mod tests {
                 "routeByHTTPUser",
                 "bandwidthLimit",
                 "responseHeaders",
+                "healthCheck",
+                "loadBalancer",
             ] {
                 assert!(!all.contains(ok), "{ok}: {all}");
             }
-            for pending in ["encryption", "compression", "healthCheck", "loadBalancer"] {
+            for pending in ["encryption", "compression"] {
                 assert!(all.contains(pending), "{pending}: {all}");
             }
             for kind in ["tcp", "udp", "https"] {
@@ -606,6 +636,60 @@ mod tests {
             // 其他代理类型带这些字段会在严格解析阶段被拒绝（frp 的字段只属于 http 代理）。
             let tcp = "serverAddr='x'\n[[proxies]]\nname='t'\ntype='tcp'\nlocalPort=22\nremotePort=6000\nhttpUser='u'\n";
             assert!(preview(&mut c, &cfg, "c", tcp).is_err());
+        }
+        #[test]
+        fn load_balancer_and_health_check_roundtrip_and_udp_is_flagged() {
+            let mut c = c();
+            let cfg = Config {
+                allow_ports: vec![(1, 65535)],
+                ..Default::default()
+            };
+            let text = "serverAddr='x'\n[[proxies]]\nname='t'\ntype='tcp'\nlocalPort=22\nremotePort=6000\nloadBalancer.group='g'\nloadBalancer.groupKey='k'\nhealthCheck.type='http'\nhealthCheck.path='/healthz'\nhealthCheck.timeoutSeconds=2\nhealthCheck.maxFailed=3\nhealthCheck.intervalSeconds=5\nhealthCheck.httpHeaders=[{name='X-A',value='1'}]\n";
+            let p = preview(&mut c, &cfg, "c", text).unwrap();
+            assert!(
+                !p.warnings.join("\n").contains("loadBalancer"),
+                "{:?}",
+                p.warnings
+            );
+            import(&mut c, &cfg, "c", text, ("a", "r", "")).unwrap();
+            let t = store::list_tunnels(&c, Some("c")).unwrap().remove(0);
+            assert_eq!(t.lb_group, "g");
+            let lb = store::tunnel_lb(&c, &t.id).unwrap();
+            let h = lb.health.unwrap();
+            assert_eq!(
+                (
+                    lb.group_key.as_str(),
+                    h.kind.as_str(),
+                    h.path.as_str(),
+                    h.timeout_secs,
+                    h.max_failed,
+                    h.interval_secs,
+                    h.headers.get("X-A").map(String::as_str)
+                ),
+                ("k", "http", "/healthz", 2, 3, 5, Some("1"))
+            );
+            let out = export(&c, &cfg, "c").unwrap();
+            for want in [
+                "group = \"g\"",
+                "groupKey = \"k\"",
+                "/healthz",
+                "maxFailed = 3",
+                "X-A",
+            ] {
+                assert!(out.contains(want), "{want}\n{out}");
+            }
+            // 再次导入去掉这些选项：回到默认。
+            let plain = "serverAddr='x'\n[[proxies]]\nname='t'\ntype='tcp'\nlocalPort=22\nremotePort=6000\n";
+            import(&mut c, &cfg, "c", plain, ("a", "r", "")).unwrap();
+            let t = store::list_tunnels(&c, Some("c")).unwrap().remove(0);
+            assert!(t.lb_group.is_empty() && t.health_check.is_none());
+            assert!(!export(&c, &cfg, "c").unwrap().contains("healthCheck"));
+            let udp = "serverAddr='x'\n[[proxies]]\nname='u'\ntype='udp'\nlocalPort=53\nremotePort=5353\nloadBalancer.group='g'\nhealthCheck.type='tcp'\n";
+            let w = preview(&mut c, &cfg, "c", udp).unwrap().warnings.join("\n");
+            assert!(
+                w.contains("loadBalancer on udp") && w.contains("healthCheck on udp"),
+                "{w}"
+            );
         }
         #[test]
         fn bandwidth_limit_roundtrips_in_both_modes_and_udp_is_flagged() {

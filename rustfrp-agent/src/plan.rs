@@ -73,6 +73,31 @@ fn resolve_token(
     }
 }
 
+/// frp 的 `loadBalancer` / `healthCheck` → 线协议（默认值与 frp 一致：超时 3s、失败 1 次、间隔 10s）。
+pub fn lb_opts(p: &rustfrp_core::frpcfg::Proxy) -> rustfrp_core::wire::LbOpts {
+    if p.kind == "udp" {
+        return Default::default();
+    }
+    let h = &p.health_check;
+    let secs = |v: i64, default: u32| u32::try_from(v).ok().filter(|n| *n > 0).unwrap_or(default);
+    rustfrp_core::wire::LbOpts {
+        group: p.load_balancer.group.clone(),
+        group_key: p.load_balancer.group_key.clone(),
+        health: (!h.kind.is_empty()).then(|| rustfrp_core::wire::HealthSpec {
+            kind: h.kind.clone(),
+            timeout_secs: secs(h.timeout_seconds, 3),
+            max_failed: secs(h.max_failed, 1),
+            interval_secs: secs(h.interval_seconds, 10),
+            path: h.path.clone(),
+            headers: h
+                .http_headers
+                .iter()
+                .map(|x| (x.name.clone(), x.value.clone()))
+                .collect(),
+        }),
+    }
+}
+
 /// 该代理里配置了、但当前版本尚未实现的选项（不会静默忽略：调用方会把它们打印出来）。
 pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static str> {
     let mut v = Vec::new();
@@ -93,8 +118,15 @@ pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static s
         p.kind == "udp" && !p.transport.proxy_protocol_version.is_empty(),
         "transport.proxyProtocolVersion (udp)",
     );
-    flag(!p.health_check.kind.is_empty(), "healthCheck");
-    flag(!p.load_balancer.group.is_empty(), "loadBalancer");
+    // 健康检查与负载均衡组已支持 tcp / http / https；udp 上没有意义。
+    flag(
+        p.kind == "udp" && !p.health_check.kind.is_empty(),
+        "healthCheck (udp)",
+    );
+    flag(
+        p.kind == "udp" && !p.load_balancer.group.is_empty(),
+        "loadBalancer (udp)",
+    );
     // http 代理已支持这些选项；其他类型上配置它们没有意义，按「未支持」提示。
     let other = p.kind != "http";
     flag(other && !p.locations.is_empty(), "locations");
@@ -160,6 +192,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
                 rustfrp_core::proxyproto::parse_version(&p.transport.proxy_protocol_version)
                     .map_err(|e| format!("proxy [{}]: {e}", p.name))?
             },
+            lb: lb_opts(p),
             http: if p.kind == "http" {
                 rustfrp_core::wire::HttpOpts {
                     locations: p.locations.clone(),
@@ -355,6 +388,46 @@ mod tests {
             "{:?}",
             plan.notes
         );
+    }
+
+    #[test]
+    fn health_checks_and_groups_map_with_frp_defaults_and_flag_udp() {
+        let fs = MemFs::default();
+        let src = "serverAddr='x'\n[[proxies]]\nname='a'\ntype='tcp'\nlocalPort=1\nremotePort=2\nloadBalancer.group='g'\nloadBalancer.groupKey='k'\nhealthCheck.type='tcp'\n\
+[[proxies]]\nname='h'\ntype='http'\nlocalPort=3\ncustomDomains=['a.com']\nhealthCheck.type='http'\nhealthCheck.path='/hz'\nhealthCheck.timeoutSeconds=7\nhealthCheck.maxFailed=4\nhealthCheck.intervalSeconds=20\nhealthCheck.httpHeaders=[{name='X-A',value='1'}]\n\
+[[proxies]]\nname='u'\ntype='udp'\nlocalPort=5\nremotePort=6\nloadBalancer.group='g'\nhealthCheck.type='tcp'\n";
+        let plan = client(src, &fs).unwrap();
+        let lb = |i: usize| plan.cfg.proxies[i].lb.clone();
+        assert_eq!((lb(0).group.as_str(), lb(0).group_key.as_str()), ("g", "k"));
+        let tcp = lb(0).health.unwrap();
+        assert_eq!(
+            (
+                tcp.kind.as_str(),
+                tcp.timeout_secs,
+                tcp.max_failed,
+                tcp.interval_secs
+            ),
+            ("tcp", 3, 1, 10),
+            "frp defaults"
+        );
+        let http = lb(1).health.unwrap();
+        assert_eq!(
+            (
+                http.path.as_str(),
+                http.timeout_secs,
+                http.max_failed,
+                http.interval_secs
+            ),
+            ("/hz", 7, 4, 20)
+        );
+        assert_eq!(http.headers.get("X-A").map(String::as_str), Some("1"));
+        assert!(lb(2).is_default(), "udp never joins a group");
+        let notes = plan.notes.join("\n");
+        assert!(
+            notes.contains("healthCheck (udp)") && notes.contains("loadBalancer (udp)"),
+            "{notes}"
+        );
+        assert!(!notes.contains("proxy [a]"), "{notes}");
     }
 
     #[test]

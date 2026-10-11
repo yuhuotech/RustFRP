@@ -8,7 +8,7 @@ use rustfrp_core::wire::{ConfigSet, ManagedProxy};
 use crate::db::StoreError;
 use crate::models::{Admin, AuditEntry, Client, EnrollToken, Node, Role, Tunnel};
 use rustfrp_core::node::{NodeDevice, NodeInfo};
-use rustfrp_core::wire::HttpOpts;
+use rustfrp_core::wire::{HealthSpec, HttpOpts, LbOpts};
 
 type Res<T> = Result<T, StoreError>;
 
@@ -771,6 +771,8 @@ pub struct NewTunnel {
     pub bandwidth_bps: u64,
     /// 限速由服务端执行。
     pub bandwidth_server: bool,
+    /// 负载均衡组与健康检查。
+    pub lb: LbOpts,
 }
 
 /// 修改隧道的参数（`None` 表示不改）。
@@ -810,6 +812,12 @@ pub struct TunnelPatch {
     pub bandwidth_bps: Option<u64>,
     /// 限速位置。
     pub bandwidth_server: Option<bool>,
+    /// 负载均衡组名（`Some("")` 退出组）。
+    pub lb_group: Option<String>,
+    /// 组密钥（`Some("")` 清除，`None` 保持）。
+    pub lb_group_key: Option<String>,
+    /// 健康检查（`kind` 为空表示取消）。
+    pub health_check: Option<HealthSpec>,
 }
 
 fn parse_opts(raw: &str) -> HttpOpts {
@@ -824,8 +832,21 @@ fn store_opts(o: &HttpOpts) -> String {
     }
 }
 
+fn parse_lb(raw: &str) -> LbOpts {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn store_lb(o: &LbOpts) -> String {
+    if o.is_default() {
+        String::new()
+    } else {
+        serde_json::to_string(o).unwrap_or_default()
+    }
+}
+
 fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
     let opts = parse_opts(&r.get::<_, String>(16)?);
+    let lb = parse_lb(&r.get::<_, String>(20)?);
     Ok(Tunnel {
         id: r.get(0)?,
         client_id: r.get(1)?,
@@ -852,9 +873,12 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         proxy_protocol: u8::try_from(r.get::<_, i64>(17)?).unwrap_or(0),
         bandwidth_bps: u64::try_from(r.get::<_, i64>(18)?).unwrap_or(0),
         bandwidth_server: r.get::<_, i64>(19)? != 0,
+        lb_group: lb.group,
+        lb_group_key_set: !lb.group_key.is_empty(),
+        health_check: lb.health,
     })
 }
-const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server";
+const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts";
 
 fn check_port(v: i64, what: &str, allow_zero: bool) -> Res<()> {
     let lo = i64::from(!allow_zero);
@@ -946,27 +970,45 @@ fn ensure_remote_port_free(
     c: &Connection,
     kind: &str,
     port: i64,
+    lb: &LbOpts,
     except_id: Option<&str>,
 ) -> Res<()> {
-    if port == 0 || is_web(kind) {
+    if is_web(kind) {
         return Ok(());
     }
-    let taken: Option<String> = c
-        .query_row(
-            "SELECT id FROM tunnels WHERE remote_port = ?1 AND kind = ?3 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
-            params![port, except_id, kind],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if taken.is_some() {
-        return Err(StoreError::Conflict(format!(
-            "remote port {port} is already used by another {kind} tunnel"
-        )));
+    let mut st = c.prepare(
+        "SELECT remote_port, lb_opts FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
+    )?;
+    let rows = st
+        .query_map(params![kind, except_id], |r| {
+            Ok((r.get::<_, i64>(0)?, parse_lb(&r.get::<_, String>(1)?)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (other_port, other) in rows {
+        let same_group = !lb.group.is_empty() && other.group == lb.group;
+        if same_group && other.group_key != lb.group_key {
+            return Err(StoreError::Conflict(format!(
+                "group \"{}\" key doesn't match the existing members",
+                lb.group
+            )));
+        }
+        if same_group && port != 0 && other_port != 0 && port != other_port {
+            return Err(StoreError::Invalid(format!(
+                "members of group \"{}\" must share the same remote port",
+                lb.group
+            )));
+        }
+        if port != 0 && other_port == port && !same_group {
+            return Err(StoreError::Conflict(format!(
+                "remote port {port} is already used by another {kind} tunnel"
+            )));
+        }
     }
     Ok(())
 }
 
 /// 同类别（http / https）内：同一域名只有在路径前缀不重叠、或 `routeByHTTPUser` 不同时才可共存；
+/// 同组（组名与密钥一致）且路径集合完全一致的隧道共用域名，由 Edge 在健康成员间轮转。
 /// 子域名按 `sub.<根域名>` 在运行时解析，这里按「同名子域名」同样处理。
 fn ensure_domains_free(
     c: &Connection,
@@ -974,13 +1016,14 @@ fn ensure_domains_free(
     domains: &[String],
     subdomain: &str,
     http: &HttpOpts,
+    lb: &LbOpts,
     except_id: Option<&str>,
 ) -> Res<()> {
     if !is_web(kind) {
         return Ok(());
     }
     let mut st = c.prepare(
-        "SELECT custom_domains, subdomain, http_opts FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
+        "SELECT custom_domains, subdomain, http_opts, lb_opts FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
     )?;
     let rows = st
         .query_map(params![kind, except_id], |r| {
@@ -988,30 +1031,95 @@ fn ensure_domains_free(
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mine = effective_locations(http);
-    for (other_domains, other_sub, other_opts) in rows {
+    for (other_domains, other_sub, other_opts, other_lb) in rows {
         let other = parse_opts(&other_opts);
+        let other_lb = parse_lb(&other_lb);
+        let theirs_locations = effective_locations(&other);
         let overlap = other.route_by_http_user == http.route_by_http_user
-            && effective_locations(&other).iter().any(|l| mine.contains(l));
+            && theirs_locations.iter().any(|l| mine.contains(l));
         if !overlap {
             continue;
         }
         let theirs = split_domains(&other_domains);
-        if let Some(d) = domains.iter().find(|d| theirs.contains(d)) {
-            return Err(StoreError::Conflict(format!(
-                "domain \"{d}\" is already used by another {kind} tunnel"
-            )));
+        let clash = domains
+            .iter()
+            .find(|d| theirs.contains(d))
+            .map(|d| format!("domain \"{d}\" is already used by another {kind} tunnel"));
+        let clash = clash.or_else(|| {
+            (!subdomain.is_empty() && subdomain == other_sub).then(|| {
+                format!("subdomain \"{subdomain}\" is already used by another {kind} tunnel")
+            })
+        });
+        let Some(message) = clash else { continue };
+        if !lb.group.is_empty() && other_lb.group == lb.group {
+            if other_lb.group_key != lb.group_key {
+                return Err(StoreError::Conflict(format!(
+                    "group \"{}\" key doesn't match the existing members",
+                    lb.group
+                )));
+            }
+            let (mut a, mut b) = (mine.clone(), theirs_locations);
+            a.sort();
+            b.sort();
+            if a == b {
+                continue;
+            }
         }
-        if !subdomain.is_empty() && subdomain == other_sub {
-            return Err(StoreError::Conflict(format!(
-                "subdomain \"{subdomain}\" is already used by another {kind} tunnel"
-            )));
-        }
+        return Err(StoreError::Conflict(message));
     }
     Ok(())
+}
+
+/// 校验负载均衡 / 健康检查选项；udp 隧道不支持。
+fn check_lb(kind: &str, lb: LbOpts) -> Res<LbOpts> {
+    let bad = |m: &str| Err(StoreError::Invalid(m.into()));
+    if lb.is_default() {
+        return Ok(lb);
+    }
+    if kind == "udp" {
+        return bad("load balancer groups and health checks do not apply to udp tunnels");
+    }
+    let printable = |v: &str| v.len() <= 64 && !v.chars().any(char::is_control);
+    if !printable(&lb.group) || !printable(&lb.group_key) {
+        return bad("group and group key must be at most 64 printable characters");
+    }
+    if lb.group.is_empty() && !lb.group_key.is_empty() {
+        return bad("group key needs a group name");
+    }
+    if let Some(h) = &lb.health {
+        if !["tcp", "http"].contains(&h.kind.as_str()) {
+            return bad("health check type must be tcp or http");
+        }
+        if !(1..=60).contains(&h.timeout_secs)
+            || !(1..=20).contains(&h.max_failed)
+            || !(1..=3600).contains(&h.interval_secs)
+        {
+            return bad("health check timeout 1-60s, max failed 1-20, interval 1-3600s");
+        }
+        if h.kind == "http" {
+            if !h.path.starts_with('/')
+                || h.path.len() > 256
+                || h.path.chars().any(|c| c.is_control() || c == ' ')
+            {
+                return bad("http health check path must start with / and contain no spaces");
+            }
+        } else if !h.path.is_empty() || !h.headers.is_empty() {
+            return bad("path and headers only apply to http health checks");
+        }
+        if h.headers.len() > 8
+            || h.headers.iter().any(|(k, v)| {
+                !rustfrp_core::http1::valid_header(k, v) || k.len() > 64 || v.len() > 256
+            })
+        {
+            return bad("invalid health check headers");
+        }
+    }
+    Ok(lb)
 }
 
 fn effective_locations(o: &HttpOpts) -> Vec<String> {
@@ -1094,6 +1202,7 @@ struct Checked {
     proxy_protocol: u8,
     bandwidth_bps: u64,
     bandwidth_server: bool,
+    lb: LbOpts,
 }
 
 fn check_tunnel(
@@ -1147,8 +1256,9 @@ fn check_tunnel(
             "domains and host_header_rewrite only apply to http / https tunnels".into(),
         ));
     }
-    ensure_remote_port_free(c, &t.kind, t.remote_port, except_id)?;
-    ensure_domains_free(c, &t.kind, &domains, &t.subdomain, &http, except_id)?;
+    let lb = check_lb(&t.kind, t.lb.clone())?;
+    ensure_remote_port_free(c, &t.kind, t.remote_port, &lb, except_id)?;
+    ensure_domains_free(c, &t.kind, &domains, &t.subdomain, &http, &lb, except_id)?;
     let dup: Option<String> = c
         .query_row(
             "SELECT id FROM tunnels WHERE client_id = ?1 AND name = ?2 AND deleted_at IS NULL AND (?3 IS NULL OR id <> ?3)",
@@ -1162,7 +1272,12 @@ fn check_tunnel(
             t.name.trim()
         )));
     }
-    Ok(Checked { domains, http, ..t })
+    Ok(Checked {
+        domains,
+        http,
+        lb,
+        ..t
+    })
 }
 
 /// 创建隧道。
@@ -1183,15 +1298,16 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
             proxy_protocol: t.proxy_protocol,
             bandwidth_bps: t.bandwidth_bps,
             bandwidth_server: t.bandwidth_server,
+            lb: t.lb.clone(),
         },
         None,
         &t.client_id,
     )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16)",
-        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server)],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb)],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
@@ -1265,6 +1381,19 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             .clone()
             .unwrap_or_else(|| cur_opts.response_headers.clone()),
     };
+    let cur_lb = tunnel_lb(c, id)?;
+    let new_lb = LbOpts {
+        group: p.lb_group.clone().unwrap_or_else(|| cur_lb.group.clone()),
+        group_key: p
+            .lb_group_key
+            .clone()
+            .unwrap_or_else(|| cur_lb.group_key.clone()),
+        health: match &p.health_check {
+            Some(h) if h.kind.is_empty() => None,
+            Some(h) => Some(h.clone()),
+            None => cur_lb.health.clone(),
+        },
+    };
     let enabled = p.enabled.unwrap_or(cur.enabled);
     let k = check_tunnel(
         c,
@@ -1290,6 +1419,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             proxy_protocol: p.proxy_protocol.unwrap_or(cur.proxy_protocol),
             bandwidth_bps: p.bandwidth_bps.unwrap_or(cur.bandwidth_bps),
             bandwidth_server: p.bandwidth_server.unwrap_or(cur.bandwidth_server),
+            lb: new_lb,
         },
         Some(id),
         &cur.client_id,
@@ -1299,6 +1429,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
         || k.proxy_protocol != cur.proxy_protocol
         || k.bandwidth_bps != cur.bandwidth_bps
         || k.bandwidth_server != cur.bandwidth_server
+        || k.lb != cur_lb
         || k.local_ip != cur.local_ip
         || k.local_port != i64::from(cur.local_port)
         || k.remote_port != i64::from(cur.remote_port)
@@ -1308,8 +1439,8 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
     // 仅数据面配置变化时等待 Edge 回报；重复启停和改显示名保留实际状态。
     c.execute(
         "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state=CASE WHEN ?11 THEN 'pending' ELSE status_state END, status_error=CASE WHEN ?11 THEN '' ELSE status_error END,
-                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15 WHERE id=?1",
-        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server)],
+                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15, lb_opts=?16 WHERE id=?1",
+        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb)],
     )?;
     bump_revision(c, &cur.client_id)?;
     get_tunnel(c, id)
@@ -1323,6 +1454,16 @@ pub fn tunnel_http_opts(c: &Connection, id: &str) -> Res<HttpOpts> {
         |r| r.get(0),
     )?;
     Ok(parse_opts(&raw))
+}
+
+/// 隧道的负载均衡 / 健康检查选项（含组密钥，仅供服务端内部下发 / 导出使用，不得经 REST 返回）。
+pub fn tunnel_lb(c: &Connection, id: &str) -> Res<LbOpts> {
+    let raw: String = c.query_row(
+        "SELECT lb_opts FROM tunnels WHERE id = ?1 AND deleted_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(parse_lb(&raw))
 }
 
 /// 软删除隧道。
@@ -1436,29 +1577,40 @@ pub fn mark_client_tunnels_stopped(c: &Connection, client_id: &str) -> Res<()> {
 /// 生成下发给设备的受管配置：只含启用的隧道，代理名即隧道 ID。
 pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
     let client = get_client(c, client_id)?;
-    let mut opts =
-        c.prepare("SELECT id, http_opts FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL")?;
-    let mut opts: std::collections::HashMap<String, HttpOpts> = opts
+    let mut opts = c.prepare(
+        "SELECT id, http_opts, lb_opts FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL",
+    )?;
+    let mut opts: std::collections::HashMap<String, (HttpOpts, LbOpts)> = opts
         .query_map([client_id], |r| {
-            Ok((r.get::<_, String>(0)?, parse_opts(&r.get::<_, String>(1)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    parse_opts(&r.get::<_, String>(1)?),
+                    parse_lb(&r.get::<_, String>(2)?),
+                ),
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let proxies = list_tunnels(c, Some(client_id))?
         .into_iter()
         .filter(|t| t.enabled)
-        .map(|t| ManagedProxy {
-            http: opts.remove(&t.id).unwrap_or_default(),
-            proxy_protocol: t.proxy_protocol,
-            bandwidth_bps: t.bandwidth_bps,
-            bandwidth_server: t.bandwidth_server,
-            name: t.id,
-            kind: t.kind,
-            remote_port: t.remote_port,
-            local_ip: t.local_ip,
-            local_port: t.local_port,
-            custom_domains: t.custom_domains,
-            subdomain: t.subdomain,
-            host_header_rewrite: t.host_header_rewrite,
+        .map(|t| {
+            let (http, lb) = opts.remove(&t.id).unwrap_or_default();
+            ManagedProxy {
+                http,
+                lb,
+                proxy_protocol: t.proxy_protocol,
+                bandwidth_bps: t.bandwidth_bps,
+                bandwidth_server: t.bandwidth_server,
+                name: t.id,
+                kind: t.kind,
+                remote_port: t.remote_port,
+                local_ip: t.local_ip,
+                local_port: t.local_port,
+                custom_domains: t.custom_domains,
+                subdomain: t.subdomain,
+                host_header_rewrite: t.host_header_rewrite,
+            }
         })
         .collect();
     let restart_seq: i64 = c.query_row(
@@ -2111,6 +2263,258 @@ mod tests {
         }
     }
 
+    fn lb(group: &str, key: &str) -> LbOpts {
+        LbOpts {
+            group: group.into(),
+            group_key: key.into(),
+            health: None,
+        }
+    }
+
+    #[test]
+    fn lb_groups_share_ports_and_domains_only_with_matching_key_and_shape() {
+        let c = conn();
+        let a = client(&c, "a");
+        let b = client(&c, "b");
+        let mut first = nt(&a.id, "one", 6000);
+        first.lb = lb("g", "k");
+        let one = create_tunnel(&c, &first, 1).unwrap();
+        assert_eq!((one.lb_group.as_str(), one.lb_group_key_set), ("g", true));
+        // 同组同密钥同端口：允许（跨设备）。
+        let mut second = nt(&b.id, "two", 6000);
+        second.lb = lb("g", "k");
+        create_tunnel(&c, &second, 2).unwrap();
+        // 端口被非组成员 / 组外占用：冲突；同组端口不一致、密钥不同：拒绝。
+        let plain = nt(&b.id, "plain", 6000);
+        assert!(
+            matches!(create_tunnel(&c, &plain, 3), Err(StoreError::Conflict(m)) if m.contains("already used"))
+        );
+        let mut other_port = nt(&b.id, "port", 6001);
+        other_port.lb = lb("g", "k");
+        assert!(
+            matches!(create_tunnel(&c, &other_port, 3), Err(StoreError::Invalid(m)) if m.contains("same remote port"))
+        );
+        let mut wrong_key = nt(&b.id, "key", 6000);
+        wrong_key.lb = lb("g", "zzz");
+        assert!(
+            matches!(create_tunnel(&c, &wrong_key, 3), Err(StoreError::Conflict(m)) if m.contains("key doesn't match"))
+        );
+        // 组内已有自动分配端口（0）的成员时，显式端口的成员也可加入。
+        let mut auto0 = nt(&a.id, "auto0", 0);
+        auto0.lb = lb("g2", "k");
+        create_tunnel(&c, &auto0, 4).unwrap();
+        let mut explicit = nt(&b.id, "explicit", 6100);
+        explicit.lb = lb("g2", "k");
+        create_tunnel(&c, &explicit, 4).unwrap();
+        // 自动分配端口的成员可加入。
+        let mut auto = nt(&b.id, "auto", 0);
+        auto.lb = lb("g", "k");
+        create_tunnel(&c, &auto, 4).unwrap();
+        // 下发的配置带着组密钥。
+        let managed = managed_config(&c, &a.id).unwrap();
+        assert_eq!(managed.proxies[0].lb, lb("g", "k"));
+
+        // 域名：同组且路径集合一致可共用；路径不同或密钥不同冲突。
+        let web = |client: &str, name: &str, group: &str, key: &str, locs: &[&str]| NewTunnel {
+            client_id: client.into(),
+            name: name.into(),
+            kind: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            custom_domains: vec!["lb.example.com".into()],
+            enabled: true,
+            http: HttpOpts {
+                locations: locs.iter().map(|l| l.to_string()).collect(),
+                ..Default::default()
+            },
+            lb: lb(group, key),
+            ..Default::default()
+        };
+        create_tunnel(&c, &web(&a.id, "w1", "web", "k", &["/a", "/b"]), 5).unwrap();
+        create_tunnel(&c, &web(&b.id, "w2", "web", "k", &["/b", "/a"]), 6).unwrap();
+        for (name, g, k, locs) in [
+            ("w3", "web", "k", vec!["/a"]),
+            ("w4", "web", "bad", vec!["/a", "/b"]),
+            ("w5", "", "", vec!["/a", "/b"]),
+        ] {
+            assert!(
+                matches!(
+                    create_tunnel(&c, &web(&b.id, name, g, k, &locs), 7),
+                    Err(StoreError::Conflict(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn lb_options_are_validated_updated_and_clearable() {
+        let c = conn();
+        let a = client(&c, "a");
+        let health = |kind: &str, path: &str| HealthSpec {
+            kind: kind.into(),
+            timeout_secs: 3,
+            max_failed: 1,
+            interval_secs: 10,
+            path: path.into(),
+            headers: Default::default(),
+        };
+        let mut t = nt(&a.id, "hc", 6000);
+        t.lb = LbOpts {
+            health: Some(health("tcp", "")),
+            ..Default::default()
+        };
+        let created = create_tunnel(&c, &t, 1).unwrap();
+        assert_eq!(
+            created.health_check.as_ref().map(|h| h.kind.as_str()),
+            Some("tcp")
+        );
+        // 非法：类型、数值范围、路径、udp、组密钥缺组名、过长。
+        let bad = |kind: &str, lb: LbOpts| {
+            let mut x = nt(&a.id, "bad", 0);
+            x.kind = kind.into();
+            x.lb = lb;
+            matches!(create_tunnel(&c, &x, 2), Err(StoreError::Invalid(_)))
+        };
+        assert!(bad(
+            "tcp",
+            LbOpts {
+                health: Some(health("icmp", "")),
+                ..Default::default()
+            }
+        ));
+        assert!(bad(
+            "tcp",
+            LbOpts {
+                health: Some(health("http", "x")),
+                ..Default::default()
+            }
+        ));
+        assert!(bad(
+            "tcp",
+            LbOpts {
+                health: Some(health("tcp", "/p")),
+                ..Default::default()
+            }
+        ));
+        assert!(bad(
+            "tcp",
+            LbOpts {
+                health: Some(HealthSpec {
+                    timeout_secs: 0,
+                    ..health("tcp", "")
+                }),
+                ..Default::default()
+            }
+        ));
+        assert!(bad(
+            "tcp",
+            LbOpts {
+                health: Some(HealthSpec {
+                    headers: [("Bad Name".to_string(), "v".to_string())].into(),
+                    ..health("http", "/")
+                }),
+                ..Default::default()
+            }
+        ));
+        assert!(bad("udp", lb("g", "k")));
+        assert!(bad("tcp", lb("", "k")));
+        assert!(bad("tcp", lb(&"g".repeat(65), "")));
+        assert!(bad("tcp", lb("g\n", "")));
+        assert!(bad("tcp", lb("g", "k\n")));
+        let with = |h: HealthSpec| LbOpts {
+            health: Some(h),
+            ..Default::default()
+        };
+        for broken in [
+            HealthSpec {
+                max_failed: 21,
+                ..health("tcp", "")
+            },
+            HealthSpec {
+                max_failed: 0,
+                ..health("tcp", "")
+            },
+            HealthSpec {
+                interval_secs: 0,
+                ..health("tcp", "")
+            },
+            HealthSpec {
+                interval_secs: 3601,
+                ..health("tcp", "")
+            },
+            HealthSpec {
+                timeout_secs: 61,
+                ..health("tcp", "")
+            },
+            health("http", "/a b"),
+            health("http", &format!("/{}", "a".repeat(300))),
+            HealthSpec {
+                headers: [("X".to_string(), "1".to_string())].into(),
+                ..health("tcp", "")
+            },
+            HealthSpec {
+                headers: (0..9)
+                    .map(|i| (format!("X-{i}"), "v".to_string()))
+                    .collect(),
+                ..health("http", "/")
+            },
+            HealthSpec {
+                headers: [("X".to_string(), "v".repeat(300))].into(),
+                ..health("http", "/")
+            },
+        ] {
+            assert!(bad("tcp", with(broken.clone())), "{broken:?}");
+        }
+        let ok_http = HealthSpec {
+            headers: [("X-A".to_string(), "1".to_string())].into(),
+            ..health("http", "/h")
+        };
+        let mut good = nt(&a.id, "good-http", 0);
+        good.lb = with(ok_http);
+        create_tunnel(&c, &good, 2).unwrap();
+        // 修改：缺省保持；改组；空 kind 取消检查；数据面变化让状态回到 pending。
+        set_tunnel_status(&c, &created.id, "running", 6000, "").unwrap();
+        let kept = update_tunnel(&c, &created.id, &TunnelPatch::default(), 3).unwrap();
+        assert_eq!(
+            (kept.health_check.is_some(), kept.state.as_str()),
+            (true, "running")
+        );
+        let grouped = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                lb_group: Some("g".into()),
+                lb_group_key: Some("k".into()),
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (grouped.lb_group.as_str(), grouped.state.as_str()),
+            ("g", "pending")
+        );
+        assert_eq!(tunnel_lb(&c, &created.id).unwrap().group_key, "k");
+        let cleared = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                lb_group: Some(String::new()),
+                lb_group_key: Some(String::new()),
+                health_check: Some(HealthSpec::default()),
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+        assert!(
+            cleared.lb_group.is_empty()
+                && cleared.health_check.is_none()
+                && !cleared.lb_group_key_set
+        );
+    }
+
     #[test]
     fn client_tags_and_restart_requests() {
         let c = conn();
@@ -2238,6 +2642,7 @@ mod tests {
             proxy_protocol: 0,
             bandwidth_bps: 0,
             bandwidth_server: false,
+            lb: Default::default(),
         };
         let a = create_tunnel(&c, &mk("a", 1), 1).unwrap();
         assert!(enforce_tunnel_quota(&c, &cl.id, 1).is_ok());
@@ -2553,6 +2958,7 @@ mod tests {
             proxy_protocol: 0,
             bandwidth_bps: 0,
             bandwidth_server: false,
+            lb: Default::default(),
         };
         let w = create_tunnel(
             &c,

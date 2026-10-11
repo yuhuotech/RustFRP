@@ -351,7 +351,7 @@ void main() {
     (tester) async {
       final s = FakeServer();
       final c = s.addClient('nas', isOnline: true);
-      await Harness.create(tester, s);
+      await Harness.create(tester, s, size: const Size(1200, 1600));
       await tester.tap(find.byTooltip('隧道'));
       await settle(tester);
 
@@ -464,6 +464,42 @@ void main() {
       await settle(tester);
       await tester.tap(find.text('在服务端限速').last);
       await settle(tester);
+      // 负载均衡组与健康检查。
+      await tester.ensureVisible(find.byKey(const Key('tunnel-lb-group')));
+      await tester.enterText(find.byKey(const Key('tunnel-lb-group')), ' web ');
+      await tester.enterText(find.byKey(const Key('tunnel-lb-key')), 'sekret');
+      await tester.ensureVisible(find.byKey(const Key('tunnel-health-kind')));
+      await tester.tap(find.byKey(const Key('tunnel-health-kind')));
+      await settle(tester);
+      await tester.tap(find.text('HTTP 2xx').last);
+      await settle(tester);
+      await tester.ensureVisible(find.byKey(const Key('tunnel-health-path')));
+      await tester.enterText(
+        find.byKey(const Key('tunnel-health-path')),
+        'healthz',
+      );
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'health path without a slash');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-health-path')),
+        '/healthz',
+      );
+      await tester.enterText(
+        find.byKey(const Key('tunnel-health-timeout')),
+        '0',
+      );
+      await settle(tester);
+      expect(save().onTap, isNull, reason: 'timeout out of range');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-health-timeout')),
+        '2',
+      );
+      await tester.enterText(find.byKey(const Key('tunnel-health-max')), '3');
+      await tester.enterText(
+        find.byKey(const Key('tunnel-health-interval')),
+        '5',
+      );
+      await settle(tester);
       expect(save().onTap, isNotNull);
       await tapKey(tester, 'tunnel-save');
       await settle(tester, 10);
@@ -477,6 +513,16 @@ void main() {
       expect(web['proxy_protocol'], 2);
       expect(web['bandwidth_bps'], 512 * 1024);
       expect(web['bandwidth_server'], true);
+      expect(web['lb_group'], 'web');
+      expect(web['lb_group_key_set'], true);
+      expect(web['health_check'], {
+        'kind': 'http',
+        'timeout_secs': 2,
+        'max_failed': 3,
+        'interval_secs': 5,
+        'path': '/healthz',
+        'headers': <String, String>{},
+      });
       expect(s.httpPasswords[web['id']], 's3cret');
       expect(web['kind'], 'http');
       expect(web['custom_domains'], ['WWW.example.com', 'b.example.com']);

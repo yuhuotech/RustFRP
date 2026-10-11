@@ -47,8 +47,8 @@ Flutter：颜色、字号、圆角沿用 linkory 的 token / 共享控件，acti
 - P00：Cargo workspace、CI、覆盖率门槛工具、Flutter 工程 ✔。
 - P01 隧道核心 ✔：`frpcfg`（含 INI `convert`）；TLS1.3 + yamux + 令牌鉴权 + 重连 + 心跳；client / edge 模式、`verify`、frpc/frps 别名；内存基线（见 `tools/bench/README.md`）。
   代理类型：**tcp / udp / http（逐请求按 Host + 路径前缀 + routeByHTTPUser 选路，通配、子域名、Host 改写、Basic Auth、requestHeaders）/ https（SNI 透传）**，独立与受管模式都支持。
-  **已实现**：http 的 `responseHeaders.set`（每个最终响应改写，不可改分帧头）、PROXY protocol v1/v2（客户端写给本地服务）、带宽限制（`transport.bandwidthLimit` + `bandwidthLimitMode`，令牌桶，每代理双向共享；tcp/http/https，udp 不支持并提示；面板有 KB/s 字段）。
-  **尚未实现**：stcp/sudp/xtcp、tcpmux、visitors、插件、加密/压缩、健康检查、负载均衡、agent `reload`。`service install|uninstall|status|start|stop` 已实现（命令构造已测，真实 systemctl/launchctl/schtasks 未实机验证）。
+  **已实现**：健康检查（tcp / http，客户端探测、状态变化通知 Edge，不健康时不接收访问者）与负载均衡组（tcp 共用端口、http/https 共用域名，健康成员间轮转，组密钥校验）、http 的 `responseHeaders.set`（每个最终响应改写，不可改分帧头）、PROXY protocol v1/v2（客户端写给本地服务）、带宽限制（`transport.bandwidthLimit` + `bandwidthLimitMode`，令牌桶，每代理双向共享；tcp/http/https，udp 不支持并提示；面板有 KB/s 字段）。
+  **尚未实现**：stcp/sudp/xtcp、tcpmux、visitors、插件、加密/压缩、agent `reload`。`service install|uninstall|status|start|stop` 已实现（命令构造已测，真实 systemctl/launchctl/schtasks 未实机验证）。
   配置里出现这些时会在兼容报告 / 日志中逐代理列出并跳过。
 - P02 Controller ✔（部分）：SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD 与批量、配置热下发、审计、REST、面板托管、API Token、流量分钟桶与 24h/7d 历史、有界日志环、配置导入预览/导出、在线备份、有界保留清理、脚本托管。
   **独立节点**已实现（`RUSTFRP_NODE_ADDR` 开启节点端口；`rustfrp-agent --mode edge --controller … --enroll-token … --public-host …`，见 `docs/NODES.md`），AT-05 在同机全栈测试中通过；内置节点仍与 Controller 同进程。

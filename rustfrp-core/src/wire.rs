@@ -76,6 +76,46 @@ pub struct HttpOpts {
     pub response_headers: BTreeMap<String, String>,
 }
 
+/// 客户端对本地服务的健康检查（frp 的 `healthCheck`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HealthSpec {
+    /// `tcp` / `http`。
+    pub kind: String,
+    /// 单次探测超时（秒）。
+    pub timeout_secs: u32,
+    /// 连续失败多少次判定不健康。
+    pub max_failed: u32,
+    /// 探测间隔（秒）。
+    pub interval_secs: u32,
+    /// http：探测路径。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// http：附加请求头。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// 负载均衡组与健康检查（frp 的 `loadBalancer` / `healthCheck`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LbOpts {
+    /// 组名；同组成员共享同一个端口 / 域名，连接在健康成员间轮流分配。空 = 不入组。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// 组密钥：同组成员必须一致。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_key: String,
+    /// 健康检查；启用后代理在第一次探测成功前不接收访问者。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthSpec>,
+}
+
+impl LbOpts {
+    /// 全部为默认值（序列化时整体省略）。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl HttpOpts {
     /// 全部为默认值（序列化时整体省略，保持旧线格式不变）。
     pub fn is_default(&self) -> bool {
@@ -117,6 +157,9 @@ pub struct ManagedProxy {
     /// 限速在服务端（Edge）执行；缺省在客户端执行（frp 的 `bandwidthLimitMode`）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub bandwidth_server: bool,
+    /// 负载均衡组与健康检查。
+    #[serde(default, skip_serializing_if = "LbOpts::is_default")]
+    pub lb: LbOpts,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -170,6 +213,9 @@ pub struct ProxySpec {
     /// 限速在服务端（Edge）执行。
     #[serde(default, skip_serializing_if = "is_false")]
     pub bandwidth_server: bool,
+    /// 负载均衡组与健康检查。
+    #[serde(default, skip_serializing_if = "LbOpts::is_default")]
+    pub lb: LbOpts,
 }
 
 /// Client → Edge。
@@ -186,6 +232,13 @@ pub enum ClientMsg {
     Applied {
         /// 版本号。
         revision: u64,
+    },
+    /// 健康检查结果变化：不健康的代理暂时不接收访问者，恢复后继续。
+    Health {
+        /// 代理名。
+        name: String,
+        /// 是否健康。
+        healthy: bool,
     },
 }
 

@@ -301,6 +301,9 @@ class ApiClient {
     int proxyProtocol = 0,
     int bandwidthBps = 0,
     bool bandwidthServer = false,
+    String lbGroup = '',
+    String lbGroupKey = '',
+    HealthCheck? healthCheck,
     required String reason,
   }) async => Tunnel.fromJson(
     await _send(
@@ -322,6 +325,9 @@ class ApiClient {
         'proxy_protocol': proxyProtocol,
         'bandwidth_bps': bandwidthBps,
         'bandwidth_server': bandwidthServer,
+        'lb_group': lbGroup,
+        'lb_group_key': lbGroupKey,
+        'health_check': ?healthCheck?.toJson(),
         'local_ip': localIp,
         'local_port': localPort,
         'remote_port': remotePort,
@@ -350,6 +356,9 @@ class ApiClient {
     int? proxyProtocol,
     int? bandwidthBps,
     bool? bandwidthServer,
+    String? lbGroup,
+    String? lbGroupKey,
+    HealthCheck? healthCheck,
     required String reason,
   }) async => Tunnel.fromJson(
     await _send(
@@ -373,6 +382,9 @@ class ApiClient {
         'proxy_protocol': ?proxyProtocol,
         'bandwidth_bps': ?bandwidthBps,
         'bandwidth_server': ?bandwidthServer,
+        'lb_group': ?lbGroup,
+        'lb_group_key': ?lbGroupKey,
+        'health_check': ?healthCheck?.toJson(),
         'reason': reason,
       },
     ),

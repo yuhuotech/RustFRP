@@ -167,6 +167,33 @@ void main() {
     );
     expect(Tunnel.fromJson({'id': 'p', 'proxy_protocol': 2}).proxyProtocol, 2);
     expect(h == Tunnel.fromJson({'id': 'h', 'proxy_protocol': 1}), isFalse);
+    final lb = Tunnel.fromJson({
+      'id': 'l',
+      'lb_group': 'g',
+      'lb_group_key_set': true,
+      'health_check': {
+        'kind': 'http',
+        'timeout_secs': 2,
+        'max_failed': 3,
+        'interval_secs': 5,
+        'path': '/h',
+        'headers': {'X-A': '1', 'bad': 2},
+      },
+    });
+    expect((lb.lbGroup, lb.lbGroupKeySet), ('g', true));
+    expect(lb.healthCheck?.headers, {'X-A': '1'});
+    expect(lb.healthCheck?.toJson()['interval_secs'], 5);
+    expect(
+      lb ==
+          Tunnel.fromJson({
+            'id': 'l',
+            'lb_group': 'g',
+            'lb_group_key_set': true,
+          }),
+      isFalse,
+    );
+    expect(lb.healthCheck, isNot(const HealthCheck(kind: 'tcp')));
+    expect(lb.healthCheck.hashCode, lb.healthCheck.hashCode);
     final bw = Tunnel.fromJson({
       'id': 'b',
       'bandwidth_bps': 65536,

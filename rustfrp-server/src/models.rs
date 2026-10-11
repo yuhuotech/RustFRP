@@ -150,6 +150,15 @@ pub struct Tunnel {
     /// 限速由服务端执行（否则由客户端）。
     #[serde(default)]
     pub bandwidth_server: bool,
+    /// 负载均衡组名（空 = 不入组）。
+    #[serde(default)]
+    pub lb_group: String,
+    /// 是否设置了组密钥（密钥本身永不通过 API 返回）。
+    #[serde(default)]
+    pub lb_group_key_set: bool,
+    /// 健康检查（`None` = 不检查）。
+    #[serde(default)]
+    pub health_check: Option<rustfrp_core::wire::HealthSpec>,
 }
 
 /// 接入令牌（不含明文）。

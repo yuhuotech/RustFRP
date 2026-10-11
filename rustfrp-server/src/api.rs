@@ -1124,6 +1124,12 @@ struct CreateTunnel {
     #[serde(default)]
     bandwidth_server: bool,
     #[serde(default)]
+    lb_group: String,
+    #[serde(default)]
+    lb_group_key: String,
+    #[serde(default)]
+    health_check: Option<rustfrp_core::wire::HealthSpec>,
+    #[serde(default)]
     reason: String,
 }
 
@@ -1184,6 +1190,11 @@ async fn create_tunnel(
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
         bandwidth_server: b.bandwidth_server,
+        lb: rustfrp_core::wire::LbOpts {
+            group: b.lb_group,
+            group_key: b.lb_group_key,
+            health: b.health_check.filter(|h| !h.kind.is_empty()),
+        },
     };
     let t = st
         .db
@@ -1294,6 +1305,9 @@ struct PatchTunnel {
     proxy_protocol: Option<u8>,
     bandwidth_bps: Option<u64>,
     bandwidth_server: Option<bool>,
+    lb_group: Option<String>,
+    lb_group_key: Option<String>,
+    health_check: Option<rustfrp_core::wire::HealthSpec>,
     #[serde(default)]
     reason: String,
 }
@@ -1328,6 +1342,9 @@ async fn patch_tunnel(
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
         bandwidth_server: b.bandwidth_server,
+        lb_group: b.lb_group,
+        lb_group_key: b.lb_group_key,
+        health_check: b.health_check,
     };
     let t = st
         .db

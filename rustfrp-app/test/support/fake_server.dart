@@ -444,6 +444,12 @@ class FakeServer {
         t['proxy_protocol'] = body['proxy_protocol'] ?? 0;
         t['bandwidth_bps'] = body['bandwidth_bps'] ?? 0;
         t['bandwidth_server'] = body['bandwidth_server'] ?? false;
+        t['lb_group'] = body['lb_group'] ?? '';
+        t['lb_group_key_set'] =
+            ((body['lb_group_key'] as String?) ?? '').isNotEmpty;
+        if (body['health_check'] != null) {
+          t['health_check'] = body['health_check'];
+        }
         final pw = (body['http_password'] as String?) ?? '';
         t['http_password_set'] = pw.isNotEmpty;
         if (pw.isNotEmpty) httpPasswords[t['id']! as String] = pw;
@@ -470,8 +476,21 @@ class FakeServer {
           'proxy_protocol',
           'bandwidth_bps',
           'bandwidth_server',
+          'lb_group',
         ]) {
           if (body.containsKey(k)) t[k] = body[k];
+        }
+        if (body.containsKey('lb_group_key')) {
+          t['lb_group_key_set'] =
+              ((body['lb_group_key'] as String?) ?? '').isNotEmpty;
+        }
+        if (body.containsKey('health_check')) {
+          final h = body['health_check'] as Map<String, dynamic>?;
+          if (h == null || h['kind'] == '') {
+            t.remove('health_check');
+          } else {
+            t['health_check'] = h;
+          }
         }
         if (body.containsKey('http_password')) {
           final pw = body['http_password']! as String;

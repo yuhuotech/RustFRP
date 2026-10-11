@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -298,6 +300,7 @@ impl Edge {
         let mut sweep = tokio::time::interval(Duration::from_secs(5));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let routes = Arc::new(Routes::default());
+        let groups = Arc::new(TcpGroups::new(shutdown.clone()));
         let vopts = VhostOpts {
             head_timeout: self.cfg.vhost_head_timeout,
             open_timeout: self.cfg.user_conn_timeout,
@@ -326,6 +329,7 @@ impl Edge {
                         policy: self.policy.clone(),
                         names: names.clone(),
                         routes: routes.clone(),
+                        groups: groups.clone(),
                         traffic: self.traffic.clone(),
                         limiter: None,
                         log: self.log.clone(),
@@ -349,6 +353,7 @@ struct ClientCtx {
     policy: Arc<dyn Policy>,
     names: Arc<crate::metrics::Metrics>,
     routes: Arc<Routes>,
+    groups: Arc<TcpGroups>,
     traffic: Arc<pipe::Traffic>,
     /// 服务端限速（`bandwidthLimitMode = "server"`）；`None` = 不限。
     limiter: Option<Arc<pipe::Limiter>>,
@@ -486,6 +491,7 @@ async fn serve_standalone(
     ctx: &ClientCtx,
 ) -> Result<(), TunnelError> {
     let mut owned: Vec<String> = Vec::new();
+    let mut ups: HashMap<String, Arc<AtomicBool>> = HashMap::new();
     let result = async {
         loop {
             let msg = tokio::select! {
@@ -502,7 +508,10 @@ async fn serve_standalone(
                     } else {
                         activate(session, &ProxyDef::from(&spec), ctx)
                             .await
-                            .map(|(port, _)| port)
+                            .map(|s| {
+                                ups.insert(spec.name.clone(), s.up);
+                                s.port
+                            })
                     };
                     if started.is_ok() {
                         owned.push(spec.name.clone());
@@ -526,6 +535,16 @@ async fn serve_standalone(
                     write_frame(wr, &resp).await?;
                 }
                 ClientMsg::Applied { .. } => {}
+                ClientMsg::Health { name, healthy } => {
+                    if let Some(up) = ups.get(&name) {
+                        if up.swap(healthy, Relaxed) != healthy {
+                            ctx.log.info(&format!(
+                                "proxy [{name}] is {}",
+                                if healthy { "healthy" } else { "unhealthy" }
+                            ));
+                        }
+                    }
+                }
                 ClientMsg::Login(_) => return Err(TunnelError::Wire("duplicate login".into())),
             }
         }
@@ -541,6 +560,8 @@ async fn serve_standalone(
 struct Running {
     spec: ManagedProxy,
     stop: CancellationToken,
+    port: u16,
+    up: Arc<AtomicBool>,
 }
 
 async fn serve_managed(
@@ -584,6 +605,14 @@ async fn serve_managed(
                     msg = next_msg(&mut reader, ctx) => match msg? {
                         ClientMsg::Ping => write_frame(wr, &ServerMsg::Pong).await?,
                         ClientMsg::Applied { revision } => ctx.log.debug(&format!("client [{client_id}] applied revision {revision}")),
+                        ClientMsg::Health { name, healthy } => {
+                            if let Some(r) = running.get(&name) {
+                                if r.up.swap(healthy, Relaxed) != healthy {
+                                    ctx.log.info(&format!("proxy [{name}] is {}", if healthy { "healthy" } else { "unhealthy" }));
+                                    emit(&name, if healthy { ProxyState::Running(r.port) } else { ProxyState::Failed("health check failed".into()) });
+                                }
+                            }
+                        }
                         ClientMsg::NewProxy(_) | ClientMsg::Login(_) => {
                             return Err(TunnelError::Wire("unexpected message for a managed client".into()));
                         }
@@ -641,15 +670,25 @@ async fn reconcile(
             continue;
         }
         match activate(session, &ProxyDef::from(p), ctx).await {
-            Ok((port, stop)) => {
+            Ok(Started { port, stop, up }) => {
                 running.insert(
                     p.name.clone(),
                     Running {
                         spec: p.clone(),
                         stop,
+                        port,
+                        up,
                     },
                 );
-                emit(&p.name, ProxyState::Running(port));
+                // 启用健康检查的代理要等第一次探测成功才接收访问者：如实回报，而不是先报「运行中」。
+                if p.lb.health.is_some() {
+                    emit(
+                        &p.name,
+                        ProxyState::Failed("waiting for the first health check".into()),
+                    );
+                } else {
+                    emit(&p.name, ProxyState::Running(port));
+                }
             }
             Err(e) => {
                 ctx.log.warn(&format!("proxy [{}] failed: {e}", p.name));
@@ -670,6 +709,7 @@ struct ProxyDef {
     http: rustfrp_core::wire::HttpOpts,
     bandwidth_bps: u64,
     bandwidth_server: bool,
+    lb: rustfrp_core::wire::LbOpts,
 }
 
 impl From<&ProxySpec> for ProxyDef {
@@ -684,6 +724,7 @@ impl From<&ProxySpec> for ProxyDef {
             http: p.http.clone(),
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
+            lb: p.lb.clone(),
         }
     }
 }
@@ -700,6 +741,7 @@ impl From<&ManagedProxy> for ProxyDef {
             http: p.http.clone(),
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
+            lb: p.lb.clone(),
         }
     }
 }
@@ -713,15 +755,14 @@ fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
         && a.host_header_rewrite == b.host_header_rewrite
         && a.http == b.http
         && a.bandwidth_server == b.bandwidth_server
+        && a.lb.group == b.lb.group
+        && a.lb.group_key == b.lb.group_key
+        && a.lb.health.is_some() == b.lb.health.is_some()
         && (!a.bandwidth_server || a.bandwidth_bps == b.bandwidth_bps)
 }
 
 /// 启动一个代理（tcp / udp / http / https）。成功返回（对外端口, 停止令牌），失败返回给客户端看的原因。
-async fn activate(
-    session: &Session,
-    def: &ProxyDef,
-    ctx: &ClientCtx,
-) -> Result<(u16, CancellationToken), String> {
+async fn activate(session: &Session, def: &ProxyDef, ctx: &ClientCtx) -> Result<Started, String> {
     if !["tcp", "udp", "http", "https"].contains(&def.kind.as_str()) {
         return Err(format!("proxy type [{}] is not supported yet", def.kind));
     }
@@ -732,13 +773,15 @@ async fn activate(
         ));
     }
     let stop = ctx.cancel.child_token();
-    match launch(session, def, ctx, &stop).await {
+    // 启用健康检查的代理在第一次探测成功前不接收访问者。
+    let up = Arc::new(AtomicBool::new(def.lb.health.is_none()));
+    match launch(session, def, ctx, &stop, &up).await {
         Ok(port) => {
             ctx.log.info(&format!(
                 "proxy [{}] ({}) start, port {port}",
                 def.name, def.kind
             ));
-            Ok((port, stop))
+            Ok(Started { port, stop, up })
         }
         Err(e) => {
             ctx.names.release(&def.name);
@@ -748,12 +791,27 @@ async fn activate(
     }
 }
 
+/// 一个已启动的代理。
+struct Started {
+    port: u16,
+    stop: CancellationToken,
+    /// 健康标志，由客户端的 `Health` 消息更新。
+    up: Arc<AtomicBool>,
+}
+
 async fn launch(
     session: &Session,
     def: &ProxyDef,
     ctx: &ClientCtx,
     stop: &CancellationToken,
+    up: &Arc<AtomicBool>,
 ) -> Result<u16, String> {
+    if !def.lb.group.is_empty() && def.kind == "udp" {
+        return Err("udp proxies don't support load balancer groups".into());
+    }
+    if def.lb.health.is_some() && def.kind == "udp" {
+        return Err("udp proxies don't support health checks".into());
+    }
     let sub = ClientCtx {
         traffic: ctx
             .names
@@ -769,13 +827,29 @@ async fn launch(
     };
     match def.kind.as_str() {
         "tcp" => {
+            let member = Member {
+                id: 0,
+                proxy: def.name.clone(),
+                session: session.clone(),
+                traffic: sub.traffic.clone(),
+                limiter: sub.limiter.clone(),
+                up: up.clone(),
+            };
+            if !def.lb.group.is_empty() {
+                return ctx
+                    .groups
+                    .join(
+                        &def.lb.group,
+                        &def.lb.group_key,
+                        def.remote_port,
+                        member,
+                        stop,
+                        ctx,
+                    )
+                    .await;
+            }
             let (listener, port) = bind_proxy_port(def.remote_port, &ctx.cfg).await?;
-            tokio::spawn(accept_visitors(
-                listener,
-                def.name.clone(),
-                session.clone(),
-                sub,
-            ));
+            tokio::spawn(accept_visitors(listener, member, sub));
             Ok(port)
         }
         "udp" => {
@@ -836,6 +910,9 @@ async fn launch(
                 } else {
                     HttpRoute::from_opts(&def.http)?
                 }),
+                group: def.lb.group.clone(),
+                group_key: def.lb.group_key.clone(),
+                up: up.clone(),
             };
             let route_id = ctx.routes.add(https, &hosts, &route)?;
             let (routes, stop) = (ctx.routes.clone(), stop.clone());
@@ -907,16 +984,155 @@ async fn first_free_port(addr: &str, ranges: &[(u16, u16)]) -> Option<TcpListene
     None
 }
 
-async fn accept_visitors(listener: TcpListener, name: String, session: Session, ctx: ClientCtx) {
+/// 一个 tcp 代理的转发目标（组成员或独立代理）。
+#[derive(Clone)]
+struct Member {
+    id: u64,
+    proxy: String,
+    session: Session,
+    traffic: Arc<pipe::Traffic>,
+    limiter: Option<Arc<pipe::Limiter>>,
+    /// 健康（可接收访问者）。
+    up: Arc<AtomicBool>,
+}
+
+/// tcp 负载均衡组：同组成员共用一个公网端口，连接在健康成员间轮转。
+struct TcpGroup {
+    key: String,
+    port: u16,
+    members: Vec<Member>,
+    stop: CancellationToken,
+}
+
+/// Edge 上的全部 tcp 组。
+struct TcpGroups {
+    groups: tokio::sync::Mutex<HashMap<String, TcpGroup>>,
+    next_id: AtomicU64,
+    rr: AtomicUsize,
+    shutdown: CancellationToken,
+}
+
+impl TcpGroups {
+    fn new(shutdown: CancellationToken) -> Self {
+        Self {
+            groups: Default::default(),
+            next_id: AtomicU64::new(1),
+            rr: AtomicUsize::new(0),
+            shutdown,
+        }
+    }
+
+    /// 加入（必要时创建）一个组，返回组的公网端口。成员在 `stop` 取消时自动离开；最后一个成员离开则关闭监听。
+    async fn join(
+        self: &Arc<Self>,
+        group: &str,
+        key: &str,
+        requested: u16,
+        mut member: Member,
+        stop: &CancellationToken,
+        ctx: &ClientCtx,
+    ) -> Result<u16, String> {
+        let mut groups = self.groups.lock().await;
+        member.id = self.next_id.fetch_add(1, Relaxed);
+        let id = member.id;
+        let port = if let Some(g) = groups.get_mut(group) {
+            if g.key != key {
+                return Err(format!("group [{group}] key doesn't match"));
+            }
+            if requested != 0 && requested != g.port {
+                return Err(format!("group [{group}] port not match"));
+            }
+            g.members.push(member);
+            g.port
+        } else {
+            let (listener, port) = bind_proxy_port(requested, &ctx.cfg).await?;
+            let token = self.shutdown.child_token();
+            groups.insert(
+                group.to_string(),
+                TcpGroup {
+                    key: key.to_string(),
+                    port,
+                    members: vec![member],
+                    stop: token.clone(),
+                },
+            );
+            tokio::spawn(accept_group(
+                listener,
+                group.to_string(),
+                self.clone(),
+                token,
+                ctx.clone(),
+            ));
+            port
+        };
+        drop(groups);
+        let (this, group, stop) = (self.clone(), group.to_string(), stop.clone());
+        tokio::spawn(async move {
+            stop.cancelled().await;
+            let mut groups = this.groups.lock().await;
+            if let Some(g) = groups.get_mut(&group) {
+                g.members.retain(|m| m.id != id);
+                if g.members.is_empty() {
+                    g.stop.cancel();
+                    groups.remove(&group);
+                }
+            }
+        });
+        Ok(port)
+    }
+
+    /// 在健康成员里轮转挑一个。
+    async fn pick(&self, group: &str) -> Option<Member> {
+        let groups = self.groups.lock().await;
+        let up: Vec<&Member> = groups
+            .get(group)?
+            .members
+            .iter()
+            .filter(|m| m.up.load(Relaxed))
+            .collect();
+        let i = self.rr.fetch_add(1, Relaxed) % up.len().max(1);
+        up.get(i).map(|m| (*m).clone())
+    }
+}
+
+async fn accept_group(
+    listener: TcpListener,
+    group: String,
+    groups: Arc<TcpGroups>,
+    stop: CancellationToken,
+    ctx: ClientCtx,
+) {
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((visitor, peer)) = accepted else { continue };
+                let (groups, group, ctx) = (groups.clone(), group.clone(), ctx.clone());
+                tokio::spawn(async move {
+                    // 没有健康成员：直接断开，等同 frp 里代理被摘除。
+                    let Some(m) = groups.pick(&group).await else { return };
+                    if let Err(e) = forward(visitor, peer, &m, &ctx.cfg).await {
+                        ctx.log.debug(&format!("proxy [{}] visitor {peer}: {e}", m.proxy));
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn accept_visitors(listener: TcpListener, member: Member, ctx: ClientCtx) {
     loop {
         tokio::select! {
             _ = ctx.cancel.cancelled() => break,
             accepted = listener.accept() => {
                 let Ok((visitor, peer)) = accepted else { continue };
-                let (session, name, ctx) = (session.clone(), name.clone(), ctx.clone());
+                if !member.up.load(Relaxed) {
+                    continue;
+                }
+                let (member, ctx) = (member.clone(), ctx.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = forward(visitor, peer, &name, &session, &ctx).await {
-                        ctx.log.debug(&format!("proxy [{name}] visitor {peer}: {e}"));
+                    if let Err(e) = forward(visitor, peer, &member, &ctx.cfg).await {
+                        ctx.log.debug(&format!("proxy [{}] visitor {peer}: {e}", member.proxy));
                     }
                 });
             }
@@ -927,21 +1143,15 @@ async fn accept_visitors(listener: TcpListener, name: String, session: Session, 
 async fn forward(
     mut visitor: TcpStream,
     peer: SocketAddr,
-    name: &str,
-    session: &Session,
-    ctx: &ClientCtx,
+    m: &Member,
+    cfg: &EdgeConfig,
 ) -> Result<(), TunnelError> {
     let _ = visitor.set_nodelay(true);
-    let mut stream = within(
-        ctx.cfg.user_conn_timeout,
-        "open work stream",
-        session.open(),
-    )
-    .await?;
+    let mut stream = within(cfg.user_conn_timeout, "open work stream", m.session.open()).await?;
     write_frame(
         &mut stream,
         &StartWork {
-            proxy: name.to_string(),
+            proxy: m.proxy.clone(),
             src: peer.to_string(),
             dst: visitor
                 .local_addr()
@@ -950,15 +1160,77 @@ async fn forward(
         },
     )
     .await?;
-    match &ctx.limiter {
+    match &m.limiter {
         Some(l) => {
             let mut v = pipe::Limited::new(visitor, l.clone());
             let mut w = pipe::Limited::new(stream, l.clone());
-            pipe::relay_counted(&mut v, &mut w, &ctx.traffic).await?;
+            pipe::relay_counted(&mut v, &mut w, &m.traffic).await?;
         }
         None => {
-            pipe::relay_counted(&mut visitor, &mut stream, &ctx.traffic).await?;
+            pipe::relay_counted(&mut visitor, &mut stream, &m.traffic).await?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn base() -> ManagedProxy {
+        ManagedProxy {
+            name: "p".into(),
+            kind: "http".into(),
+            remote_port: 0,
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            custom_domains: vec!["a.com".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_listener_level_changes_require_a_restart() {
+        let a = base();
+        // 只有本地目标变化：无需重启。
+        let mut same = a.clone();
+        same.local_ip = "10.0.0.1".into();
+        same.local_port = 8080;
+        same.proxy_protocol = 2;
+        assert!(same_listener(&a, &same));
+        type Change = Box<dyn Fn(&mut ManagedProxy)>;
+        let changes: Vec<(&str, Change)> = vec![
+            ("kind", Box::new(|p| p.kind = "https".into())),
+            ("remote_port", Box::new(|p| p.remote_port = 7)),
+            (
+                "domains",
+                Box::new(|p| p.custom_domains.push("b.com".into())),
+            ),
+            ("subdomain", Box::new(|p| p.subdomain = "s".into())),
+            ("rewrite", Box::new(|p| p.host_header_rewrite = "x".into())),
+            ("http", Box::new(|p| p.http.http_user = "u".into())),
+            ("bandwidth mode", Box::new(|p| p.bandwidth_server = true)),
+            ("group", Box::new(|p| p.lb.group = "g".into())),
+            ("group key", Box::new(|p| p.lb.group_key = "k".into())),
+            (
+                "health on",
+                Box::new(|p| p.lb.health = Some(Default::default())),
+            ),
+        ];
+        for (what, change) in changes {
+            let mut b = a.clone();
+            change(&mut b);
+            assert!(!same_listener(&a, &b), "{what}");
+        }
+        // 服务端限速时，速率变化也要重建限速器。
+        let (mut s1, mut s2) = (a.clone(), a);
+        s1.bandwidth_server = true;
+        s2.bandwidth_server = true;
+        s1.bandwidth_bps = 1;
+        s2.bandwidth_bps = 2;
+        assert!(!same_listener(&s1, &s2));
+        s2.bandwidth_bps = 1;
+        assert!(same_listener(&s1, &s2));
+    }
 }

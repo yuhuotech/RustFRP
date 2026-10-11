@@ -51,6 +51,8 @@ pub struct ProxyCfg {
     pub bandwidth_bps: u64,
     /// 限速由服务端（Edge）执行；否则由本客户端执行。
     pub bandwidth_server: bool,
+    /// 负载均衡组与健康检查。
+    pub lb: rustfrp_core::wire::LbOpts,
 }
 
 /// 首次接入所需信息。
@@ -385,6 +387,46 @@ struct Local {
 
 type Locals = Arc<Mutex<HashMap<String, Local>>>;
 
+/// 一个被监控代理的探测参数。
+type Watch = (String, rustfrp_core::wire::HealthSpec, String, u16);
+
+/// 本次会话里的全部健康检查任务及其最近结果。
+struct Monitors {
+    running: HashMap<String, (Watch, CancellationToken)>,
+    states: HashMap<String, bool>,
+    tx: mpsc::Sender<(String, bool)>,
+    parent: CancellationToken,
+}
+
+impl Monitors {
+    /// 让运行中的任务与期望一致：多余 / 参数变化的停掉，新增的启动。
+    fn sync(&mut self, wanted: Vec<Watch>) {
+        self.running.retain(|name, (w, stop)| {
+            let keep = wanted.contains(w);
+            if !keep {
+                stop.cancel();
+                self.states.remove(name);
+            }
+            keep
+        });
+        for w in wanted {
+            if self.running.contains_key(&w.0) {
+                continue;
+            }
+            let stop = self.parent.child_token();
+            crate::health::spawn(
+                w.0.clone(),
+                w.1.clone(),
+                w.2.clone(),
+                w.3,
+                self.tx.clone(),
+                stop.clone(),
+            );
+            self.running.insert(w.0.clone(), (w, stop));
+        }
+    }
+}
+
 async fn talk(
     cfg: &Arc<ClientConfig>,
     session: &Session,
@@ -433,6 +475,7 @@ async fn talk(
     // 独立模式：注册全部代理（顺序进行，逐个读应答）。受管模式由服务端下发配置，这里不注册。
     let locals: Locals = Arc::default();
     let own_proxies: &[ProxyCfg] = if managed { &[] } else { &cfg.proxies };
+    let mut watches: Vec<Watch> = Vec::new();
     for p in own_proxies {
         let spec = ProxySpec {
             name: p.name.clone(),
@@ -444,6 +487,7 @@ async fn talk(
             http: p.http.clone(),
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
+            lb: p.lb.clone(),
         };
         if let Err(e) = write_frame(&mut wr, &ClientMsg::NewProxy(spec)).await {
             return lost(e.to_string(), true);
@@ -473,6 +517,9 @@ async fn talk(
                             limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server),
                         },
                     );
+                if let Some(h) = &p.lb.health {
+                    watches.push((name.clone(), h.clone(), p.local_ip.clone(), p.local_port));
+                }
                 emit(events, Event::ProxyStarted { name, remote_port });
             }
             Ok(ServerMsg::NewProxyResp { name, error, .. }) => {
@@ -483,6 +530,15 @@ async fn talk(
             Err(e) => return lost(e.to_string(), true),
         }
     }
+    let (health_tx, mut health_rx) = mpsc::channel::<(String, bool)>(16);
+    let mon_cancel = cancel.child_token();
+    let mut monitors = Monitors {
+        running: HashMap::new(),
+        states: HashMap::new(),
+        tx: health_tx,
+        parent: mon_cancel.clone(),
+    };
+    monitors.sync(watches);
     // 控制流读取放到独立任务（读帧不是取消安全的），主循环只看通道。
     let (pong_tx, mut pong_rx) = mpsc::channel::<Result<ServerMsg, TunnelError>>(4);
     let reader = tokio::spawn(async move {
@@ -523,8 +579,29 @@ async fn talk(
                     if let Err(e) = crate::local_control::update_tunnels(&cfg.local_tunnels,&set) { break lost(e.into(),true); }
                     let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server) })).collect();
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
+                    monitors.sync(
+                        set.proxies
+                            .iter()
+                            .filter_map(|p| {
+                                p.lb.health
+                                    .clone()
+                                    .map(|h| (p.name.clone(), h, p.local_ip.clone(), p.local_port))
+                            })
+                            .collect(),
+                    );
                     emit(events, Event::ConfigApplied { revision: set.revision, proxies: set.proxies.len() });
                     if let Err(e) = write_frame(&mut wr, &ClientMsg::Applied { revision: set.revision }).await {
+                        break lost(e.to_string(), true);
+                    }
+                    // Edge 可能因配置变化重启了代理（健康状态回到初始）：把已知结果重新告知。
+                    let mut failed = None;
+                    for (name, healthy) in &monitors.states {
+                        if let Err(e) = write_frame(&mut wr, &ClientMsg::Health { name: name.clone(), healthy: *healthy }).await {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = failed {
                         break lost(e.to_string(), true);
                     }
                 }
@@ -532,6 +609,12 @@ async fn talk(
                 Some(Err(e)) => break lost(e.to_string(), true),
                 None => break lost("control stream closed".into(), true),
             },
+            Some((name, healthy)) = health_rx.recv() => {
+                monitors.states.insert(name.clone(), healthy);
+                if let Err(e) = write_frame(&mut wr, &ClientMsg::Health { name, healthy }).await {
+                    break lost(e.to_string(), true);
+                }
+            }
             stream = inbound.recv() => match stream {
                 Some(s) => {
                     let (locals, cfg, log) = (locals.clone(), cfg.clone(), log.clone());
@@ -546,6 +629,7 @@ async fn talk(
         }
     };
     reader.abort();
+    mon_cancel.cancel();
     cfg.local_tunnels
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

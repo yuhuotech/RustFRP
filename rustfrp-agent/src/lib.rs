@@ -14,6 +14,7 @@ pub mod app;
 pub mod cli;
 pub mod client;
 pub mod edge;
+pub mod health;
 pub mod local_control;
 pub mod log;
 pub mod managed;

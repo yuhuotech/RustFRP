@@ -444,6 +444,56 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
         : '${(widget.existing!.bandwidthBps / 1024).ceil()}',
   );
   late bool _bandwidthServer = widget.existing?.bandwidthServer ?? false;
+  late final _lbGroup = TextEditingController(
+    text: widget.existing?.lbGroup ?? '',
+  );
+  final _lbKey = TextEditingController();
+  late String _hcKind = widget.existing?.healthCheck?.kind ?? '';
+  late final _hcPath = TextEditingController(
+    text: widget.existing?.healthCheck?.path ?? '',
+  );
+  late final _hcTimeout = TextEditingController(
+    text: '${widget.existing?.healthCheck?.timeoutSecs ?? 3}',
+  );
+  late final _hcMax = TextEditingController(
+    text: '${widget.existing?.healthCheck?.maxFailed ?? 1}',
+  );
+  late final _hcInterval = TextEditingController(
+    text: '${widget.existing?.healthCheck?.intervalSecs ?? 10}',
+  );
+
+  /// 当前表单对应的健康检查；不检查返回 null，数值非法返回 [_badHealth]。
+  HealthCheck? get _health {
+    if (_hcKind.isEmpty) return null;
+    final t = int.tryParse(_hcTimeout.text.trim());
+    final m = int.tryParse(_hcMax.text.trim());
+    final i = int.tryParse(_hcInterval.text.trim());
+    final path = _hcPath.text.trim();
+    final ok =
+        t != null &&
+        t >= 1 &&
+        t <= 60 &&
+        m != null &&
+        m >= 1 &&
+        m <= 20 &&
+        i != null &&
+        i >= 1 &&
+        i <= 3600 &&
+        (_hcKind != 'http' || path.startsWith('/'));
+    if (!ok) return _badHealth;
+    return HealthCheck(
+      kind: _hcKind,
+      timeoutSecs: t,
+      maxFailed: m,
+      intervalSecs: i,
+      path: _hcKind == 'http' ? path : '',
+      headers: _hcKind == 'http'
+          ? widget.existing?.healthCheck?.headers ?? const {}
+          : const {},
+    );
+  }
+
+  static const _badHealth = HealthCheck(kind: '!');
 
   /// 限速输入（KB/s）→ 字节/秒；留空 = 0（不限），非法 = null。
   int? get _bandwidthBps {
@@ -495,6 +545,12 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       _headers,
       _respHeaders,
       _bandwidth,
+      _lbGroup,
+      _lbKey,
+      _hcPath,
+      _hcTimeout,
+      _hcMax,
+      _hcInterval,
     ]) {
       c.dispose();
     }
@@ -538,7 +594,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
   bool get _valid =>
       _client != null &&
       _httpValid &&
-      (_kind == 'udp' || _bandwidthBps != null) &&
+      (_kind == 'udp' || (_bandwidthBps != null && _health != _badHealth)) &&
       _name.text.trim().isNotEmpty &&
       _localIp.text.trim().isNotEmpty &&
       (_lp ?? 0) >= 1 &&
@@ -572,6 +628,9 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           proxyProtocol: _kind == 'udp' ? 0 : _proxyProtocol,
           bandwidthBps: _kind == 'udp' ? 0 : _bandwidthBps!,
           bandwidthServer: _kind != 'udp' && _bandwidthServer,
+          lbGroup: _kind == 'udp' ? '' : _lbGroup.text.trim(),
+          lbGroupKey: _kind == 'udp' ? '' : _lbKey.text,
+          healthCheck: _kind == 'udp' ? null : _health,
           reason: '通过面板创建隧道',
         );
       } else {
@@ -598,6 +657,16 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           proxyProtocol: _kind == 'udp' ? null : _proxyProtocol,
           bandwidthBps: _kind == 'udp' ? null : _bandwidthBps,
           bandwidthServer: _kind == 'udp' ? null : _bandwidthServer,
+          lbGroup: _kind == 'udp' ? null : _lbGroup.text.trim(),
+          // 留空 = 保持原密钥；退出组时一并清掉。
+          lbGroupKey: _kind == 'udp'
+              ? null
+              : _lbGroup.text.trim().isEmpty
+              ? ''
+              : (_lbKey.text.isEmpty ? null : _lbKey.text),
+          healthCheck: _kind == 'udp'
+              ? null
+              : (_health ?? const HealthCheck(kind: '')),
           reason: '通过面板修改隧道',
         );
       }
@@ -756,6 +825,75 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
                 ),
               ],
             ),
+            const SizedBox(height: 12),
+            label('负载均衡组（可选；同组隧道共用端口 / 域名，连接在健康成员间轮转）'),
+            Row(
+              children: [
+                Expanded(
+                  child: LTextField(
+                    key: const Key('tunnel-lb-group'),
+                    controller: _lbGroup,
+                    hint: '组名',
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: LTextField(
+                    key: const Key('tunnel-lb-key'),
+                    controller: _lbKey,
+                    hint: editing && widget.existing!.lbGroupKeySet
+                        ? '组密钥已设置（留空不改）'
+                        : '组密钥',
+                    obscure: true,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            label('健康检查（探测本地服务；不健康时暂停接收访问者）'),
+            LSelect<String>(
+              key: const Key('tunnel-health-kind'),
+              value: _hcKind,
+              options: const [
+                LSelectOption('', '不检查'),
+                LSelectOption('tcp', 'TCP 连接'),
+                LSelectOption('http', 'HTTP 2xx'),
+              ],
+              onChanged: (v) => setState(() => _hcKind = v ?? ''),
+            ),
+            if (_hcKind.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              if (_hcKind == 'http') ...[
+                LTextField(
+                  key: const Key('tunnel-health-path'),
+                  controller: _hcPath,
+                  hint: '/healthz',
+                  onChanged: (_) => setState(() {}),
+                ),
+                const SizedBox(height: 8),
+              ],
+              Row(
+                children: [
+                  for (final (key, ctl, hint) in [
+                    ('tunnel-health-timeout', _hcTimeout, '超时(秒)'),
+                    ('tunnel-health-max', _hcMax, '失败次数'),
+                    ('tunnel-health-interval', _hcInterval, '间隔(秒)'),
+                  ]) ...[
+                    Expanded(
+                      child: LTextField(
+                        key: Key(key),
+                        controller: ctl,
+                        hint: hint,
+                        onChanged: (_) => setState(() {}),
+                      ),
+                    ),
+                    if (key != 'tunnel-health-interval')
+                      const SizedBox(width: 8),
+                  ],
+                ],
+              ),
+            ],
           ],
           const SizedBox(height: 12),
           if (!_web) ...[

@@ -42,6 +42,12 @@ pub struct Route {
     pub http: Arc<HttpRoute>,
     /// 服务端限速；`None` = 不限。
     pub limiter: Option<Arc<pipe::Limiter>>,
+    /// 负载均衡组名；空 = 不入组。同组成员可以共用域名与路径。
+    pub group: String,
+    /// 组密钥：同组成员必须一致。
+    pub group_key: String,
+    /// 是否健康；不健康的路由不参与选路。
+    pub up: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// http 代理在 Edge 上生效的选项（已校验、已规范化）。
@@ -131,6 +137,8 @@ pub struct Routes {
     http: Table,
     https: Table,
     next_id: std::sync::atomic::AtomicU64,
+    /// 组内轮转计数。
+    rr: std::sync::atomic::AtomicUsize,
 }
 
 impl Routes {
@@ -150,14 +158,28 @@ impl Routes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for h in hosts {
-            if t.iter().any(|(p, r)| {
-                p.eq_ignore_ascii_case(h)
+            for (p, r) in t.iter() {
+                if !(p.eq_ignore_ascii_case(h)
                     && r.http.route_by_user == route.http.route_by_user
                     && r.http
                         .locations
                         .iter()
-                        .any(|l| route.http.locations.contains(l))
-            }) {
+                        .any(|l| route.http.locations.contains(l)))
+                {
+                    continue;
+                }
+                // 同组、同密钥、路径集合完全一致的路由共用同一个域名，由 Edge 在健康成员间轮转。
+                if !route.group.is_empty() && r.group == route.group {
+                    if r.group_key != route.group_key {
+                        return Err(format!(
+                            "group [{}] key doesn't match the existing members",
+                            route.group
+                        ));
+                    }
+                    if r.http.locations == route.http.locations {
+                        continue;
+                    }
+                }
                 return Err(format!("custom domain [{h}] is already used"));
             }
         }
@@ -196,34 +218,62 @@ impl Routes {
         }
     }
 
-    /// 精确匹配优先，其次是最长的通配模式。
+    /// 精确匹配优先，其次是最长的通配模式；同组成员在健康者中轮转。
     pub fn lookup(&self, https: bool, host: &str) -> Option<Route> {
         let t = self
             .table(https)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        t.iter()
-            .find(|(p, _)| p.eq_ignore_ascii_case(host))
+        let pattern = t
+            .iter()
+            .filter(|(_, r)| r.up.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(p, _)| p)
+            .find(|p| p.eq_ignore_ascii_case(host))
             .or_else(|| {
                 t.iter()
-                    .filter(|(p, _)| p.starts_with("*.") && domain_matches(p, host))
-                    .max_by_key(|(p, _)| p.len())
-            })
-            .map(|(_, r)| r.clone())
+                    .filter(|(p, r)| {
+                        r.up.load(std::sync::atomic::Ordering::Relaxed)
+                            && p.starts_with("*.")
+                            && domain_matches(p, host)
+                    })
+                    .map(|(p, _)| p)
+                    .max_by_key(|p| p.len())
+            })?;
+        self.pick(
+            t.iter()
+                .filter(|(p, r)| p == pattern && r.up.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(_, r)| r),
+        )
+    }
+
+    /// 在候选（同域名、同路径的同组成员）里轮转挑一个。
+    fn pick<'a>(&self, candidates: impl Iterator<Item = &'a Route>) -> Option<Route> {
+        let all: Vec<&Route> = candidates.collect();
+        let n = all.len();
+        let i = if n > 1 {
+            self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n
+        } else {
+            0
+        };
+        all.get(i).map(|r| (*r).clone())
     }
 }
 
 impl Routes {
     /// HTTP 选路（frp 语义）：先精确域名，再由具体到宽泛的通配域名；
-    /// 同一域名内取匹配路径前缀最长者，优先 `routeByHTTPUser` 与请求 Basic 用户名一致的，其次未限定用户的。
+    /// 同一域名内取匹配路径前缀最长者，优先 `routeByHTTPUser` 与请求 Basic 用户名一致的，其次未限定用户的；
+    /// 不健康的路由不参与，同组成员在健康者中轮转。
     pub fn lookup_http(&self, host: &str, path: &str, user: &str) -> Option<Route> {
         let t = self
             .table(false)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let up = |r: &Route| r.up.load(std::sync::atomic::Ordering::Relaxed);
         let mut tiers: Vec<&str> = Vec::new();
-        for (p, _) in t.iter() {
-            if (p.eq_ignore_ascii_case(host) || (p.starts_with("*.") && domain_matches(p, host)))
+        for (p, r) in t.iter() {
+            if up(r)
+                && (p.eq_ignore_ascii_case(host)
+                    || (p.starts_with("*.") && domain_matches(p, host)))
                 && !tiers.iter().any(|x| x.eq_ignore_ascii_case(p))
             {
                 tiers.push(p);
@@ -234,24 +284,27 @@ impl Routes {
         for tier in tiers {
             let users: &[&str] = if user.is_empty() { &[""] } else { &[user, ""] };
             for want_user in users.iter().copied() {
-                let best = t
-                    .iter()
-                    .filter(|(p, r)| {
-                        p.eq_ignore_ascii_case(tier) && r.http.route_by_user == want_user
+                let matched = |r: &Route| {
+                    r.http
+                        .locations
+                        .iter()
+                        .filter(|l| location_matches(path, l))
+                        .map(String::len)
+                        .max()
+                };
+                let candidates = || {
+                    t.iter().filter(|(p, r)| {
+                        up(r) && p.eq_ignore_ascii_case(tier) && r.http.route_by_user == want_user
                     })
-                    .filter_map(|(_, r)| {
-                        r.http
-                            .locations
-                            .iter()
-                            .filter(|l| location_matches(path, l))
-                            .map(String::len)
-                            .max()
-                            .map(|len| (len, r))
-                    })
-                    .max_by_key(|(len, _)| *len);
-                if let Some((_, r)) = best {
-                    return Some(r.clone());
-                }
+                };
+                let Some(best) = candidates().filter_map(|(_, r)| matched(r)).max() else {
+                    continue;
+                };
+                return self.pick(
+                    candidates()
+                        .filter(|(_, r)| matched(r) == Some(best))
+                        .map(|(_, r)| r),
+                );
             }
         }
         None
@@ -952,4 +1005,108 @@ async fn udp_peer(
     };
     reader.abort();
     result
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn session() -> Session {
+        let (a, _b) = tokio::io::duplex(1024);
+        rustfrp_core::mux::spawn(a, true, Default::default()).0
+    }
+
+    fn route(proxy: &str, group: &str, key: &str, locations: &[&str]) -> Route {
+        Route {
+            id: 0,
+            proxy: proxy.into(),
+            session: session(),
+            rewrite: String::new(),
+            traffic: Default::default(),
+            http: Arc::new(HttpRoute {
+                locations: locations.iter().map(|l| l.to_string()).collect(),
+                ..Default::default()
+            }),
+            limiter: None,
+            group: group.into(),
+            group_key: key.into(),
+            up: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[tokio::test]
+    async fn group_members_share_a_domain_and_rotate_between_healthy_ones() {
+        let routes = Routes::default();
+        let hosts = |h: &str| vec![h.to_string()];
+        let (a, b) = (route("a", "g", "k", &["/"]), route("b", "g", "k", &["/"]));
+        routes.add(false, &hosts("x.com"), &a).unwrap();
+        routes.add(false, &hosts("x.com"), &b).unwrap();
+        // 密钥不同 / 路径集合不同 / 不在组里：都不能共用。
+        let err = routes
+            .add(false, &hosts("x.com"), &route("c", "g", "other", &["/"]))
+            .unwrap_err();
+        assert!(err.contains("key doesn't match"), "{err}");
+        for r in [
+            route("d", "g", "k", &["/", "/api"]),
+            route("e", "", "", &["/"]),
+            route("f", "h", "k", &["/"]),
+        ] {
+            let err = routes.add(false, &hosts("x.com"), &r).unwrap_err();
+            assert!(err.contains("already used"), "{err}");
+        }
+        let picked = |routes: &Routes| {
+            (0..6)
+                .filter_map(|_| routes.lookup_http("x.com", "/p", "").map(|r| r.proxy))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(picked(&routes), ["a".to_string(), "b".to_string()].into());
+        // 不健康的成员不参与选路；全部不健康则没有路由。
+        a.up.store(false, Ordering::Relaxed);
+        assert_eq!(picked(&routes), ["b".to_string()].into());
+        b.up.store(false, Ordering::Relaxed);
+        assert!(routes.lookup_http("x.com", "/p", "").is_none());
+        a.up.store(true, Ordering::Relaxed);
+        b.up.store(true, Ordering::Relaxed);
+
+        // https：通配域名同样在健康成员间轮转，精确域名优先。
+        routes
+            .add(true, &hosts("*.s.com"), &route("w1", "t", "k", &["/"]))
+            .unwrap();
+        let w2 = route("w2", "t", "k", &["/"]);
+        routes.add(true, &hosts("*.s.com"), &w2).unwrap();
+        routes
+            .add(true, &hosts("exact.s.com"), &route("ex", "", "", &["/"]))
+            .unwrap();
+        assert_eq!(routes.lookup(true, "exact.s.com").unwrap().proxy, "ex");
+        let wild: std::collections::BTreeSet<_> = (0..6)
+            .filter_map(|_| routes.lookup(true, "a.s.com").map(|r| r.proxy))
+            .collect();
+        assert_eq!(wild, ["w1".to_string(), "w2".to_string()].into());
+        w2.up.store(false, Ordering::Relaxed);
+        for _ in 0..3 {
+            assert_eq!(routes.lookup(true, "a.s.com").unwrap().proxy, "w1");
+        }
+        assert!(routes.lookup(true, "nope.com").is_none());
+    }
+
+    #[test]
+    fn response_header_options_are_validated() {
+        let opts = |k: &str| HttpOpts {
+            response_headers: [(k.to_string(), "v".to_string())].into(),
+            ..Default::default()
+        };
+        assert!(HttpRoute::from_opts(&opts("X-Ok")).is_ok());
+        for bad in [
+            "Content-Length",
+            "transfer-encoding",
+            "Connection",
+            "UPGRADE",
+            "Bad Name",
+        ] {
+            let err = HttpRoute::from_opts(&opts(bad)).unwrap_err();
+            assert!(err.contains("invalid response header"), "{bad}: {err}");
+        }
+    }
 }
