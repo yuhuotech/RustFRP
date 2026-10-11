@@ -418,6 +418,9 @@ async fn node(State(st): State<AppState>, _a: Auth) -> Json<serde_json::Value> {
         "public_host": st.cfg.public_host,
         "edge_port": st.cfg.edge_port(),
         "allow_ports": st.cfg.allow_ports,
+        "vhost_http_port": st.cfg.vhost_http,
+        "vhost_https_port": st.cfg.vhost_https,
+        "subdomain_host": st.cfg.subdomain_host,
         "version": env!("CARGO_PKG_VERSION"),
         "clients_online": st.hub.online_ids().len(),
     }))
@@ -610,6 +613,12 @@ struct CreateTunnel {
     #[serde(default = "yes")]
     enabled: bool,
     #[serde(default)]
+    custom_domains: Vec<String>,
+    #[serde(default)]
+    subdomain: String,
+    #[serde(default)]
+    host_header_rewrite: String,
+    #[serde(default)]
     reason: String,
 }
 
@@ -630,6 +639,26 @@ fn port_policy(cfg: &Config, remote_port: i64) -> Result<(), ApiError> {
     }
 }
 
+/// 该服务器是否开启了对应的虚拟主机端口 / 子域名后缀。
+fn vhost_policy(cfg: &Config, kind: &str, subdomain: &str) -> Result<(), ApiError> {
+    if kind == "http" && cfg.vhost_http.is_none() {
+        return Err(ApiError::bad(
+            "http tunnels need the vhost HTTP port (set RUSTFRP_VHOST_HTTP on the server)",
+        ));
+    }
+    if kind == "https" && cfg.vhost_https.is_none() {
+        return Err(ApiError::bad(
+            "https tunnels need the vhost HTTPS port (set RUSTFRP_VHOST_HTTPS on the server)",
+        ));
+    }
+    if !subdomain.is_empty() && cfg.subdomain_host.is_empty() {
+        return Err(ApiError::bad(
+            "subdomains need RUSTFRP_SUBDOMAIN_HOST on the server",
+        ));
+    }
+    Ok(())
+}
+
 async fn create_tunnel(
     State(st): State<AppState>,
     a: Auth,
@@ -638,6 +667,7 @@ async fn create_tunnel(
     a.require(&st, Role::Operator).await?;
     let why = reason(&b.reason)?;
     port_policy(&st.cfg, b.remote_port)?;
+    vhost_policy(&st.cfg, &b.kind, &b.subdomain)?;
     let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
     let new = NewTunnel {
         client_id: b.client_id,
@@ -647,6 +677,9 @@ async fn create_tunnel(
         local_port: b.local_port,
         remote_port: b.remote_port,
         enabled: b.enabled,
+        custom_domains: b.custom_domains,
+        subdomain: b.subdomain,
+        host_header_rewrite: b.host_header_rewrite,
     };
     let t = st
         .db
@@ -680,6 +713,9 @@ struct PatchTunnel {
     local_port: Option<i64>,
     remote_port: Option<i64>,
     enabled: Option<bool>,
+    custom_domains: Option<Vec<String>>,
+    subdomain: Option<String>,
+    host_header_rewrite: Option<String>,
     #[serde(default)]
     reason: String,
 }
@@ -702,6 +738,9 @@ async fn patch_tunnel(
         local_port: b.local_port,
         remote_port: b.remote_port,
         enabled: b.enabled,
+        custom_domains: b.custom_domains,
+        subdomain: b.subdomain,
+        host_header_rewrite: b.host_header_rewrite,
     };
     let t = st
         .db
@@ -1169,6 +1208,22 @@ mod tests {
         assert!(port_policy(&cfg, 0).is_ok() && port_policy(&cfg, 6050).is_ok());
         assert!(port_policy(&cfg, 5999).is_err());
         assert!(port_policy(&Config::default(), 1).is_ok());
+    }
+
+    #[test]
+    fn vhost_policy_rules() {
+        let off = Config::default();
+        assert!(vhost_policy(&off, "tcp", "").is_ok());
+        assert!(vhost_policy(&off, "http", "").is_err());
+        assert!(vhost_policy(&off, "https", "").is_err());
+        assert!(vhost_policy(&off, "udp", "x").is_err());
+        let on = Config {
+            vhost_http: Some(80),
+            vhost_https: Some(443),
+            subdomain_host: "t.com".into(),
+            ..Config::default()
+        };
+        assert!(vhost_policy(&on, "http", "web").is_ok() && vhost_policy(&on, "https", "").is_ok());
     }
 
     #[test]

@@ -405,7 +405,7 @@ pub fn bump_revision(c: &Connection, id: &str) -> Res<i64> {
 // ───────────── 隧道 ─────────────
 
 /// 新建隧道的参数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewTunnel {
     /// 所属设备。
     pub client_id: String,
@@ -421,6 +421,12 @@ pub struct NewTunnel {
     pub remote_port: i64,
     /// 是否启用。
     pub enabled: bool,
+    /// http / https：自定义域名。
+    pub custom_domains: Vec<String>,
+    /// http / https：子域名。
+    pub subdomain: String,
+    /// http：改写 Host 头。
+    pub host_header_rewrite: String,
 }
 
 /// 修改隧道的参数（`None` 表示不改）。
@@ -436,6 +442,12 @@ pub struct TunnelPatch {
     pub remote_port: Option<i64>,
     /// 是否启用。
     pub enabled: Option<bool>,
+    /// http / https：自定义域名。
+    pub custom_domains: Option<Vec<String>>,
+    /// http / https：子域名。
+    pub subdomain: Option<String>,
+    /// http：改写 Host 头。
+    pub host_header_rewrite: Option<String>,
 }
 
 fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
@@ -453,9 +465,12 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         state: r.get(10)?,
         status_port: r.get::<_, i64>(11)? as u16,
         status_error: r.get(12)?,
+        custom_domains: split_domains(&r.get::<_, String>(13)?),
+        subdomain: r.get(14)?,
+        host_header_rewrite: r.get(15)?,
     })
 }
-const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error";
+const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite";
 
 fn check_port(v: i64, what: &str, allow_zero: bool) -> Res<()> {
     let lo = i64::from(!allow_zero);
@@ -477,43 +492,188 @@ fn check_host(h: &str) -> Res<()> {
     Ok(())
 }
 
-fn ensure_remote_port_free(c: &Connection, port: i64, except_id: Option<&str>) -> Res<()> {
-    if port == 0 {
+const KINDS: &[&str] = &["tcp", "udp", "http", "https"];
+
+fn is_web(kind: &str) -> bool {
+    kind == "http" || kind == "https"
+}
+
+fn split_domains(s: &str) -> Vec<String> {
+    s.split(',')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 校验并规范化域名（小写；允许 `*.example.com` 通配）。
+fn normalize_domains(list: &[String]) -> Res<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in list {
+        let d = raw.trim().to_ascii_lowercase();
+        let body = d.strip_prefix("*.").unwrap_or(&d);
+        let ok = !body.is_empty()
+            && d.len() <= 253
+            && body.split('.').all(|l| {
+                !l.is_empty()
+                    && l.len() <= 63
+                    && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+            });
+        if !ok {
+            return Err(StoreError::Invalid(format!(
+                "\"{}\" is not a valid domain name",
+                raw.trim()
+            )));
+        }
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    Ok(out)
+}
+
+fn check_subdomain(s: &str) -> Res<()> {
+    let ok = s.is_empty()
+        || (s.len() <= 63
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !s.starts_with('-')
+            && !s.ends_with('-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid(
+            "subdomain must be a single DNS label (letters, digits, '-')".into(),
+        ))
+    }
+}
+
+fn check_rewrite(s: &str) -> Res<()> {
+    if s.len() > 253 || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(StoreError::Invalid(
+            "host_header_rewrite must be a host name (optionally with port)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 同一协议类别内远程端口不能重复（tcp 与 udp 是不同的端口空间）。
+fn ensure_remote_port_free(
+    c: &Connection,
+    kind: &str,
+    port: i64,
+    except_id: Option<&str>,
+) -> Res<()> {
+    if port == 0 || is_web(kind) {
         return Ok(());
     }
     let taken: Option<String> = c
         .query_row(
-            "SELECT id FROM tunnels WHERE remote_port = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
-            params![port, except_id],
+            "SELECT id FROM tunnels WHERE remote_port = ?1 AND kind = ?3 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
+            params![port, except_id, kind],
             |r| r.get(0),
         )
         .optional()?;
     if taken.is_some() {
         return Err(StoreError::Conflict(format!(
-            "remote port {port} is already used by another tunnel"
+            "remote port {port} is already used by another {kind} tunnel"
         )));
     }
     Ok(())
 }
 
-/// 创建隧道。
-pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
+/// 同类别（http / https）内域名不能重复；子域名按 `sub.<根域名>` 在运行时解析，这里按「同名子域名」去重。
+fn ensure_domains_free(
+    c: &Connection,
+    kind: &str,
+    domains: &[String],
+    subdomain: &str,
+    except_id: Option<&str>,
+) -> Res<()> {
+    if !is_web(kind) {
+        return Ok(());
+    }
+    let mut st = c.prepare(
+        "SELECT id, custom_domains, subdomain FROM tunnels WHERE kind = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR id <> ?2)",
+    )?;
+    let rows = st
+        .query_map(params![kind, except_id], |r| {
+            Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (other_domains, other_sub) in rows {
+        let theirs = split_domains(&other_domains);
+        if let Some(d) = domains.iter().find(|d| theirs.contains(d)) {
+            return Err(StoreError::Conflict(format!(
+                "domain \"{d}\" is already used by another {kind} tunnel"
+            )));
+        }
+        if !subdomain.is_empty() && subdomain == other_sub {
+            return Err(StoreError::Conflict(format!(
+                "subdomain \"{subdomain}\" is already used by another {kind} tunnel"
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct Checked {
+    name: String,
+    kind: String,
+    local_ip: String,
+    local_port: i64,
+    remote_port: i64,
+    domains: Vec<String>,
+    subdomain: String,
+    rewrite: String,
+}
+
+fn check_tunnel(
+    c: &Connection,
+    t: Checked,
+    except_id: Option<&str>,
+    client_id: &str,
+) -> Res<Checked> {
     check_name(&t.name, "name")?;
-    if t.kind != "tcp" {
+    if !KINDS.contains(&t.kind.as_str()) {
         return Err(StoreError::Invalid(format!(
-            "tunnel type \"{}\" is not supported yet, only tcp",
+            "tunnel type \"{}\" is not supported yet, supported: tcp, udp, http, https",
             t.kind
         )));
     }
     check_host(&t.local_ip)?;
     check_port(t.local_port, "local_port", false)?;
     check_port(t.remote_port, "remote_port", true)?;
-    get_client(c, &t.client_id)?;
-    ensure_remote_port_free(c, t.remote_port, None)?;
+    let domains = normalize_domains(&t.domains)?;
+    check_subdomain(&t.subdomain)?;
+    check_rewrite(&t.rewrite)?;
+    if is_web(&t.kind) {
+        if domains.is_empty() && t.subdomain.is_empty() {
+            return Err(StoreError::Invalid(
+                "http / https tunnels need a custom domain or a subdomain".into(),
+            ));
+        }
+        if t.remote_port != 0 {
+            return Err(StoreError::Invalid(
+                "http / https tunnels use the vhost port; remote_port must be 0".into(),
+            ));
+        }
+        if t.kind == "https" && !t.rewrite.is_empty() {
+            return Err(StoreError::Invalid(
+                "host_header_rewrite only applies to http tunnels".into(),
+            ));
+        }
+    } else if !domains.is_empty() || !t.subdomain.is_empty() || !t.rewrite.is_empty() {
+        return Err(StoreError::Invalid(
+            "domains and host_header_rewrite only apply to http / https tunnels".into(),
+        ));
+    }
+    ensure_remote_port_free(c, &t.kind, t.remote_port, except_id)?;
+    ensure_domains_free(c, &t.kind, &domains, &t.subdomain, except_id)?;
     let dup: Option<String> = c
         .query_row(
-            "SELECT id FROM tunnels WHERE client_id = ?1 AND name = ?2 AND deleted_at IS NULL",
-            params![t.client_id, t.name.trim()],
+            "SELECT id FROM tunnels WHERE client_id = ?1 AND name = ?2 AND deleted_at IS NULL AND (?3 IS NULL OR id <> ?3)",
+            params![client_id, t.name.trim(), except_id],
             |r| r.get(0),
         )
         .optional()?;
@@ -523,11 +683,32 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
             t.name.trim()
         )));
     }
+    Ok(Checked { domains, ..t })
+}
+
+/// 创建隧道。
+pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
+    get_client(c, &t.client_id)?;
+    let k = check_tunnel(
+        c,
+        Checked {
+            name: t.name.clone(),
+            kind: t.kind.clone(),
+            local_ip: t.local_ip.clone(),
+            local_port: t.local_port,
+            remote_port: t.remote_port,
+            domains: t.custom_domains.clone(),
+            subdomain: t.subdomain.to_ascii_lowercase(),
+            rewrite: t.host_header_rewrite.clone(),
+        },
+        None,
+        &t.client_id,
+    )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-        params![id, t.client_id, t.name.trim(), t.kind, t.local_ip, t.local_port, t.remote_port, i64::from(t.enabled), now],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
@@ -553,36 +734,39 @@ pub fn list_tunnels(c: &Connection, client_id: Option<&str>) -> Res<Vec<Tunnel>>
     Ok(rows)
 }
 
-/// 修改隧道。
+/// 修改隧道（类型不可改；需要换类型请删除重建）。
 pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res<Tunnel> {
     let cur = get_tunnel(c, id)?;
-    let name = p.name.clone().unwrap_or_else(|| cur.name.clone());
-    let local_ip = p.local_ip.clone().unwrap_or_else(|| cur.local_ip.clone());
-    let local_port = p.local_port.unwrap_or(i64::from(cur.local_port));
-    let remote_port = p.remote_port.unwrap_or(i64::from(cur.remote_port));
     let enabled = p.enabled.unwrap_or(cur.enabled);
-    check_name(&name, "name")?;
-    check_host(&local_ip)?;
-    check_port(local_port, "local_port", false)?;
-    check_port(remote_port, "remote_port", true)?;
-    ensure_remote_port_free(c, remote_port, Some(id))?;
-    let dup: Option<String> = c
-        .query_row(
-            "SELECT id FROM tunnels WHERE client_id = ?1 AND name = ?2 AND deleted_at IS NULL AND id <> ?3",
-            params![cur.client_id, name.trim(), id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if dup.is_some() {
-        return Err(StoreError::Conflict(format!(
-            "tunnel \"{}\" already exists on this client",
-            name.trim()
-        )));
-    }
+    let k = check_tunnel(
+        c,
+        Checked {
+            name: p.name.clone().unwrap_or_else(|| cur.name.clone()),
+            kind: cur.kind.clone(),
+            local_ip: p.local_ip.clone().unwrap_or_else(|| cur.local_ip.clone()),
+            local_port: p.local_port.unwrap_or(i64::from(cur.local_port)),
+            remote_port: p.remote_port.unwrap_or(i64::from(cur.remote_port)),
+            domains: p
+                .custom_domains
+                .clone()
+                .unwrap_or_else(|| cur.custom_domains.clone()),
+            subdomain: p
+                .subdomain
+                .clone()
+                .map_or_else(|| cur.subdomain.clone(), |s| s.to_ascii_lowercase()),
+            rewrite: p
+                .host_header_rewrite
+                .clone()
+                .unwrap_or_else(|| cur.host_header_rewrite.clone()),
+        },
+        Some(id),
+        &cur.client_id,
+    )?;
     // 配置变化后状态回到 pending，等待 Edge 重新回报。
     c.execute(
-        "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state='pending', status_error='' WHERE id=?1",
-        params![id, name.trim(), local_ip, local_port, remote_port, i64::from(enabled), now],
+        "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state='pending', status_error='',
+                custom_domains=?8, subdomain=?9, host_header_rewrite=?10 WHERE id=?1",
+        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite],
     )?;
     bump_revision(c, &cur.client_id)?;
     get_tunnel(c, id)
@@ -629,6 +813,9 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
             remote_port: t.remote_port,
             local_ip: t.local_ip,
             local_port: t.local_port,
+            custom_domains: t.custom_domains,
+            subdomain: t.subdomain,
+            host_header_rewrite: t.host_header_rewrite,
         })
         .collect();
     Ok(ConfigSet {
@@ -741,6 +928,7 @@ mod tests {
             local_port: 22,
             remote_port: remote,
             enabled: true,
+            ..Default::default()
         }
     }
 
@@ -995,7 +1183,7 @@ mod tests {
         create_tunnel(&c, &nt(&b.id, "auto2", 0), 12).unwrap();
 
         let mut bad = nt(&a.id, "x", 1);
-        bad.kind = "udp".into();
+        bad.kind = "stcp".into();
         assert!(
             matches!(create_tunnel(&c, &bad, 1), Err(StoreError::Invalid(m)) if m.contains("not supported yet"))
         );
@@ -1028,6 +1216,141 @@ mod tests {
     }
 
     #[test]
+    fn udp_and_web_tunnels() {
+        let c = conn();
+        let a = client(&c, "a");
+        // tcp 与 udp 是不同的端口空间。
+        create_tunnel(&c, &nt(&a.id, "tcp53", 5353), 1).unwrap();
+        let mut udp = nt(&a.id, "udp53", 5353);
+        udp.kind = "udp".into();
+        let u = create_tunnel(&c, &udp, 1).unwrap();
+        assert_eq!((u.kind.as_str(), u.remote_port), ("udp", 5353));
+        let mut udp2 = nt(&a.id, "udp53b", 5353);
+        udp2.kind = "udp".into();
+        assert!(
+            matches!(create_tunnel(&c, &udp2, 1), Err(StoreError::Conflict(m)) if m.contains("udp tunnel"))
+        );
+
+        let web = |name: &str, domains: &[&str], sub: &str| NewTunnel {
+            client_id: a.id.clone(),
+            name: name.into(),
+            kind: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            remote_port: 0,
+            enabled: true,
+            custom_domains: domains.iter().map(|d| d.to_string()).collect(),
+            subdomain: sub.into(),
+            host_header_rewrite: String::new(),
+        };
+        let w = create_tunnel(
+            &c,
+            &web(
+                "site",
+                &["WWW.Example.com", "www.example.com", "*.wild.example.com"],
+                "Blog",
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            w.custom_domains,
+            vec!["www.example.com", "*.wild.example.com"],
+            "lower-cased and de-duplicated"
+        );
+        assert_eq!(w.subdomain, "blog");
+        // 域名 / 子域名冲突只在同一类别（http / https）内检查。
+        assert!(
+            matches!(create_tunnel(&c, &web("dup", &["www.example.com"], ""), 3), Err(StoreError::Conflict(m)) if m.contains("domain"))
+        );
+        assert!(
+            matches!(create_tunnel(&c, &web("dup2", &[], "blog"), 3), Err(StoreError::Conflict(m)) if m.contains("subdomain"))
+        );
+        let mut https = web("tls", &["www.example.com"], "");
+        https.kind = "https".into();
+        assert!(create_tunnel(&c, &https, 3).is_ok());
+
+        for (bad, why) in [
+            (web("n1", &[], ""), "need a custom domain"),
+            (web("n2", &["bad domain"], ""), "not a valid domain"),
+            (web("n3", &["-x.com"], ""), "not a valid domain"),
+            (web("n4", &["*."], ""), "not a valid domain"),
+            (web("n5", &["a.com"], "a.b"), "single DNS label"),
+            (web("n6", &["a.com"], "-x"), "single DNS label"),
+        ] {
+            assert!(
+                matches!(create_tunnel(&c, &bad, 4), Err(StoreError::Invalid(m)) if m.contains(why)),
+                "{why}"
+            );
+        }
+        let mut with_port = web("p", &["p.com"], "");
+        with_port.remote_port = 8080;
+        assert!(
+            matches!(create_tunnel(&c, &with_port, 4), Err(StoreError::Invalid(m)) if m.contains("vhost port"))
+        );
+        let mut tls_rewrite = web("r", &["r.com"], "");
+        tls_rewrite.kind = "https".into();
+        tls_rewrite.host_header_rewrite = "x".into();
+        assert!(
+            matches!(create_tunnel(&c, &tls_rewrite, 4), Err(StoreError::Invalid(m)) if m.contains("only applies to http"))
+        );
+        let mut bad_rewrite = web("r2", &["r2.com"], "");
+        bad_rewrite.host_header_rewrite = "a b".into();
+        assert!(
+            matches!(create_tunnel(&c, &bad_rewrite, 4), Err(StoreError::Invalid(m)) if m.contains("host name"))
+        );
+        let mut tcp_domains = nt(&a.id, "t", 0);
+        tcp_domains.custom_domains = vec!["a.com".into()];
+        assert!(
+            matches!(create_tunnel(&c, &tcp_domains, 4), Err(StoreError::Invalid(m)) if m.contains("only apply"))
+        );
+
+        // 更新：改域名、改写 Host；类型不可改；更新自己不算冲突。
+        let up = update_tunnel(
+            &c,
+            &w.id,
+            &TunnelPatch {
+                custom_domains: Some(vec!["new.example.com".into()]),
+                host_header_rewrite: Some("internal.lan".into()),
+                subdomain: Some("BLOG".into()),
+                ..Default::default()
+            },
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                up.custom_domains.clone(),
+                up.host_header_rewrite.as_str(),
+                up.subdomain.as_str()
+            ),
+            (vec!["new.example.com".to_string()], "internal.lan", "blog")
+        );
+        assert!(update_tunnel(
+            &c,
+            &w.id,
+            &TunnelPatch {
+                custom_domains: Some(vec![]),
+                subdomain: Some(String::new()),
+                ..Default::default()
+            },
+            10
+        )
+        .is_err());
+        // 下发配置带上域名与 Host 改写。
+        let cfg = managed_config(&c, &a.id).unwrap();
+        let p = cfg.proxies.iter().find(|p| p.name == w.id).unwrap();
+        assert_eq!(
+            (
+                p.kind.as_str(),
+                p.custom_domains.clone(),
+                p.host_header_rewrite.as_str()
+            ),
+            ("http", vec!["new.example.com".to_string()], "internal.lan")
+        );
+    }
+
+    #[test]
     fn tunnels_update_delete_status_and_config() {
         let c = conn();
         let a = client(&c, "a");
@@ -1044,6 +1367,7 @@ mod tests {
             remote_port: Some(6100),
             enabled: Some(false),
             local_ip: Some("10.0.0.5".into()),
+            ..Default::default()
         };
         let u = update_tunnel(&c, &t.id, &patch, 20).unwrap();
         assert_eq!(

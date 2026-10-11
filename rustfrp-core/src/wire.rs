@@ -54,18 +54,27 @@ pub struct Enroll {
 }
 
 /// 受管代理：Controller 下发给 Edge 与 Client 的完整定义。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ManagedProxy {
     /// 代理名。
     pub name: String,
-    /// `tcp`。
+    /// `tcp` / `udp` / `http` / `https`。
     pub kind: String,
-    /// 远程端口，0 = 自动分配。
+    /// 远程端口，0 = 自动分配（http / https 不使用）。
     pub remote_port: u16,
     /// 本地目标主机。
     pub local_ip: String,
     /// 本地目标端口。
     pub local_port: u16,
+    /// http / https：自定义域名。
+    #[serde(default)]
+    pub custom_domains: Vec<String>,
+    /// http / https：子域名。
+    #[serde(default)]
+    pub subdomain: String,
+    /// http：改写 Host 头。
+    #[serde(default)]
+    pub host_header_rewrite: String,
 }
 
 /// 一版受管配置（全量快照；幂等，可重复下发）。
@@ -78,14 +87,23 @@ pub struct ConfigSet {
 }
 
 /// 代理注册信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProxySpec {
     /// 代理名（已带 user 前缀）。
     pub name: String,
-    /// `tcp` / `udp`。
+    /// `tcp` / `udp` / `http` / `https`。
     pub kind: String,
-    /// 远程端口，0 = 由服务端从允许范围内分配。
+    /// 远程端口，0 = 由服务端从允许范围内分配（http / https 不使用）。
     pub remote_port: u16,
+    /// http / https：自定义域名（可含 `*.example.com` 通配）。
+    #[serde(default)]
+    pub custom_domains: Vec<String>,
+    /// http / https：子域名（与服务端的 `subDomainHost` 拼成完整域名）。
+    #[serde(default)]
+    pub subdomain: String,
+    /// http：把转发给内网服务的 `Host` 头改写成这个值。
+    #[serde(default)]
+    pub host_header_rewrite: String,
 }
 
 /// Client → Edge。
@@ -211,6 +229,7 @@ mod tests {
                 name: "n".into(),
                 kind: "tcp".into(),
                 remote_port: 6000,
+                ..Default::default()
             }),
             ClientMsg::Ping,
             ClientMsg::Applied { revision: 7 },
@@ -251,6 +270,7 @@ mod tests {
                     remote_port: 6000,
                     local_ip: "127.0.0.1".into(),
                     local_port: 80,
+                    ..Default::default()
                 }],
             }),
             ServerMsg::Pong,

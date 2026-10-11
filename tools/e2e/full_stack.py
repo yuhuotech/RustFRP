@@ -119,7 +119,7 @@ def main():
     server_bin = os.path.join(a.bin_dir, "rustfrp-server")
     agent_bin = os.path.join(a.bin_dir, "rustfrp-agent")
     tmp = tempfile.mkdtemp(prefix="rfrp-e2e-")
-    http_port, edge_port, echo_port = free_port(), free_port(), free_port()
+    http_port, edge_port, echo_port, vhost_port = free_port(), free_port(), free_port(), free_port()
     env = dict(
         os.environ,
         RUSTFRP_DB=f"{tmp}/ctl.db",
@@ -127,6 +127,8 @@ def main():
         RUSTFRP_EDGE=f"127.0.0.1:{edge_port}",
         RUSTFRP_PROXY_BIND="127.0.0.1",
         RUSTFRP_PUBLIC_HOST="127.0.0.1",
+        RUSTFRP_VHOST_HTTP=str(vhost_port),
+        RUSTFRP_SUBDOMAIN_HOST="t.example.com",
         RUSTFRP_ADMIN_PASSWORD="a-long-enough-password",
     )
     procs = []
@@ -176,6 +178,63 @@ def main():
         t2 = wait(lambda: (lambda x: x if x["state"] == "running" else None)(api.call("GET", f"/tunnels/{t['id']}")), "tunnel running again")
         assert tcp_roundtrip(t2["status_port"], b"after reconnect") == b"after reconnect"
         print("重连后隧道恢复 OK")
+
+        # UDP 与 HTTP（按域名 / 子域名路由）
+        udp_srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_srv.bind(("127.0.0.1", 0))
+        udp_port = udp_srv.getsockname()[1]
+
+        def udp_loop():
+            while True:
+                try:
+                    d, a_ = udp_srv.recvfrom(4096)
+                    udp_srv.sendto(b"udp:" + d, a_)
+                except OSError:
+                    return
+
+        threading.Thread(target=udp_loop, daemon=True).start()
+        u = api.call("POST", "/tunnels", {"client_id": client["id"], "name": "dns", "kind": "udp", "local_port": udp_port, "reason": "e2e"})
+        u = wait(lambda: (lambda x: x if x["state"] == "running" else None)(api.call("GET", f"/tunnels/{u['id']}")), "udp tunnel running")
+        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        c.settimeout(5)
+        c.sendto(b"ping", ("127.0.0.1", u["status_port"]))
+        assert c.recvfrom(100)[0] == b"udp:ping"
+        print("UDP 隧道 OK")
+
+        http_srv = socket.socket()
+        http_srv.bind(("127.0.0.1", 0))
+        http_srv.listen(8)
+        http_port_local = http_srv.getsockname()[1]
+
+        def http_loop():
+            while True:
+                try:
+                    cs, _ = http_srv.accept()
+                except OSError:
+                    return
+                data = cs.recv(4096).decode(errors="replace")
+                host = next((l for l in data.split("\r\n") if l.lower().startswith("host:")), "")
+                body = f"site[{host}]".encode()
+                cs.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+                cs.close()
+
+        threading.Thread(target=http_loop, daemon=True).start()
+        w = api.call("POST", "/tunnels", {"client_id": client["id"], "name": "site", "kind": "http", "local_port": http_port_local, "custom_domains": ["www.example.com"], "subdomain": "blog", "host_header_rewrite": "internal.lan", "reason": "e2e"})
+        wait(lambda: api.call("GET", f"/tunnels/{w['id']}")["state"] == "running", "http tunnel running")
+        for host in ["www.example.com", "blog.t.example.com"]:
+            with socket.create_connection(("127.0.0.1", vhost_port), timeout=5) as hs:
+                hs.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+                resp = b""
+                while True:
+                    chunk = hs.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+            assert b"site[Host: internal.lan]" in resp, resp
+        with socket.create_connection(("127.0.0.1", vhost_port), timeout=5) as hs:
+            hs.sendall(b"GET / HTTP/1.1\r\nHost: nobody.example.com\r\n\r\n")
+            assert hs.recv(100).startswith(b"HTTP/1.1 404")
+        print("HTTP 域名 / 子域名路由与 Host 改写 OK")
 
         api.call("DELETE", f"/clients/{client['id']}?reason=e2e")
         wait(lambda: port_closed(t2["status_port"]), "port closed after delete")

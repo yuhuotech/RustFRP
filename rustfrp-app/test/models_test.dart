@@ -61,6 +61,12 @@ void main() {
     expect(t == Tunnel.fromJson({'id': 't1', 'client_id': 'c1', 'name': 'ssh', 'kind': 'tcp', 'local_ip': '10.0.0.1', 'local_port': 22, 'remote_port': 6000, 'enabled': false, 'created_at': 1, 'updated_at': 2, 'state': 'error', 'status_error': 'boom'}), isTrue);
     expect(t == d, isFalse);
     expect(t.hashCode == d.hashCode, isFalse);
+    final w = Tunnel.fromJson({'id': 'w', 'kind': 'http', 'custom_domains': ['a.com', 5], 'subdomain': 's', 'host_header_rewrite': 'h'});
+    expect((w.isWeb, w.subdomain, w.hostHeaderRewrite), (true, 's', 'h'));
+    expect(w.customDomains, ['a.com']);
+    expect(w == Tunnel.fromJson({'id': 'w', 'kind': 'http', 'custom_domains': ['a.com'], 'subdomain': 's', 'host_header_rewrite': 'h'}), isTrue);
+    expect(w == Tunnel.fromJson({'id': 'w', 'kind': 'http', 'custom_domains': ['b.com'], 'subdomain': 's', 'host_header_rewrite': 'h'}), isFalse);
+    expect(t.isWeb, isFalse);
     expect(() => Tunnel.fromJson({}), throwsA(isA<ProtocolException>()));
   });
 
@@ -107,6 +113,8 @@ void main() {
     expect((n.edgePort, n.clientsOnline), (7100, 2));
     expect(NodeInfo.fromJson({}).allowPortsLabel, '不限制');
     expect(NodeInfo.fromJson({}).edgePort, 7000);
+    final v = NodeInfo.fromJson({'vhost_http_port': 8080, 'vhost_https_port': null, 'subdomain_host': 't.com'});
+    expect((v.vhostHttpPort, v.vhostHttpsPort, v.subdomainHost), (8080, null, 't.com'));
   });
 
   test('ApiException', () {

@@ -42,6 +42,14 @@ fn secs(v: i64, fallback: u64) -> Duration {
     Duration::from_secs(if v > 0 { v as u64 } else { fallback })
 }
 
+/// frp 的 0 表示「不启用」。
+fn opt_port(v: i64, what: &str) -> Result<Option<u16>, String> {
+    if v == 0 {
+        return Ok(None);
+    }
+    port(v, what).map(Some)
+}
+
 fn port(v: i64, what: &str) -> Result<u16, String> {
     u16::try_from(v).map_err(|_| format!("{what}: port {v} out of range"))
 }
@@ -65,6 +73,37 @@ fn resolve_token(
     }
 }
 
+/// 该代理里配置了、但当前版本尚未实现的选项（不会静默忽略：调用方会把它们打印出来）。
+fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    let mut flag = |on: bool, name: &'static str| {
+        if on {
+            v.push(name);
+        }
+    };
+    flag(p.transport.use_encryption, "transport.useEncryption");
+    flag(p.transport.use_compression, "transport.useCompression");
+    flag(
+        !p.transport.bandwidth_limit.is_empty(),
+        "transport.bandwidthLimit",
+    );
+    flag(
+        !p.transport.proxy_protocol_version.is_empty(),
+        "transport.proxyProtocolVersion",
+    );
+    flag(!p.health_check.kind.is_empty(), "healthCheck");
+    flag(!p.load_balancer.group.is_empty(), "loadBalancer");
+    flag(!p.locations.is_empty(), "locations");
+    flag(
+        !p.http_user.is_empty() || !p.http_password.is_empty(),
+        "httpUser / httpPassword",
+    );
+    flag(!p.request_headers.set.is_empty(), "requestHeaders");
+    flag(!p.response_headers.set.is_empty(), "responseHeaders");
+    flag(!p.route_by_http_user.is_empty(), "routeByHTTPUser");
+    v
+}
+
 /// 由 frpc 配置生成运行计划。
 pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, String> {
     let c = &l.common;
@@ -74,7 +113,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
     let mut notes = Vec::new();
     let mut proxies = Vec::new();
     for p in &l.proxies {
-        if p.kind != "tcp" {
+        if !["tcp", "udp", "http", "https"].contains(&p.kind.as_str()) {
             notes.push(format!(
                 "proxy [{}]: type \"{}\" is not supported yet, skipped",
                 p.name, p.kind
@@ -99,7 +138,16 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             local_ip: p.local_ip.clone(),
             local_port: port(p.local_port, &format!("proxy [{}] localPort", p.name))?,
             remote_port: port(p.remote_port, &format!("proxy [{}] remotePort", p.name))?,
+            custom_domains: p.custom_domains.clone(),
+            subdomain: p.subdomain.clone(),
+            host_header_rewrite: p.host_header_rewrite.clone(),
         });
+        for opt in ignored_options(p) {
+            notes.push(format!(
+                "proxy [{}]: option {opt} is not supported yet and is ignored",
+                p.name
+            ));
+        }
     }
     for v in &l.visitors {
         notes.push(format!(
@@ -135,6 +183,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
         heartbeat_interval: secs(hb_interval, 30),
         heartbeat_timeout: secs(c.transport.heartbeat_timeout, 90),
         mux: MuxConfig::default(),
+        udp_packet_size: usize::try_from(c.udp_packet_size).unwrap_or(1500),
         ..Default::default()
     };
     Ok(ClientPlan {
@@ -151,13 +200,7 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
     if s.auth.method == "oidc" {
         return Err("auth.method \"oidc\" is not implemented yet".into());
     }
-    let mut notes = Vec::new();
-    if s.vhost_http_port > 0 || s.vhost_https_port > 0 {
-        notes.push(
-            "vhostHTTPPort / vhostHTTPSPort: http / https proxies are not supported yet"
-                .to_string(),
-        );
-    }
+    let notes = Vec::new();
     let mut allow_ports = Vec::new();
     for r in &s.allow_ports {
         let (lo, hi) = if r.single > 0 {
@@ -188,6 +231,11 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
         max_ports_per_client: usize::try_from(s.max_ports_per_client).unwrap_or(0),
         heartbeat_timeout: secs(s.transport.heartbeat_timeout, 90),
         user_conn_timeout: secs(s.user_conn_timeout, 10),
+        vhost_http_port: opt_port(s.vhost_http_port, "vhostHTTPPort")?,
+        vhost_https_port: opt_port(s.vhost_https_port, "vhostHTTPSPort")?,
+        sub_domain_host: s.sub_domain_host.clone(),
+        vhost_head_timeout: secs(s.vhost_http_timeout, 60),
+        udp_packet_size: usize::try_from(s.udp_packet_size).unwrap_or(1500),
         ..Default::default()
     };
     Ok(EdgePlan {
@@ -258,6 +306,16 @@ name = "web"
 type = "http"
 localPort = 80
 customDomains = ["a.com"]
+hostHeaderRewrite = "internal.lan"
+transport.bandwidthLimit = "1MB"
+[[proxies]]
+name = "dns"
+type = "udp"
+localPort = 53
+remotePort = 5353
+[[proxies]]
+name = "odd"
+type = "sudp"
 [[proxies]]
 name = "sock"
 type = "tcp"
@@ -274,11 +332,21 @@ bindPort = 1
             ("10.0.0.1", 7100)
         );
         assert_eq!(p.cfg.token, "tk");
-        assert_eq!(p.cfg.proxies.len(), 1);
+        assert_eq!(p.cfg.proxies.len(), 3);
         assert_eq!(
             (p.cfg.proxies[0].name.as_str(), p.cfg.proxies[0].remote_port),
             ("alice.ssh", 6000)
         );
+        let web = &p.cfg.proxies[1];
+        assert_eq!(
+            (
+                web.kind.as_str(),
+                web.custom_domains.clone(),
+                web.host_header_rewrite.as_str()
+            ),
+            ("http", vec!["a.com".to_string()], "internal.lan")
+        );
+        assert_eq!(p.cfg.proxies[2].kind, "udp");
         assert_eq!(p.cfg.dial_timeout, Duration::from_secs(3));
         assert_eq!(p.cfg.heartbeat_interval, Duration::from_secs(15));
         assert_eq!(p.cfg.heartbeat_timeout, Duration::from_secs(90));
@@ -286,10 +354,11 @@ bindPort = 1
             (p.log_to.as_str(), p.log_level.as_str()),
             ("./frpc.log", "debug")
         );
-        assert_eq!(p.notes.len(), 3);
-        assert!(p.notes[0].contains("type \"http\""));
-        assert!(p.notes[1].contains("plugins"));
-        assert!(p.notes[2].contains("visitor [v]"));
+        assert_eq!(p.notes.len(), 4);
+        assert!(p.notes[0].contains("transport.bandwidthLimit"));
+        assert!(p.notes[1].contains("type \"sudp\""));
+        assert!(p.notes[2].contains("plugins"));
+        assert!(p.notes[3].contains("visitor [v]"));
     }
 
     #[test]
@@ -377,15 +446,23 @@ allowPorts = [ { start = 6000, end = 6100 }, { single = 7000 } ]
         assert_eq!(p.cfg.user_conn_timeout, Duration::from_secs(3));
         assert_eq!(p.cfg.heartbeat_timeout, Duration::from_secs(20));
         assert!(p.identity.is_none());
-        assert_eq!(p.notes.len(), 1);
+        assert!(p.notes.is_empty());
         assert_eq!(p.cfg.proxy_bind_addr, "127.0.0.1");
-        assert_eq!(
-            server("vhostHTTPSPort = 443\n", &MemFs::new())
-                .unwrap()
-                .notes
-                .len(),
-            1
-        );
+        assert_eq!(p.cfg.vhost_http_port, Some(80));
+        assert_eq!(p.cfg.vhost_https_port, None);
+        let https = server(
+            "vhostHTTPSPort = 443\nsubDomainHost = \"t.example.com\"\nvhostHTTPTimeout = 5\nudpPacketSize = 4000\n",
+            &MemFs::new(),
+        )
+        .unwrap();
+        assert_eq!(https.cfg.vhost_https_port, Some(443));
+        assert_eq!(https.cfg.sub_domain_host, "t.example.com");
+        assert_eq!(https.cfg.vhost_head_timeout, Duration::from_secs(5));
+        assert_eq!(https.cfg.udp_packet_size, 4000);
+        assert!(server("vhostHTTPPort = 70000\n", &MemFs::new())
+            .err()
+            .unwrap()
+            .contains("vhostHTTPPort"));
         assert!(server("bindPort = 7000\n", &MemFs::new())
             .unwrap()
             .notes

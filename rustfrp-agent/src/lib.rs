@@ -17,3 +17,4 @@ pub mod edge;
 pub mod log;
 pub mod managed;
 pub mod plan;
+pub mod proxy_rt;

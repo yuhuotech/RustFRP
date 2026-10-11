@@ -677,7 +677,7 @@ async fn tunnel_crud_and_validation() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(v["error"]["message"].as_str().unwrap().contains("outside"));
     let mut udp = mk("u", 0);
-    udp["kind"] = json!("udp");
+    udp["kind"] = json!("stcp");
     assert_eq!(
         r.send(Method::POST, "/api/v1/tunnels", &op, udp).await.0,
         StatusCode::BAD_REQUEST
@@ -1011,4 +1011,92 @@ async fn panel_static_files_spa_fallback_and_traversal() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = r.hub.online_ids();
+}
+
+#[tokio::test]
+async fn udp_and_web_tunnels_via_api() {
+    let r = rig_with(Config {
+        vhost_http: Some(8080),
+        subdomain_host: "t.example.com".into(),
+        ..Config::default()
+    })
+    .await;
+    let op = r.admin("o", Role::Operator).await;
+    let cid = r.client("c1").await;
+    let (_, node) = r.get("/api/v1/node", &op).await;
+    assert_eq!(node["vhost_http_port"], 8080);
+    assert!(node["vhost_https_port"].is_null());
+    assert_eq!(node["subdomain_host"], "t.example.com");
+
+    let (st, udp) = r.send(Method::POST, "/api/v1/tunnels", &op, json!({"client_id": cid, "name": "dns", "kind": "udp", "local_port": 53, "remote_port": 5353, "reason": "x"})).await;
+    assert_eq!(
+        (st, udp["kind"].as_str()),
+        (StatusCode::CREATED, Some("udp"))
+    );
+
+    let web = json!({"client_id": cid, "name": "site", "kind": "http", "local_port": 80, "custom_domains": ["WWW.Example.com"], "subdomain": "blog", "host_header_rewrite": "internal.lan", "reason": "x"});
+    let (st, t) = r
+        .send(Method::POST, "/api/v1/tunnels", &op, web.clone())
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(
+        (
+            t["custom_domains"][0].as_str(),
+            t["subdomain"].as_str(),
+            t["host_header_rewrite"].as_str()
+        ),
+        (Some("www.example.com"), Some("blog"), Some("internal.lan"))
+    );
+    let path = format!("/api/v1/tunnels/{}", t["id"].as_str().unwrap());
+    let (st, up) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &op,
+            json!({"custom_domains": ["b.example.com"], "reason": "x"}),
+        )
+        .await;
+    assert_eq!(
+        (st, up["custom_domains"][0].as_str()),
+        (StatusCode::OK, Some("b.example.com"))
+    );
+    // 同域名冲突 / 无域名 / https 未开启 / 子域名后缀未配置。
+    let mut dup = web.clone();
+    dup["name"] = json!("dup");
+    dup["custom_domains"] = json!(["b.example.com"]);
+    dup["subdomain"] = json!("");
+    assert_eq!(
+        r.send(Method::POST, "/api/v1/tunnels", &op, dup).await.0,
+        StatusCode::CONFLICT
+    );
+    let mut https = web.clone();
+    https["kind"] = json!("https");
+    https["name"] = json!("tls");
+    let (st, v) = r.send(Method::POST, "/api/v1/tunnels", &op, https).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("RUSTFRP_VHOST_HTTPS"));
+
+    let none = rig().await;
+    let op2 = none.admin("o", Role::Operator).await;
+    let c2 = none.client("c").await;
+    for (body, want) in [
+        (
+            json!({"client_id": c2, "name": "w", "kind": "http", "local_port": 80, "custom_domains": ["a.com"], "reason": "x"}),
+            "RUSTFRP_VHOST_HTTP",
+        ),
+        (
+            json!({"client_id": c2, "name": "s", "kind": "tcp", "local_port": 80, "subdomain": "x", "reason": "x"}),
+            "RUSTFRP_SUBDOMAIN_HOST",
+        ),
+    ] {
+        let (st, v) = none.send(Method::POST, "/api/v1/tunnels", &op2, body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains(want),
+            "{v}"
+        );
+    }
 }

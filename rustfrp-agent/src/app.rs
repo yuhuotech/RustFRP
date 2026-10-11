@@ -330,7 +330,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let fs = MemFs::new()
-            .with("frps.toml", &format!("bindAddr='127.0.0.1'\nbindPort={port}\nvhostHTTPPort=80\n"))
+            .with("frps.toml", &format!("bindAddr='127.0.0.1'\nbindPort={port}\n"))
             .with(
                 "frpc.toml",
                 &format!("serverAddr='127.0.0.1'\nserverPort={port}\nlog.level='error'\n[[proxies]]\nname='a'\ntype='tcp'\nlocalPort=1\nremotePort=0\n"),

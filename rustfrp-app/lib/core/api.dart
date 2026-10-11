@@ -152,11 +152,19 @@ class ApiClient {
     String localIp = '127.0.0.1',
     int remotePort = 0,
     bool enabled = true,
+    String kind = 'tcp',
+    List<String> customDomains = const [],
+    String subdomain = '',
+    String hostHeaderRewrite = '',
     required String reason,
   }) async =>
       Tunnel.fromJson(await _send('POST', '/tunnels', body: {
         'client_id': clientId,
         'name': name,
+        'kind': kind,
+        'custom_domains': customDomains,
+        'subdomain': subdomain,
+        'host_header_rewrite': hostHeaderRewrite,
         'local_ip': localIp,
         'local_port': localPort,
         'remote_port': remotePort,
@@ -165,13 +173,24 @@ class ApiClient {
       }));
 
   Future<Tunnel> patchTunnel(String id,
-          {String? name, String? localIp, int? localPort, int? remotePort, bool? enabled, required String reason}) async =>
+          {String? name,
+          String? localIp,
+          int? localPort,
+          int? remotePort,
+          bool? enabled,
+          List<String>? customDomains,
+          String? subdomain,
+          String? hostHeaderRewrite,
+          required String reason}) async =>
       Tunnel.fromJson(await _send('PATCH', '/tunnels/$id', body: {
         'name': ?name,
         'local_ip': ?localIp,
         'local_port': ?localPort,
         'remote_port': ?remotePort,
         'enabled': ?enabled,
+        'custom_domains': ?customDomains,
+        'subdomain': ?subdomain,
+        'host_header_rewrite': ?hostHeaderRewrite,
         'reason': reason,
       }));
 

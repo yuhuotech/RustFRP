@@ -90,6 +90,7 @@ struct Rig {
     cfg: watch::Sender<Arc<ConfigSet>>,
     events: mpsc::Receiver<ProxyEvent>,
     online: Arc<AtomicUsize>,
+    http: std::net::SocketAddr,
 }
 
 async fn rig() -> Rig {
@@ -107,6 +108,7 @@ async fn rig() -> Rig {
             bind_addr: "127.0.0.1".into(),
             bind_port: 0,
             proxy_bind_addr: "127.0.0.1".into(),
+            vhost_http_port: Some(0),
             ..Default::default()
         },
         None,
@@ -116,10 +118,12 @@ async fn rig() -> Rig {
     .await
     .unwrap();
     let port = edge.local_addr().unwrap().port();
+    let http = edge.http_addr().unwrap();
     let stop = CancellationToken::new();
     tokio::spawn(edge.serve(stop.clone()));
     Rig {
         port,
+        http,
         stop,
         cfg,
         events,
@@ -204,6 +208,7 @@ fn mp(name: &str, remote: u16, local: u16) -> ManagedProxy {
         remote_port: remote,
         local_ip: "127.0.0.1".into(),
         local_port: local,
+        ..Default::default()
     }
 }
 
@@ -296,7 +301,7 @@ async fn enroll_push_config_hot_update_and_reconnect() {
     let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let busy_port = busy.local_addr().unwrap().port();
     let mut udp = mp("u", 0, echo_a);
-    udp.kind = "udp".into();
+    udp.kind = "stcp".into();
     rig.cfg.send_replace(Arc::new(ConfigSet {
         revision: 4,
         proxies: vec![mp("b", busy_port, echo_a), udp],
@@ -428,6 +433,7 @@ async fn managed_edge_rejects_clients_that_register_proxies_themselves() {
             name: "x".into(),
             kind: "tcp".into(),
             remote_port: 0,
+            ..Default::default()
         }),
     )
     .await
@@ -480,6 +486,128 @@ async fn disconnect_stops_running_proxies_and_names_are_unique_across_sessions()
     assert_eq!(stopped.name, "same");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    rig.stop.cancel();
+}
+
+#[tokio::test]
+async fn managed_http_and_udp_proxies_follow_config_changes() {
+    use tokio::net::UdpSocket;
+    let mut rig = rig().await;
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut b = [0u8; 2048];
+                let n = s.read(&mut b).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&b[..n]).to_string();
+                let host = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                    .unwrap_or("")
+                    .to_string();
+                let body = format!("saw[{host}]");
+                let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            });
+        }
+    });
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = udp.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = [0u8; 512];
+        while let Ok((n, from)) = udp.recv_from(&mut b).await {
+            let _ = udp.send_to(&b[..n], from).await;
+        }
+    });
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let (mut rx, cancel, _task) = spawn_client(managed_client(rig.port, key, None, Some("good")));
+    until(&mut rx, |e| matches!(e, Event::ConfigApplied { .. })).await;
+
+    let web = |domains: &[&str], rewrite: &str| ManagedProxy {
+        name: "web".into(),
+        kind: "http".into(),
+        local_ip: "127.0.0.1".into(),
+        local_port: backend_port,
+        custom_domains: domains.iter().map(|d| d.to_string()).collect(),
+        host_header_rewrite: rewrite.into(),
+        ..Default::default()
+    };
+    let get = |host: &'static str| {
+        let addr = rig.http;
+        async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut out = String::new();
+            timeout(T, s.read_to_string(&mut out))
+                .await
+                .unwrap()
+                .unwrap();
+            out
+        }
+    };
+    let mut dns = mp("dns", 0, udp_port);
+    dns.kind = "udp".into();
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 1,
+        proxies: vec![web(&["a.example.com"], ""), dns.clone()],
+    }));
+    until(&mut rig.events, |e| {
+        e.name == "web" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await;
+    let udp_pub = match until(&mut rig.events, |e| {
+        e.name == "dns" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await
+    .state
+    {
+        ProxyState::Running(p) => p,
+        _ => unreachable!(),
+    };
+    until(&mut rx, |e| {
+        matches!(e, Event::ConfigApplied { revision: 1, .. })
+    })
+    .await;
+    assert!(get("a.example.com")
+        .await
+        .contains("saw[Host: a.example.com]"));
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    c.send_to(b"hi", ("127.0.0.1", udp_pub)).await.unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(timeout(T, c.recv(&mut buf)).await.unwrap().unwrap(), 2);
+
+    // 改域名 → 旧域名失效、新域名生效；改 Host 改写 → 立即生效。
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 2,
+        proxies: vec![web(&["b.example.com"], "internal.lan"), dns.clone()],
+    }));
+    until(&mut rig.events, |e| {
+        e.name == "web" && e.state == ProxyState::Stopped
+    })
+    .await;
+    until(&mut rig.events, |e| {
+        e.name == "web" && matches!(e.state, ProxyState::Running(_))
+    })
+    .await;
+    assert!(get("a.example.com").await.starts_with("HTTP/1.1 404"));
+    assert!(get("b.example.com")
+        .await
+        .contains("saw[Host: internal.lan]"));
+    // 改 UDP 的远程端口 → 重启监听（不是只改映射）。
+    let mut moved = dns.clone();
+    moved.remote_port = 0;
+    moved.local_port = udp_port;
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 3,
+        proxies: vec![web(&["b.example.com"], "internal.lan"), moved],
+    }));
+    until(&mut rx, |e| {
+        matches!(e, Event::ConfigApplied { revision: 3, .. })
+    })
+    .await;
+    cancel.cancel();
     rig.stop.cancel();
 }
 

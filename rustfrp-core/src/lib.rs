@@ -17,4 +17,6 @@ pub mod identity;
 pub mod mux;
 pub mod pipe;
 pub mod tls;
+pub mod udpframe;
+pub mod vhost;
 pub mod wire;

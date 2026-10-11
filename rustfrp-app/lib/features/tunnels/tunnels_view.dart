@@ -120,6 +120,24 @@ class TunnelsView extends ConsumerWidget {
   }
 }
 
+/// What visitors type to reach a tunnel: `host:port` for tcp / udp, a URL for http / https.
+String publicAddress(Tunnel t, NodeInfo? node) {
+  final host = node?.publicHost ?? '';
+  if (t.isWeb) {
+    final port = t.kind == 'http' ? node?.vhostHttpPort : node?.vhostHttpsPort;
+    final hosts = [
+      ...t.customDomains,
+      if (t.subdomain.isNotEmpty && (node?.subdomainHost ?? '').isNotEmpty) '${t.subdomain}.${node!.subdomainHost}',
+    ];
+    if (hosts.isEmpty) return '未配置域名';
+    final standard = (t.kind == 'http' && port == 80) || (t.kind == 'https' && port == 443);
+    final suffix = port == null || standard ? '' : ':$port';
+    return '${t.kind}://${hosts.first}$suffix${hosts.length > 1 ? '  (+${hosts.length - 1})' : ''}';
+  }
+  if (t.publicPort == 0) return '自动分配';
+  return host.isEmpty ? ':${t.publicPort}' : hostPort(host, t.publicPort);
+}
+
 class TunnelCard extends ConsumerWidget {
   const TunnelCard({super.key, required this.tunnel, this.showClient = true});
   final Tunnel tunnel;
@@ -129,11 +147,11 @@ class TunnelCard extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final c = context.c;
     final role = ref.watch(sessionProvider.select((s) => s.role));
-    final host = ref.watch(nodeProvider).asData?.value.publicHost ?? '';
+    final node = ref.watch(nodeProvider).asData?.value;
     final clients = ref.watch(clientsProvider).asData?.value ?? const <ClientDevice>[];
     final t = tunnel;
     final owner = clients.where((d) => d.id == t.clientId).firstOrNull;
-    final remote = t.publicPort == 0 ? '自动分配' : (host.isEmpty ? ':${t.publicPort}' : hostPort(host, t.publicPort));
+    final remote = publicAddress(t, node);
     final canEdit = role.atLeast(Role.operator);
     return PanelCard(
       key: Key('tunnel-${t.id}'),
@@ -199,11 +217,15 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
   late final _localPort = TextEditingController(text: widget.existing == null ? '' : '${widget.existing!.localPort}');
   late final _remotePort = TextEditingController(text: (widget.existing?.remotePort ?? 0) == 0 ? '' : '${widget.existing!.remotePort}');
   late String? _client = widget.existing?.clientId ?? widget.clientId;
+  late String _kind = widget.existing?.kind ?? 'tcp';
+  late final _domains = TextEditingController(text: widget.existing?.customDomains.join(', ') ?? '');
+  late final _sub = TextEditingController(text: widget.existing?.subdomain ?? '');
+  late final _rewrite = TextEditingController(text: widget.existing?.hostHeaderRewrite ?? '');
   bool _busy = false;
 
   @override
   void dispose() {
-    for (final c in [_name, _localIp, _localPort, _remotePort]) {
+    for (final c in [_name, _localIp, _localPort, _remotePort, _domains, _sub, _rewrite]) {
       c.dispose();
     }
     super.dispose();
@@ -211,8 +233,15 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
 
   int? get _lp => int.tryParse(_localPort.text.trim());
   int? get _rp => _remotePort.text.trim().isEmpty ? 0 : int.tryParse(_remotePort.text.trim());
+  bool get _web => _kind == 'http' || _kind == 'https';
+  List<String> get _domainList => _domains.text.split(RegExp(r'[,\s]+')).where((d) => d.isNotEmpty).toList();
   bool get _valid =>
-      _client != null && _name.text.trim().isNotEmpty && _localIp.text.trim().isNotEmpty && (_lp ?? 0) >= 1 && (_lp ?? 0) <= 65535 && _rp != null && _rp! >= 0 && _rp! <= 65535;
+      _client != null &&
+      _name.text.trim().isNotEmpty &&
+      _localIp.text.trim().isNotEmpty &&
+      (_lp ?? 0) >= 1 &&
+      (_lp ?? 0) <= 65535 &&
+      (_web ? (_domainList.isNotEmpty || _sub.text.trim().isNotEmpty) : (_rp != null && _rp! >= 0 && _rp! <= 65535));
 
   Future<void> _save() async {
     setState(() => _busy = true);
@@ -220,9 +249,28 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
     final e = widget.existing;
     final ok = await guarded(context, () async {
       if (e == null) {
-        await a.createTunnel(clientId: _client!, name: _name.text.trim(), localPort: _lp!, localIp: _localIp.text.trim(), remotePort: _rp!, reason: '通过面板创建隧道');
+        await a.createTunnel(
+            clientId: _client!,
+            name: _name.text.trim(),
+            localPort: _lp!,
+            localIp: _localIp.text.trim(),
+            remotePort: _web ? 0 : _rp!,
+            kind: _kind,
+            customDomains: _web ? _domainList : const [],
+            subdomain: _web ? _sub.text.trim() : '',
+            hostHeaderRewrite: _kind == 'http' ? _rewrite.text.trim() : '',
+            reason: '通过面板创建隧道');
       } else {
-        await a.updateTunnel(e.id, name: _name.text.trim(), localIp: _localIp.text.trim(), localPort: _lp, remotePort: _rp, reason: '通过面板修改隧道');
+        await a.updateTunnel(
+          e.id,
+          name: _name.text.trim(),
+          localIp: _localIp.text.trim(),
+          localPort: _lp,
+          remotePort: _web ? null : _rp,
+          customDomains: _web ? _domainList : null,
+          subdomain: _web ? _sub.text.trim() : null,
+          hostHeaderRewrite: _kind == 'http' ? _rewrite.text.trim() : null,
+          reason: '通过面板修改隧道');
       }
       return true;
     });
@@ -253,6 +301,21 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
             onChanged: (v) => setState(() => _client = v),
           ),
         const SizedBox(height: 12),
+        label('类型'),
+        if (editing)
+          Text(_kind.toUpperCase(), style: Type.body.copyWith(color: c.text1))
+        else
+          LSelect<String>(
+            value: _kind,
+            options: const [
+              LSelectOption('tcp', 'TCP'),
+              LSelectOption('udp', 'UDP'),
+              LSelectOption('http', 'HTTP（按域名）'),
+              LSelectOption('https', 'HTTPS（按域名，TLS 透传）'),
+            ],
+            onChanged: (v) => setState(() => _kind = v ?? 'tcp'),
+          ),
+        const SizedBox(height: 12),
         label('名称'),
         LTextField(key: const Key('tunnel-name'), controller: _name, hint: '例如：ssh', onChanged: (_) => setState(() {})),
         const SizedBox(height: 12),
@@ -268,10 +331,21 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           ])),
         ]),
         const SizedBox(height: 12),
-        label('公网端口（留空 = 自动分配）'),
-        LTextField(key: const Key('tunnel-remote-port'), controller: _remotePort, hint: '6000', onChanged: (_) => setState(() {})),
-        const SizedBox(height: 8),
-        Text('类型：TCP（UDP / HTTP 等将在后续版本提供）', style: Type.caption.copyWith(color: c.text3)),
+        if (!_web) ...[
+          label('公网端口（留空 = 自动分配）'),
+          LTextField(key: const Key('tunnel-remote-port'), controller: _remotePort, hint: '6000', onChanged: (_) => setState(() {})),
+        ] else ...[
+          label('自定义域名（多个用逗号分隔，支持 *.example.com）'),
+          LTextField(key: const Key('tunnel-domains'), controller: _domains, hint: 'www.example.com', onChanged: (_) => setState(() {})),
+          const SizedBox(height: 12),
+          label('子域名（需要服务器配置子域名后缀）'),
+          LTextField(key: const Key('tunnel-subdomain'), controller: _sub, hint: 'blog', onChanged: (_) => setState(() {})),
+          if (_kind == 'http') ...[
+            const SizedBox(height: 12),
+            label('改写 Host 头（可选）'),
+            LTextField(key: const Key('tunnel-rewrite'), controller: _rewrite, hint: 'internal.lan:8080'),
+          ],
+        ],
       ]),
       actions: [
         LButton(label: '取消', onPressed: () => Navigator.pop(context)),

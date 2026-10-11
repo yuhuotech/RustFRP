@@ -42,8 +42,9 @@ Flutter：UI 完全沿用 linkory 的 token / 共享控件 / 三栏布局，**�
 - P00 工程初始化：Cargo workspace、CI、覆盖率门槛工具 ✔；Flutter 工程 ✘。
 - P01 隧道核心：`frpcfg` ✔（INI 转换 `convert` 未做）；TLS1.3 + yamux 多路复用 + TCP 隧道 + 令牌鉴权 + 重连 + 心跳 ✔；
   `rustfrp-agent` 的 client / edge 模式、`verify`、frpc/frps 别名 ✔；内存基线 ✔（见 `tools/bench/README.md`）。
-  **尚未实现**：UDP、http/https/vhost、stcp/sudp/xtcp、tcpmux、插件、带宽限制、健康检查、负载均衡、visitors、PROXY protocol——
-  配置里出现这些时会在兼容报告 / 日志里明确列出并跳过。
+  已实现的代理类型：**tcp / udp / http（按 Host 路由、通配、子域名、Host 改写）/ https（按 SNI 透传）**，独立模式与受管模式都支持。
+  **尚未实现**：stcp/sudp/xtcp、tcpmux、插件、带宽限制、加密/压缩、健康检查、负载均衡、visitors、PROXY protocol、http 的 locations / Basic Auth / 请求头改写——
+  配置里出现这些时会在兼容报告 / 日志里明确列出并跳过（逐代理列出被忽略的选项）。HTTP 路由按「连接」的第一个请求的 Host 决定（同一连接上的后续请求不再重新路由）。
 - P02 Controller：`rustfrp-server`（SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD、配置热下发、审计、REST、面板静态托管）✔；
   `rustfrp-agent --controller … --enroll-token …` 受管模式 ✔。尚未做：流量统计/曲线、日志尾随、API Token、多 Edge 节点、安装脚本 `install.sh`/`install.ps1` 的托管。
 - P03 Flutter：登录、概览、节点、客户端（含重命名/停用/下线/删除）、隧道 CRUD、接入向导、审计、设置（主题/令牌/管理员）、宽窄屏、深浅色 ✔；

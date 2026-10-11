@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rustfrp_app/core/models.dart';
+import 'package:rustfrp_app/features/tunnels/tunnels_view.dart';
 import 'package:rustfrp_app/core/store.dart';
 import 'package:rustfrp_app/shared/widgets.dart';
 
@@ -277,5 +279,90 @@ void main() {
     await settle(tester, 10);
     expect(s.tunnels.single['client_id'], c['id']);
     expect(find.text('rdp'), findsOneWidget);
+  });
+
+  testWidgets('create UDP and HTTP tunnels; domains are required for web types; addresses are shown as URLs', (tester) async {
+    final s = FakeServer();
+    final c = s.addClient('nas', isOnline: true);
+    await Harness.create(tester, s);
+    await tester.tap(find.byTooltip('隧道'));
+    await settle(tester);
+
+    // UDP
+    await tapKey(tester, 'new-tunnel');
+    await tester.tap(find.text('选择客户端'));
+    await settle(tester);
+    await tester.tap(find.text('nas').last);
+    await settle(tester);
+    await tester.tap(find.text('TCP'));
+    await settle(tester);
+    await tester.tap(find.text('UDP').last);
+    await settle(tester);
+    await tester.enterText(find.byKey(const Key('tunnel-name')), 'dns');
+    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '53');
+    await tester.enterText(find.byKey(const Key('tunnel-remote-port')), '5353');
+    await settle(tester);
+    await tapKey(tester, 'tunnel-save');
+    await settle(tester, 10);
+    expect(s.tunnels.single['kind'], 'udp');
+    expect(s.tunnels.single['remote_port'], 5353);
+    expect(find.textContaining('frp.example.com:5353'), findsOneWidget);
+
+    // HTTP: the domain fields replace the public port; save stays disabled without a domain or subdomain.
+    await tapKey(tester, 'new-tunnel');
+    await tester.tap(find.text('选择客户端'));
+    await settle(tester);
+    await tester.tap(find.text('nas').last);
+    await settle(tester);
+    await tester.tap(find.text('TCP'));
+    await settle(tester);
+    await tester.tap(find.textContaining('HTTP（按域名）').last);
+    await settle(tester);
+    expect(find.byKey(const Key('tunnel-remote-port')), findsNothing);
+    expect(find.byKey(const Key('tunnel-rewrite')), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('tunnel-name')), 'site');
+    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '80');
+    await settle(tester);
+    GestureDetector save() => tester.widget<GestureDetector>(find.descendant(of: find.byKey(const Key('tunnel-save')), matching: find.byType(GestureDetector)).first);
+    expect(save().onTap, isNull);
+    await tester.enterText(find.byKey(const Key('tunnel-domains')), 'WWW.example.com, b.example.com');
+    await tester.enterText(find.byKey(const Key('tunnel-rewrite')), 'internal.lan');
+    await settle(tester);
+    expect(save().onTap, isNotNull);
+    await tapKey(tester, 'tunnel-save');
+    await settle(tester, 10);
+    final web = s.tunnels.last;
+    expect(web['kind'], 'http');
+    expect(web['custom_domains'], ['WWW.example.com', 'b.example.com']);
+    expect(web['host_header_rewrite'], 'internal.lan');
+    expect(find.textContaining('http://WWW.example.com:8080'), findsOneWidget);
+    expect(find.textContaining('(+1)'), findsOneWidget);
+
+    // Editing keeps the type fixed and updates domains.
+    await tester.tap(find.byTooltip('编辑').last);
+    await settle(tester);
+    expect(find.text('HTTP'), findsWidgets);
+    await tester.enterText(find.byKey(const Key('tunnel-domains')), '');
+    await tester.enterText(find.byKey(const Key('tunnel-subdomain')), 'blog');
+    await settle(tester);
+    await tapKey(tester, 'tunnel-save');
+    await settle(tester, 10);
+    expect(s.tunnels.last['subdomain'], 'blog');
+    expect(find.textContaining('http://blog.t.example.com:8080'), findsOneWidget);
+    expect(c['id'], isNotNull);
+  });
+
+  test('publicAddress covers every kind', () {
+    const node = NodeInfo(publicHost: 'h.com', vhostHttpPort: 80, vhostHttpsPort: 8443, subdomainHost: 't.com');
+    Tunnel t(Map<String, Object?> j) => Tunnel.fromJson({'id': 'x', ...j});
+    expect(publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), node), 'h.com:6000');
+    expect(publicAddress(t({'kind': 'tcp', 'remote_port': 6000}), null), ':6000');
+    expect(publicAddress(t({'kind': 'udp'}), node), '自动分配');
+    expect(publicAddress(t({'kind': 'http', 'custom_domains': ['a.com']}), node), 'http://a.com');
+    expect(publicAddress(t({'kind': 'https', 'custom_domains': ['a.com']}), node), 'https://a.com:8443');
+    expect(publicAddress(t({'kind': 'http', 'subdomain': 'x'}), node), 'http://x.t.com');
+    expect(publicAddress(t({'kind': 'http', 'subdomain': 'x'}), const NodeInfo()), '未配置域名');
+    expect(publicAddress(t({'kind': 'http', 'custom_domains': ['a.com']}), null), 'http://a.com');
+    expect(publicAddress(t({'kind': 'https', 'custom_domains': ['a.com']}), const NodeInfo(vhostHttpsPort: 443)), 'https://a.com');
   });
 }

@@ -25,6 +25,12 @@ pub struct Config {
     pub secure_cookie: bool,
     /// 管理会话有效期（毫秒）。
     pub session_ttl_ms: i64,
+    /// HTTP 虚拟主机端口（`None` = 不启用）。
+    pub vhost_http: Option<u16>,
+    /// HTTPS（SNI 透传）虚拟主机端口。
+    pub vhost_https: Option<u16>,
+    /// 子域名后缀（`*.tunnel.example.com` 的 `tunnel.example.com`）。
+    pub subdomain_host: String,
 }
 
 impl Default for Config {
@@ -40,6 +46,9 @@ impl Default for Config {
             panel_dir: None,
             secure_cookie: false,
             session_ttl_ms: 8 * 3600 * 1000,
+            vhost_http: None,
+            vhost_https: None,
+            subdomain_host: String::new(),
         }
     }
 }
@@ -97,6 +106,20 @@ impl Config {
         }
         if let Some(v) = get("RUSTFRP_SECURE_COOKIE") {
             c.secure_cookie = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        for (key, slot) in [
+            ("RUSTFRP_VHOST_HTTP", &mut c.vhost_http),
+            ("RUSTFRP_VHOST_HTTPS", &mut c.vhost_https),
+        ] {
+            if let Some(v) = get(key).filter(|v| !v.is_empty()) {
+                *slot = Some(
+                    v.parse::<u16>()
+                        .map_err(|_| format!("invalid {key} \"{v}\""))?,
+                );
+            }
+        }
+        if let Some(v) = get("RUSTFRP_SUBDOMAIN_HOST") {
+            c.subdomain_host = v.trim().trim_matches('.').to_ascii_lowercase();
         }
         if let Some(v) = get("RUSTFRP_SESSION_HOURS") {
             let h: i64 = v
@@ -159,6 +182,9 @@ mod tests {
             ("RUSTFRP_PANEL_DIR", "/srv/panel"),
             ("RUSTFRP_SECURE_COOKIE", "true"),
             ("RUSTFRP_SESSION_HOURS", "2"),
+            ("RUSTFRP_VHOST_HTTP", "8080"),
+            ("RUSTFRP_VHOST_HTTPS", "8443"),
+            ("RUSTFRP_SUBDOMAIN_HOST", ".Tunnel.Example.com."),
         ])
         .unwrap();
         assert_eq!(c.db_path.to_str(), Some("/data/x.db"));
@@ -177,6 +203,8 @@ mod tests {
         );
         assert!(c.panel_dir.is_some() && c.secure_cookie);
         assert_eq!(c.session_ttl_ms, 2 * 3600 * 1000);
+        assert_eq!((c.vhost_http, c.vhost_https), (Some(8080), Some(8443)));
+        assert_eq!(c.subdomain_host, "tunnel.example.com");
         assert!(cfg(&[("RUSTFRP_PANEL_DIR", "")])
             .unwrap()
             .panel_dir
@@ -201,6 +229,12 @@ mod tests {
         assert!(cfg(&[("RUSTFRP_ALLOW_PORTS", "abc")]).is_err());
         assert!(cfg(&[("RUSTFRP_ALLOW_PORTS", "5-1")]).is_err());
         assert!(cfg(&[("RUSTFRP_ALLOW_PORTS", "1-99999")]).is_err());
+        assert!(cfg(&[("RUSTFRP_VHOST_HTTP", "x")]).is_err());
+        assert!(cfg(&[("RUSTFRP_VHOST_HTTPS", "99999")]).is_err());
+        assert!(cfg(&[("RUSTFRP_VHOST_HTTP", "")])
+            .unwrap()
+            .vhost_http
+            .is_none());
         assert!(cfg(&[("RUSTFRP_SESSION_HOURS", "x")]).is_err());
         assert!(cfg(&[("RUSTFRP_SESSION_HOURS", "0")]).is_err());
         assert!(cfg(&[("RUSTFRP_SESSION_HOURS", "721")]).is_err());

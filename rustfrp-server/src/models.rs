@@ -108,6 +108,15 @@ pub struct Tunnel {
     pub status_port: u16,
     /// 失败原因。
     pub status_error: String,
+    /// http / https：自定义域名。
+    #[serde(default)]
+    pub custom_domains: Vec<String>,
+    /// http / https：子域名。
+    #[serde(default)]
+    pub subdomain: String,
+    /// http：改写 Host 头。
+    #[serde(default)]
+    pub host_header_rewrite: String,
 }
 
 /// 接入令牌（不含明文）。

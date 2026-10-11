@@ -212,15 +212,44 @@ class Actions {
     required int localPort,
     String localIp = '127.0.0.1',
     int remotePort = 0,
+    String kind = 'tcp',
+    List<String> customDomains = const [],
+    String subdomain = '',
+    String hostHeaderRewrite = '',
     required String reason,
   }) =>
       _do(() => _api.createTunnel(
-          clientId: clientId, name: name, localPort: localPort, localIp: localIp, remotePort: remotePort, reason: reason));
+          clientId: clientId,
+          name: name,
+          localPort: localPort,
+          localIp: localIp,
+          remotePort: remotePort,
+          kind: kind,
+          customDomains: customDomains,
+          subdomain: subdomain,
+          hostHeaderRewrite: hostHeaderRewrite,
+          reason: reason));
 
   Future<Tunnel> updateTunnel(String id,
-          {String? name, String? localIp, int? localPort, int? remotePort, bool? enabled, required String reason}) =>
+          {String? name,
+          String? localIp,
+          int? localPort,
+          int? remotePort,
+          bool? enabled,
+          List<String>? customDomains,
+          String? subdomain,
+          String? hostHeaderRewrite,
+          required String reason}) =>
       _do(() => _api.patchTunnel(id,
-          name: name, localIp: localIp, localPort: localPort, remotePort: remotePort, enabled: enabled, reason: reason));
+          name: name,
+          localIp: localIp,
+          localPort: localPort,
+          remotePort: remotePort,
+          enabled: enabled,
+          customDomains: customDomains,
+          subdomain: subdomain,
+          hostHeaderRewrite: hostHeaderRewrite,
+          reason: reason));
 
   Future<void> deleteTunnel(String id, String reason) => _do(() => _api.deleteTunnel(id, reason: reason));
 

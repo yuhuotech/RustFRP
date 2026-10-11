@@ -166,8 +166,14 @@ class Tunnel {
     this.state = TunnelState.pending,
     this.statusPort = 0,
     this.statusError = '',
+    this.customDomains = const [],
+    this.subdomain = '',
+    this.hostHeaderRewrite = '',
   });
-  final String id, clientId, name, kind, localIp, statusError;
+  final String id, clientId, name, kind, localIp, statusError, subdomain, hostHeaderRewrite;
+  final List<String> customDomains;
+
+  bool get isWeb => kind == 'http' || kind == 'https';
   final int localPort, remotePort, statusPort, createdAt, updatedAt;
   final bool enabled;
   final TunnelState state;
@@ -192,6 +198,9 @@ class Tunnel {
       state: TunnelState.fromWire(m['state'] as String?),
       statusPort: _int(m['status_port']),
       statusError: _str(m['status_error']),
+      customDomains: [for (final d in _list(m['custom_domains'])) if (d is String) d],
+      subdomain: _str(m['subdomain']),
+      hostHeaderRewrite: _str(m['host_header_rewrite']),
     );
   }
 
@@ -210,10 +219,13 @@ class Tunnel {
       other.updatedAt == updatedAt &&
       other.state == state &&
       other.statusPort == statusPort &&
-      other.statusError == statusError;
+      other.statusError == statusError &&
+      listEquals(other.customDomains, customDomains) &&
+      other.subdomain == subdomain &&
+      other.hostHeaderRewrite == hostHeaderRewrite;
   @override
   int get hashCode =>
-      Object.hash(id, clientId, name, kind, localIp, localPort, remotePort, enabled, createdAt, updatedAt, state, statusPort, statusError);
+      Object.hashAll([id, clientId, name, kind, localIp, localPort, remotePort, enabled, createdAt, updatedAt, state, statusPort, statusError, ...customDomains, subdomain, hostHeaderRewrite]);
 }
 
 @immutable
@@ -345,9 +357,13 @@ class NodeInfo {
     this.allowPorts = const [],
     this.version = '',
     this.clientsOnline = 0,
+    this.vhostHttpPort,
+    this.vhostHttpsPort,
+    this.subdomainHost = '',
   });
-  final String name, publicHost, version;
+  final String name, publicHost, version, subdomainHost;
   final int edgePort, clientsOnline;
+  final int? vhostHttpPort, vhostHttpsPort;
 
   /// Inclusive `[lo, hi]` ranges; empty = unrestricted.
   final List<(int, int)> allowPorts;
@@ -369,6 +385,9 @@ class NodeInfo {
       allowPorts: ranges,
       version: _str(m['version']),
       clientsOnline: _int(m['clients_online']),
+      vhostHttpPort: _intOrNull(m['vhost_http_port']),
+      vhostHttpsPort: _intOrNull(m['vhost_https_port']),
+      subdomainHost: _str(m['subdomain_host']),
     );
   }
 }

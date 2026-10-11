@@ -36,7 +36,10 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_tunnel_domains.sql")),
+];
 
 /// 执行未应用的迁移（以 `PRAGMA user_version` 记录进度）。
 pub fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -119,7 +122,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         for t in [
             "admins",
             "admin_sessions",

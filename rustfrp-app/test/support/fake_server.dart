@@ -64,6 +64,9 @@ class FakeServer {
       'state': state,
       'status_port': state == 'running' ? remote : 0,
       'status_error': error,
+      'custom_domains': <String>[],
+      'subdomain': '',
+      'host_header_rewrite': '',
     };
     tunnels.add(t);
     return t;
@@ -138,6 +141,9 @@ class FakeServer {
             [6000, 6100],
             [7000, 7000]
           ],
+          'vhost_http_port': 8080,
+          'vhost_https_port': null,
+          'subdomain_host': 't.example.com',
           'version': '0.1.0',
           'clients_online': online.length,
         });
@@ -173,13 +179,17 @@ class FakeServer {
         final t = addTunnel(body['client_id']! as String, body['name']! as String,
             local: body['local_port']! as int, remote: (body['remote_port'] as int?) ?? 0, state: 'pending');
         t['local_ip'] = body['local_ip'] ?? '127.0.0.1';
+        t['kind'] = body['kind'] ?? 'tcp';
+        t['custom_domains'] = body['custom_domains'] ?? <String>[];
+        t['subdomain'] = body['subdomain'] ?? '';
+        t['host_header_rewrite'] = body['host_header_rewrite'] ?? '';
         return _json(t, 201);
       case ('PATCH', ['tunnels', final id]):
         final e = guard('operator');
         if (e != null) return e;
         final t = tunnels.where((x) => x['id'] == id).firstOrNull;
         if (t == null) return _err(404, 'not_found', 'not found');
-        for (final k in ['name', 'local_ip', 'local_port', 'remote_port', 'enabled']) {
+        for (final k in ['name', 'local_ip', 'local_port', 'remote_port', 'enabled', 'custom_domains', 'subdomain', 'host_header_rewrite']) {
           if (body.containsKey(k)) t[k] = body[k];
         }
         return _json(t);

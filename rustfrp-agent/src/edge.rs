@@ -17,18 +17,20 @@ use rustfrp_core::error::TunnelError;
 use rustfrp_core::mux::{self, MuxConfig, Session, Stream};
 use rustfrp_core::pipe;
 use rustfrp_core::tls::{self, Identity};
+use rustfrp_core::vhost::proxy_hosts;
 use rustfrp_core::wire::{
     read_frame, write_frame, ClientMsg, ConfigSet, Login, ManagedProxy, ProxySpec, ServerMsg,
     StartWork, PROTOCOL_VERSION,
 };
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::log::Logger;
+use crate::proxy_rt::{serve_vhost, udp_proxy, Route, Routes, UdpOpts, VhostOpts};
 
 /// 装箱的异步返回值。
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -125,6 +127,20 @@ pub struct EdgeConfig {
     pub user_conn_timeout: Duration,
     /// 多路复用参数。
     pub mux: MuxConfig,
+    /// HTTP 虚拟主机端口（`None` = 不启用，`Some(0)` = 系统分配，测试用）。
+    pub vhost_http_port: Option<u16>,
+    /// HTTPS（SNI 透传）虚拟主机端口。
+    pub vhost_https_port: Option<u16>,
+    /// 子域名后缀（frp 的 `subDomainHost`）。
+    pub sub_domain_host: String,
+    /// 等待请求头的超时。
+    pub vhost_head_timeout: Duration,
+    /// 每个 UDP 代理同时跟踪的访问者上限。
+    pub udp_max_peers: usize,
+    /// UDP 访问者空闲回收时间。
+    pub udp_idle: Duration,
+    /// UDP 接收缓冲（frp 的 `udpPacketSize`）。
+    pub udp_packet_size: usize,
 }
 
 impl Default for EdgeConfig {
@@ -140,6 +156,13 @@ impl Default for EdgeConfig {
             heartbeat_timeout: Duration::from_secs(90),
             user_conn_timeout: Duration::from_secs(10),
             mux: MuxConfig::default(),
+            vhost_http_port: None,
+            vhost_https_port: None,
+            sub_domain_host: String::new(),
+            vhost_head_timeout: Duration::from_secs(10),
+            udp_max_peers: 1024,
+            udp_idle: Duration::from_secs(60),
+            udp_packet_size: 1500,
         }
     }
 }
@@ -176,6 +199,8 @@ impl Names {
 /// 已绑定、待运行的边缘节点。
 pub struct Edge {
     listener: TcpListener,
+    http_listener: Option<TcpListener>,
+    https_listener: Option<TcpListener>,
     acceptor: TlsAcceptor,
     cfg: Arc<EdgeConfig>,
     policy: Arc<dyn Policy>,
@@ -208,8 +233,21 @@ impl Edge {
         };
         let acceptor = TlsAcceptor::from(tls::server_config(id)?);
         let listener = TcpListener::bind((cfg.bind_addr.as_str(), cfg.bind_port)).await?;
+        let vhost = |port: Option<u16>| {
+            let addr = cfg.proxy_bind_addr.clone();
+            async move {
+                match port {
+                    Some(p) => Ok(Some(TcpListener::bind((addr.as_str(), p)).await?)),
+                    None => Ok::<_, TunnelError>(None),
+                }
+            }
+        };
+        let http_listener = vhost(cfg.vhost_http_port).await?;
+        let https_listener = vhost(cfg.vhost_https_port).await?;
         Ok(Edge {
             listener,
+            http_listener,
+            https_listener,
             acceptor,
             cfg: Arc::new(cfg),
             policy,
@@ -222,9 +260,40 @@ impl Edge {
         self.listener.local_addr()
     }
 
+    /// HTTP 虚拟主机的实际监听地址。
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+    }
+
+    /// HTTPS 虚拟主机的实际监听地址。
+    pub fn https_addr(&self) -> Option<SocketAddr> {
+        self.https_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+    }
+
     /// 运行直到 `shutdown` 被取消。
     pub async fn serve(self, shutdown: CancellationToken) {
         let names = Arc::new(Names::default());
+        let routes = Arc::new(Routes::default());
+        let vopts = VhostOpts {
+            head_timeout: self.cfg.vhost_head_timeout,
+            open_timeout: self.cfg.user_conn_timeout,
+        };
+        for (listener, https) in [(self.http_listener, false), (self.https_listener, true)] {
+            if let Some(l) = listener {
+                tokio::spawn(serve_vhost(
+                    l,
+                    https,
+                    routes.clone(),
+                    vopts.clone(),
+                    self.log.clone(),
+                    shutdown.clone(),
+                ));
+            }
+        }
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -235,6 +304,7 @@ impl Edge {
                         acceptor: self.acceptor.clone(),
                         policy: self.policy.clone(),
                         names: names.clone(),
+                        routes: routes.clone(),
                         log: self.log.clone(),
                         cancel: shutdown.child_token(),
                     };
@@ -255,6 +325,7 @@ struct ClientCtx {
     acceptor: TlsAcceptor,
     policy: Arc<dyn Policy>,
     names: Arc<Names>,
+    routes: Arc<Routes>,
     log: Logger,
     cancel: CancellationToken,
 }
@@ -398,7 +469,19 @@ async fn serve_standalone(
             match msg {
                 ClientMsg::Ping => write_frame(wr, &ServerMsg::Pong).await?,
                 ClientMsg::NewProxy(spec) => {
-                    let resp = match start_proxy(session, &spec, ctx, &mut owned).await {
+                    let started = if ctx.cfg.max_ports_per_client > 0
+                        && owned.len() >= ctx.cfg.max_ports_per_client
+                    {
+                        Err("exceed the max_ports_per_client".to_string())
+                    } else {
+                        activate(session, &ProxyDef::from(&spec), ctx)
+                            .await
+                            .map(|(port, _)| port)
+                    };
+                    if started.is_ok() {
+                        owned.push(spec.name.clone());
+                    }
+                    let resp = match started {
                         Ok(port) => ServerMsg::NewProxyResp {
                             name: spec.name,
                             remote_port: port,
@@ -529,7 +612,7 @@ async fn reconcile(
             r.spec = p.clone();
             continue;
         }
-        match start_managed(session, p, ctx).await {
+        match activate(session, &ProxyDef::from(p), ctx).await {
             Ok((port, stop)) => {
                 running.insert(
                     p.name.clone(),
@@ -548,81 +631,164 @@ async fn reconcile(
     }
 }
 
-fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
-    a.kind == b.kind && a.remote_port == b.remote_port
+/// 统一的代理定义：独立模式（`ProxySpec`）与受管模式（`ManagedProxy`）都转换成它再启动。
+struct ProxyDef {
+    name: String,
+    kind: String,
+    remote_port: u16,
+    custom_domains: Vec<String>,
+    subdomain: String,
+    host_header_rewrite: String,
 }
 
-async fn start_managed(
+impl From<&ProxySpec> for ProxyDef {
+    fn from(p: &ProxySpec) -> Self {
+        Self {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            remote_port: p.remote_port,
+            custom_domains: p.custom_domains.clone(),
+            subdomain: p.subdomain.clone(),
+            host_header_rewrite: p.host_header_rewrite.clone(),
+        }
+    }
+}
+
+impl From<&ManagedProxy> for ProxyDef {
+    fn from(p: &ManagedProxy) -> Self {
+        Self {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            remote_port: p.remote_port,
+            custom_domains: p.custom_domains.clone(),
+            subdomain: p.subdomain.clone(),
+            host_header_rewrite: p.host_header_rewrite.clone(),
+        }
+    }
+}
+
+/// 两份受管定义在「监听 / 路由」层面是否等价（只有本地目标变了则无需重启监听）。
+fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
+    a.kind == b.kind
+        && a.remote_port == b.remote_port
+        && a.custom_domains == b.custom_domains
+        && a.subdomain == b.subdomain
+        && a.host_header_rewrite == b.host_header_rewrite
+}
+
+/// 启动一个代理（tcp / udp / http / https）。成功返回（对外端口, 停止令牌），失败返回给客户端看的原因。
+async fn activate(
     session: &Session,
-    p: &ManagedProxy,
+    def: &ProxyDef,
     ctx: &ClientCtx,
 ) -> Result<(u16, CancellationToken), String> {
-    if p.kind != "tcp" {
-        return Err(format!("proxy type [{}] is not supported yet", p.kind));
+    if !["tcp", "udp", "http", "https"].contains(&def.kind.as_str()) {
+        return Err(format!("proxy type [{}] is not supported yet", def.kind));
     }
-    if !ctx.names.claim(&p.name) {
-        return Err(format!("proxy [{}] already exists", p.name));
+    if !ctx.names.claim(&def.name) {
+        return Err(format!("proxy [{}] already exists", def.name));
     }
-    match bind_proxy_port(p.remote_port, &ctx.cfg).await {
-        Ok((listener, port)) => {
-            let stop = ctx.cancel.child_token();
-            let sub = ClientCtx {
-                cancel: stop.clone(),
-                ..ctx.clone()
-            };
-            tokio::spawn(accept_visitors(
-                listener,
-                p.name.clone(),
-                session.clone(),
-                sub,
-            ));
+    let stop = ctx.cancel.child_token();
+    match launch(session, def, ctx, &stop).await {
+        Ok(port) => {
             ctx.log.info(&format!(
-                "proxy [{}] start, listening on port {port}",
-                p.name
+                "proxy [{}] ({}) start, port {port}",
+                def.name, def.kind
             ));
             Ok((port, stop))
         }
         Err(e) => {
-            ctx.names.release(&p.name);
+            ctx.names.release(&def.name);
+            stop.cancel();
             Err(e)
         }
     }
 }
 
-/// 为一个代理绑定公网端口并启动转发。成功返回实际端口，失败返回给客户端看的原因。
-async fn start_proxy(
+async fn launch(
     session: &Session,
-    spec: &ProxySpec,
+    def: &ProxyDef,
     ctx: &ClientCtx,
-    owned: &mut Vec<String>,
+    stop: &CancellationToken,
 ) -> Result<u16, String> {
-    if spec.kind != "tcp" {
-        return Err(format!("proxy type [{}] is not supported yet", spec.kind));
-    }
-    if ctx.cfg.max_ports_per_client > 0 && owned.len() >= ctx.cfg.max_ports_per_client {
-        return Err("exceed the max_ports_per_client".into());
-    }
-    if !ctx.names.claim(&spec.name) {
-        return Err(format!("proxy [{}] already exists", spec.name));
-    }
-    match bind_proxy_port(spec.remote_port, &ctx.cfg).await {
-        Ok((listener, port)) => {
-            owned.push(spec.name.clone());
+    let sub = ClientCtx {
+        cancel: stop.clone(),
+        ..ctx.clone()
+    };
+    match def.kind.as_str() {
+        "tcp" => {
+            let (listener, port) = bind_proxy_port(def.remote_port, &ctx.cfg).await?;
             tokio::spawn(accept_visitors(
                 listener,
-                spec.name.clone(),
+                def.name.clone(),
                 session.clone(),
-                ctx.clone(),
-            ));
-            ctx.log.info(&format!(
-                "proxy [{}] start, listening on port {port}",
-                spec.name
+                sub,
             ));
             Ok(port)
         }
-        Err(e) => {
-            ctx.names.release(&spec.name);
-            Err(e)
+        "udp" => {
+            let sock = bind_udp_port(def.remote_port, &ctx.cfg).await?;
+            let port = sock.local_addr().map_or(def.remote_port, |a| a.port());
+            let opts = UdpOpts {
+                max_peers: ctx.cfg.udp_max_peers,
+                idle: ctx.cfg.udp_idle,
+                packet_size: ctx.cfg.udp_packet_size,
+                open_timeout: ctx.cfg.user_conn_timeout,
+            };
+            tokio::spawn(udp_proxy(
+                sock,
+                def.name.clone(),
+                session.clone(),
+                opts,
+                ctx.log.clone(),
+                stop.clone(),
+            ));
+            Ok(port)
+        }
+        kind => {
+            let https = kind == "https";
+            let (enabled, label) = if https {
+                (ctx.cfg.vhost_https_port.is_some(), "https")
+            } else {
+                (ctx.cfg.vhost_http_port.is_some(), "http")
+            };
+            if !enabled {
+                return Err(format!(
+                    "type [{label}] not supported when vhost {label} port is not set"
+                ));
+            }
+            if !def.subdomain.is_empty() && ctx.cfg.sub_domain_host.is_empty() {
+                return Err(
+                    "subdomain is not supported because this feature is not enabled in server"
+                        .into(),
+                );
+            }
+            let hosts = proxy_hosts(
+                &def.custom_domains,
+                &def.subdomain,
+                &ctx.cfg.sub_domain_host,
+            );
+            if hosts.is_empty() {
+                return Err("subdomain and custom domains should not be both empty".into());
+            }
+            let route = Route {
+                id: 0,
+                proxy: def.name.clone(),
+                session: session.clone(),
+                rewrite: def.host_header_rewrite.clone(),
+            };
+            let route_id = ctx.routes.add(https, &hosts, &route)?;
+            let (routes, stop) = (ctx.routes.clone(), stop.clone());
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                routes.remove(route_id);
+            });
+            Ok(if https {
+                ctx.cfg.vhost_https_port
+            } else {
+                ctx.cfg.vhost_http_port
+            }
+            .unwrap_or(0))
         }
     }
 }
@@ -648,6 +814,26 @@ async fn bind_proxy_port(requested: u16, cfg: &EdgeConfig) -> Result<(TcpListene
     };
     let port = listener.local_addr().map_or(requested, |a| a.port());
     Ok((listener, port))
+}
+
+async fn bind_udp_port(requested: u16, cfg: &EdgeConfig) -> Result<UdpSocket, String> {
+    let addr = cfg.proxy_bind_addr.as_str();
+    if requested != 0 && !cfg.port_allowed(requested) {
+        return Err(format!("port not allowed: {requested}"));
+    }
+    if requested != 0 || cfg.allow_ports.is_empty() {
+        return UdpSocket::bind((addr, requested))
+            .await
+            .map_err(|e| format!("listen on udp port {requested} failed: {e}"));
+    }
+    for (lo, hi) in &cfg.allow_ports {
+        for port in *lo..=*hi {
+            if let Ok(s) = UdpSocket::bind((addr, port)).await {
+                return Ok(s);
+            }
+        }
+    }
+    Err("no available port in allowPorts".into())
 }
 
 async fn first_free_port(addr: &str, ranges: &[(u16, u16)]) -> Option<TcpListener> {

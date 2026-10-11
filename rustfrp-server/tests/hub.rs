@@ -35,6 +35,8 @@ async fn start() -> (Server, std::path::PathBuf) {
         http_addr: "127.0.0.1:0".into(),
         edge_addr: "127.0.0.1:0".into(),
         proxy_bind_addr: "127.0.0.1".into(),
+        vhost_http: Some(0),
+        subdomain_host: "t.example.com".into(),
         ..Config::default()
     };
     (app::start(cfg, Logger::silent()).await.unwrap(), path)
@@ -199,6 +201,7 @@ async fn enroll_manage_tunnels_and_go_offline() {
                         local_port: i64::from(echo_port),
                         remote_port: 0,
                         enabled: true,
+                        ..Default::default()
                     },
                     store::now_ms(),
                 )
@@ -540,4 +543,122 @@ async fn startup_errors() {
     .err()
     .unwrap();
     assert!(e.contains("open database"), "{e}");
+}
+
+#[tokio::test]
+async fn udp_and_http_tunnels_run_through_the_controller() {
+    use tokio::net::UdpSocket;
+    let (server, path) = start().await;
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let token = make_token(&server, "box", 60_000).await;
+    let (mut rx, cancel) = spawn(agent(&server, key, None, Some(&token)));
+    let Event::Enrolled { client_id } =
+        until(&mut rx, |e| matches!(e, Event::Enrolled { .. })).await
+    else {
+        unreachable!()
+    };
+
+    // 本地 UDP 回显与一个简单的 HTTP 后端。
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = udp.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = [0u8; 1024];
+        while let Ok((n, from)) = udp.recv_from(&mut b).await {
+            let _ = udp.send_to(&b[..n], from).await;
+        }
+    });
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = http.accept().await {
+            tokio::spawn(async move {
+                let mut b = [0u8; 2048];
+                let _ = s.read(&mut b).await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    let cid = client_id.clone();
+    let mk = move |name: &str, kind: &str, port: u16, domains: Vec<String>, sub: &str| NewTunnel {
+        client_id: cid.clone(),
+        name: name.into(),
+        kind: kind.into(),
+        local_ip: "127.0.0.1".into(),
+        local_port: i64::from(port),
+        enabled: true,
+        custom_domains: domains,
+        subdomain: sub.into(),
+        ..Default::default()
+    };
+    let (udp_t, web_t) = server
+        .db
+        .call(move |c| {
+            let u =
+                store::create_tunnel(c, &mk("dns", "udp", udp_port, vec![], ""), store::now_ms())?;
+            let w = store::create_tunnel(
+                c,
+                &mk(
+                    "site",
+                    "http",
+                    http_port,
+                    vec!["www.example.com".into()],
+                    "blog",
+                ),
+                store::now_ms(),
+            )?;
+            Ok((u, w))
+        })
+        .await
+        .unwrap();
+    server.hub.refresh(&client_id).await.unwrap();
+    for id in [udp_t.id.clone(), web_t.id.clone()] {
+        wait_for(|| {
+            let (db, id) = (server.db.clone(), id.clone());
+            async move {
+                db.call(move |c| store::get_tunnel(c, &id))
+                    .await
+                    .unwrap()
+                    .state
+                    == "running"
+            }
+        })
+        .await;
+    }
+    let udp_port_pub = server
+        .db
+        .call({
+            let id = udp_t.id.clone();
+            move |c| store::get_tunnel(c, &id)
+        })
+        .await
+        .unwrap()
+        .status_port;
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    c.send_to(b"ping", ("127.0.0.1", udp_port_pub))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let n = timeout(T, c.recv(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"ping");
+
+    let vhost = server.vhost_http_addr.unwrap();
+    for host in ["www.example.com", "blog.t.example.com"] {
+        let mut s = TcpStream::connect(vhost).await.unwrap();
+        s.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        timeout(T, s.read_to_string(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.ends_with("ok"), "{host}: {out}");
+    }
+    cancel.cancel();
+    server.stop().await;
+    cleanup(&path);
 }

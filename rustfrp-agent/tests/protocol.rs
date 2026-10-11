@@ -177,6 +177,7 @@ async fn edge_survives_a_client_that_vanishes_with_visitors_waiting() {
             name: "gone".into(),
             kind: "tcp".into(),
             remote_port: 0,
+            ..Default::default()
         }),
     )
     .await
@@ -214,6 +215,7 @@ async fn proxy_names_are_released_when_a_client_disconnects() {
                 name: "same".into(),
                 kind: "tcp".into(),
                 remote_port: 0,
+                ..Default::default()
             }),
         )
         .await
@@ -316,6 +318,7 @@ fn p(name: &str, local_port: u16) -> ProxyCfg {
         local_ip: "127.0.0.1".into(),
         local_port,
         remote_port: 0,
+        ..Default::default()
     }
 }
 

@@ -22,6 +22,8 @@ pub struct Server {
     pub http_addr: SocketAddr,
     /// 内置 Edge 的实际监听地址。
     pub edge_addr: SocketAddr,
+    /// HTTP 虚拟主机的实际监听地址（未启用为 `None`）。
+    pub vhost_http_addr: Option<SocketAddr>,
     /// 数据库。
     pub db: Db,
     /// Hub。
@@ -53,6 +55,9 @@ pub async fn start(cfg: Config, log: Logger) -> Result<Server, String> {
         bind_port,
         proxy_bind_addr: cfg.proxy_bind_addr.clone(),
         allow_ports: cfg.allow_ports.clone(),
+        vhost_http_port: cfg.vhost_http,
+        vhost_https_port: cfg.vhost_https,
+        sub_domain_host: cfg.subdomain_host.clone(),
         ..Default::default()
     };
     let policy = Arc::new(DbPolicy {
@@ -63,6 +68,7 @@ pub async fn start(cfg: Config, log: Logger) -> Result<Server, String> {
         .await
         .map_err(|e| format!("start edge: {e}"))?;
     let edge_addr = edge.local_addr().map_err(|e| e.to_string())?;
+    let vhost_http_addr = edge.http_addr();
     tasks.push(tokio::spawn(edge.serve(cancel.clone())));
 
     let listener = TcpListener::bind(&cfg.http_addr)
@@ -102,6 +108,7 @@ pub async fn start(cfg: Config, log: Logger) -> Result<Server, String> {
     Ok(Server {
         http_addr,
         edge_addr,
+        vhost_http_addr,
         db,
         hub,
         cancel,

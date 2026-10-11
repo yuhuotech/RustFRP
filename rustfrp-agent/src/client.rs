@@ -10,12 +10,13 @@ use rustfrp_core::identity::DeviceKey;
 use rustfrp_core::mux::{self, MuxConfig, Session, Stream};
 use rustfrp_core::pipe;
 use rustfrp_core::tls;
+use rustfrp_core::udpframe::{read_datagram, write_datagram};
 use rustfrp_core::wire::{
     read_frame, write_frame, ClientMsg, Enroll, Login, ProxySpec, ServerMsg, StartWork,
     PROTOCOL_VERSION,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
@@ -24,11 +25,11 @@ use tokio_util::sync::CancellationToken;
 use crate::log::Logger;
 
 /// 一个待注册的代理。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyCfg {
     /// 名称（已含 user 前缀）。
     pub name: String,
-    /// 类型，当前仅 `tcp`。
+    /// 类型：`tcp` / `udp` / `http` / `https`。
     pub kind: String,
     /// 本地目标主机。
     pub local_ip: String,
@@ -36,6 +37,12 @@ pub struct ProxyCfg {
     pub local_port: u16,
     /// 请求的远程端口，0 = 由服务端分配。
     pub remote_port: u16,
+    /// http / https：自定义域名。
+    pub custom_domains: Vec<String>,
+    /// http / https：子域名。
+    pub subdomain: String,
+    /// http：改写 Host 头。
+    pub host_header_rewrite: String,
 }
 
 /// 首次接入所需信息。
@@ -97,6 +104,10 @@ pub struct ClientConfig {
     pub backoff: (Duration, Duration),
     /// 多路复用参数。
     pub mux: MuxConfig,
+    /// UDP 接收缓冲（frp 的 `udpPacketSize`）。
+    pub udp_packet_size: usize,
+    /// UDP 会话空闲回收时间。
+    pub udp_idle: Duration,
     /// 受管模式（`None` 为独立模式，等价 frpc）。
     pub managed: Option<ManagedCfg>,
 }
@@ -119,6 +130,8 @@ impl Default for ClientConfig {
             local_dial_timeout: Duration::from_secs(5),
             backoff: (Duration::from_secs(1), Duration::from_secs(30)),
             mux: MuxConfig::default(),
+            udp_packet_size: 1500,
+            udp_idle: Duration::from_secs(60),
             managed: None,
         }
     }
@@ -339,7 +352,15 @@ fn login_msg(cfg: &ClientConfig, issued: &Issued) -> ClientMsg {
     ClientMsg::Login(login)
 }
 
-type Locals = Arc<Mutex<HashMap<String, (String, u16)>>>;
+/// 一个本地转发目标。
+#[derive(Debug, Clone)]
+struct Local {
+    kind: String,
+    host: String,
+    port: u16,
+}
+
+type Locals = Arc<Mutex<HashMap<String, Local>>>;
 
 async fn talk(
     cfg: &Arc<ClientConfig>,
@@ -394,6 +415,9 @@ async fn talk(
             name: p.name.clone(),
             kind: p.kind.clone(),
             remote_port: p.remote_port,
+            custom_domains: p.custom_domains.clone(),
+            subdomain: p.subdomain.clone(),
+            host_header_rewrite: p.host_header_rewrite.clone(),
         };
         if let Err(e) = write_frame(&mut wr, &ClientMsg::NewProxy(spec)).await {
             return lost(e.to_string(), true);
@@ -413,7 +437,14 @@ async fn talk(
                 locals
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(name.clone(), (p.local_ip.clone(), p.local_port));
+                    .insert(
+                        name.clone(),
+                        Local {
+                            kind: p.kind.clone(),
+                            host: p.local_ip.clone(),
+                            port: p.local_port,
+                        },
+                    );
                 emit(events, Event::ProxyStarted { name, remote_port });
             }
             Ok(ServerMsg::NewProxyResp { name, error, .. }) => {
@@ -451,7 +482,7 @@ async fn talk(
             msg = pong_rx.recv() => match msg {
                 Some(Ok(ServerMsg::Pong)) => deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout,
                 Some(Ok(ServerMsg::Config(set))) => {
-                    let map = set.proxies.iter().map(|p| (p.name.clone(), (p.local_ip.clone(), p.local_port))).collect();
+                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port })).collect();
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
                     emit(events, Event::ConfigApplied { revision: set.revision, proxies: set.proxies.len() });
                     if let Err(e) = write_frame(&mut wr, &ClientMsg::Applied { revision: set.revision }).await {
@@ -491,17 +522,60 @@ async fn handle_work(
         .unwrap_or_else(PoisonError::into_inner)
         .get(&start.proxy)
         .cloned();
-    let Some((host, port)) = target else {
+    let Some(t) = target else {
         return Err(TunnelError::Wire(format!(
             "unknown proxy [{}]",
             start.proxy
         )));
     };
+    if t.kind == "udp" {
+        return udp_work(stream, &t, cfg).await;
+    }
     let mut local = within(cfg.local_dial_timeout, "dial local service", async {
-        Ok(TcpStream::connect((host.as_str(), port)).await?)
+        Ok(TcpStream::connect((t.host.as_str(), t.port)).await?)
     })
     .await?;
     let _ = local.set_nodelay(true);
     pipe::relay(&mut stream, &mut local).await?;
     Ok(())
+}
+
+/// UDP：一条流对应一个访问者；数据报在流上用「长度 + 载荷」封装，本地一侧是一个已 connect 的 UDP 套接字。
+async fn udp_work(stream: Stream, t: &Local, cfg: &ClientConfig) -> Result<(), TunnelError> {
+    let target = tokio::net::lookup_host((t.host.as_str(), t.port))
+        .await?
+        .next()
+        .ok_or_else(|| TunnelError::Wire(format!("cannot resolve {}", t.host)))?;
+    let bind = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).await?);
+    sock.connect(target).await?;
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let out = sock.clone();
+    let mut upstream = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        while let Ok(Some(_)) = read_datagram(&mut rd, &mut buf).await {
+            let _ = out.send(&buf).await;
+        }
+    });
+    let mut buf = vec![0u8; cfg.udp_packet_size.max(512)];
+    let result = loop {
+        tokio::select! {
+            _ = &mut upstream => break Ok(()),
+            _ = tokio::time::sleep(cfg.udp_idle) => break Ok(()),
+            r = sock.recv(&mut buf) => {
+                // 本地端口不可达会让 connect 过的 UDP 套接字报 ECONNREFUSED：忽略，继续等待。
+                if let Ok(n) = r {
+                    if let Err(e) = write_datagram(&mut wr, buf.get(..n).unwrap_or(&[])).await {
+                        break Err(e);
+                    }
+                }
+            }
+        }
+    };
+    upstream.abort();
+    result
 }
