@@ -13,3 +13,4 @@ build/
 *.db-wal
 *.db-shm
 node_modules/
+coverage/

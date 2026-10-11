@@ -22,3 +22,30 @@ jobs:
         run: make test
       - name: coverage gate (line / function / branch >= 90%, no regression)
         run: make cov
+
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: analyze + test + coverage (line >= 90%)
+        run: |
+          cd rustfrp-app
+          flutter pub get
+          flutter analyze
+          flutter test --coverage
+          cd ..
+          python3 tools/cov/check_lcov.py rustfrp-app/coverage/lcov.info --name rustfrp-app --list-gaps
+      - name: web build (same-origin panel)
+        run: cd rustfrp-app && flutter build web --no-web-resources-cdn
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make e2e
+      - run: make bench-mem

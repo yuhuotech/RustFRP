@@ -1,0 +1,236 @@
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:rustfrp_app/core/api.dart';
+
+/// In-memory stand-in for the controller's REST API (same JSON shapes and error codes as rustfrp-server).
+class FakeServer {
+  FakeServer({this.role = 'owner'});
+
+  String role;
+  final String adminName = 'root';
+  final String adminPassword = 'correct horse battery';
+  bool loggedIn = false; // whether the (single) session cookie is valid
+  bool failNext = false;
+  bool offline = false;
+  int _seq = 0;
+  final List<http.Request> requests = [];
+
+  final List<Map<String, Object?>> clients = [];
+  final List<Map<String, Object?>> tunnels = [];
+  final List<Map<String, Object?>> tokens = [];
+  final List<Map<String, Object?>> audit = [];
+  final Set<String> online = {};
+  String publicHost = 'frp.example.com';
+  String publicUrl = 'https://frp.example.com';
+
+  late final MockClient client = MockClient(_handle);
+
+  ApiClient api([String base = '']) => ApiClient(baseUrl: base, client: client);
+
+  String _id() => 'id${++_seq}';
+
+  Map<String, Object?> addClient(String name, {String os = 'linux', bool isOnline = false, bool disabled = false}) {
+    final c = {
+      'id': _id(),
+      'name': name,
+      'os': os,
+      'arch': 'x86_64',
+      'version': '0.1.0',
+      'revision': 1,
+      'created_at': 1700000000000,
+      'last_seen_at': 1700000100000,
+      'disabled_at': disabled ? 1700000200000 : null,
+    };
+    clients.add(c);
+    if (isOnline) online.add(c['id']! as String);
+    return c;
+  }
+
+  Map<String, Object?> addTunnel(String clientId, String name,
+      {int local = 22, int remote = 6000, String state = 'running', bool enabled = true, String error = ''}) {
+    final t = {
+      'id': _id(),
+      'client_id': clientId,
+      'name': name,
+      'kind': 'tcp',
+      'local_ip': '127.0.0.1',
+      'local_port': local,
+      'remote_port': remote,
+      'enabled': enabled,
+      'created_at': 1,
+      'updated_at': 1,
+      'state': state,
+      'status_port': state == 'running' ? remote : 0,
+      'status_error': error,
+    };
+    tunnels.add(t);
+    return t;
+  }
+
+  http.Response _json(Object? body, [int status = 200, Map<String, String> headers = const {}]) => http.Response(
+        jsonEncode(body),
+        status,
+        headers: {'content-type': 'application/json', ...headers},
+      );
+
+  http.Response _err(int status, String code, String message) => _json({'error': {'code': code, 'message': message}}, status);
+
+  int _rank(String r) => const ['viewer', 'operator', 'admin', 'owner'].indexOf(r);
+
+  Map<String, Object?> get _admin => {'id': 'a1', 'name': adminName, 'role': role, 'disabled_at': null, 'created_at': 1};
+
+  Future<http.Response> _handle(http.Request r) async {
+    requests.add(r);
+    if (offline) throw http.ClientException('connection refused');
+    if (failNext) {
+      failNext = false;
+      return _err(500, 'internal', 'internal error');
+    }
+    final path = r.url.path.replaceFirst('/api/v1', '');
+    final body = r.body.isEmpty ? <String, Object?>{} : jsonDecode(r.body) as Map<String, Object?>;
+
+    if (path == '/auth/login') {
+      if (r.headers['x-rustfrp-admin'] == null) return _err(403, 'forbidden', 'login must come from the panel');
+      if (body['name'] == adminName && body['password'] == adminPassword) {
+        loggedIn = true;
+        return _json({'admin': _admin, 'csrf': 'csrf-token'}, 200, {'set-cookie': 'rfrp_session=tok123; HttpOnly; Path=/'});
+      }
+      return _err(401, 'invalid_credentials', 'invalid user name or password');
+    }
+    final cookieOk = loggedIn && (r.headers['cookie'] ?? 'rfrp_session=tok123').contains('rfrp_session=tok123');
+    if (!cookieOk) return _err(401, 'unauthorized', 'login required');
+    if (path == '/auth/me') return _json({'admin': _admin, 'csrf': 'csrf-token'});
+    if (path == '/auth/logout') {
+      loggedIn = false;
+      return _json({'ok': true}, 200, {'set-cookie': 'rfrp_session=; Max-Age=0'});
+    }
+    final write = r.method != 'GET';
+    if (write && r.headers['x-csrf-token'] != 'csrf-token') return _err(403, 'forbidden', 'missing or invalid CSRF token');
+
+    String reason() => (body['reason'] as String?) ?? r.url.queryParameters['reason'] ?? '';
+    http.Response? guard(String min) {
+      if (_rank(role) < _rank(min)) return _err(403, 'forbidden', 'insufficient permissions');
+      if (write && reason().trim().isEmpty) return _err(400, 'bad_request', 'reason is required (1-200 characters)');
+      return null;
+    }
+
+    final seg = path.split('/').where((s) => s.isNotEmpty).toList();
+    switch ((r.method, seg)) {
+      case ('GET', ['overview']):
+        return _json({
+          'counts': {
+            'clients': clients.length,
+            'tunnels': tunnels.length,
+            'tunnels_running': tunnels.where((t) => t['state'] == 'running').length,
+            'tokens_pending': tokens.where((t) => t['used_at'] == null && t['revoked_at'] == null).length,
+          },
+          'clients_online': online.length,
+          'version': '0.1.0',
+        });
+      case ('GET', ['node']):
+        return _json({
+          'name': 'builtin',
+          'public_host': publicHost,
+          'edge_port': 7000,
+          'allow_ports': [
+            [6000, 6100],
+            [7000, 7000]
+          ],
+          'version': '0.1.0',
+          'clients_online': online.length,
+        });
+      case ('GET', ['clients']):
+        return _json([for (final c in clients) {...c, 'online': online.contains(c['id'])}]);
+      case ('PATCH', ['clients', final id]):
+        final e = guard('admin');
+        if (e != null) return e;
+        final c = clients.where((x) => x['id'] == id).firstOrNull;
+        if (c == null) return _err(404, 'not_found', 'not found');
+        if (body.containsKey('name')) c['name'] = body['name'];
+        if (body.containsKey('disabled')) c['disabled_at'] = body['disabled'] == true ? 1700000300000 : null;
+        return _json({...c, 'online': online.contains(id)});
+      case ('POST', ['clients', final id, 'kick']):
+        final e = guard('admin');
+        if (e != null) return e;
+        return clients.any((x) => x['id'] == id) ? _json({'ok': true}) : _err(404, 'not_found', 'not found');
+      case ('DELETE', ['clients', final id]):
+        final e = guard('admin');
+        if (e != null) return e;
+        clients.removeWhere((x) => x['id'] == id);
+        tunnels.removeWhere((x) => x['client_id'] == id);
+        return _json({'ok': true});
+      case ('GET', ['tunnels']):
+        final cid = r.url.queryParameters['client_id'];
+        return _json([for (final t in tunnels) if (cid == null || t['client_id'] == cid) t]);
+      case ('POST', ['tunnels']):
+        final e = guard('operator');
+        if (e != null) return e;
+        if (tunnels.any((t) => t['remote_port'] == body['remote_port'] && body['remote_port'] != 0)) {
+          return _err(409, 'conflict', 'remote port ${body['remote_port']} is already used by another tunnel');
+        }
+        final t = addTunnel(body['client_id']! as String, body['name']! as String,
+            local: body['local_port']! as int, remote: (body['remote_port'] as int?) ?? 0, state: 'pending');
+        t['local_ip'] = body['local_ip'] ?? '127.0.0.1';
+        return _json(t, 201);
+      case ('PATCH', ['tunnels', final id]):
+        final e = guard('operator');
+        if (e != null) return e;
+        final t = tunnels.where((x) => x['id'] == id).firstOrNull;
+        if (t == null) return _err(404, 'not_found', 'not found');
+        for (final k in ['name', 'local_ip', 'local_port', 'remote_port', 'enabled']) {
+          if (body.containsKey(k)) t[k] = body[k];
+        }
+        return _json(t);
+      case ('DELETE', ['tunnels', final id]):
+        final e = guard('operator');
+        if (e != null) return e;
+        tunnels.removeWhere((x) => x['id'] == id);
+        return _json({'ok': true});
+      case ('GET', ['enroll-tokens']):
+        final e = guard('admin');
+        return e ?? _json(tokens);
+      case ('POST', ['enroll-tokens']):
+        final e = guard('admin');
+        if (e != null) return e;
+        final id = _id();
+        tokens.add({
+          'id': id,
+          'name': body['name'],
+          'created_by': adminName,
+          'created_at': 1700000000000,
+          'expires_at': DateTime.now().millisecondsSinceEpoch + 3600000,
+          'used_at': null,
+          'client_id': null,
+          'revoked_at': null,
+        });
+        const token = 'rfrp_secret_token';
+        return _json({
+          'id': id,
+          'token': token,
+          'expires_at': DateTime.now().millisecondsSinceEpoch + 3600000,
+          'commands': {
+            'controller': '$publicHost:7000',
+            'direct': 'rustfrp-agent --mode client --controller $publicHost:7000 --enroll-token $token --name "${body['name']}"',
+            if (publicUrl.isNotEmpty) 'linux_macos': 'curl -fsSL $publicUrl/install.sh | sh -s -- --enroll-token $token',
+            if (publicUrl.isNotEmpty) 'windows': 'powershell -c "iwr $publicUrl/install.ps1 | iex"',
+          },
+        }, 201);
+      case ('DELETE', ['enroll-tokens', final id]):
+        final e = guard('admin');
+        if (e != null) return e;
+        final t = tokens.where((x) => x['id'] == id).firstOrNull;
+        if (t == null) return _err(404, 'not_found', 'not found');
+        t['revoked_at'] = 1700000400000;
+        return _json({'ok': true});
+      case ('GET', ['audit']):
+        final e = guard('admin');
+        return e ?? _json(audit);
+      case ('GET', ['admins']):
+        final e = guard('owner');
+        return e ?? _json([_admin, {'id': 'a2', 'name': 'ops', 'role': 'viewer', 'disabled_at': 5, 'created_at': 2}]);
+    }
+    return _err(404, 'not_found', 'not found');
+  }
+}

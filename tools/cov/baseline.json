@@ -13,5 +13,10 @@
     "lines": 96.81,
     "functions": 94.68,
     "branches": 95.6
+  },
+  "rustfrp-app": {
+    "lines": 97.17,
+    "functions": null,
+    "branches": null
   }
 }

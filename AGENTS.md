@@ -16,15 +16,21 @@ make lint        # fmt --check + clippy
 make test        # cargo test --workspace
 make cov         # 全部 crate 覆盖率（行/函数/分支）并校验门槛与基线
 make bench-mem   # release 内存基准（≤10 MB）
+make app-test    # flutter analyze + test
+make app-cov     # Flutter 行覆盖率（≥90%）
+make web-build   # 面板 Web（必须 --no-web-resources-cdn）
+make e2e         # 全栈冒烟：真实 server + agent + REST
+make app-shots   # 评审截图（真实字体）
 ```
-Flutter 部分（`rustfrp-app`）尚未创建，规范见设计文档 §2–§3、§5.6。
+
+Flutter：UI 完全沿用 linkory 的 token / 共享控件 / 三栏布局，**唯一改动是 action 主色换成草绿**（`rustfrp-app/lib/theme/tokens.dart`）。
 
 ## 仓库结构（现状）
 - `rustfrp-core/`：Rust 共享库。已实现 `frpcfg`（frp 配置兼容层：解析 / 默认值 / 校验 / 兼容报告 / 导出）。
 - `rustfrp-protocol/frp-compat/`：兼容性测试语料（含上游 frp 官方示例）。
 - `assets/brand/`：Logo。
 - `docs/`：需求、技术设计、开发规范。
-- 待建：`rustfrp-server/`、`rustfrp-agent/`、`rustfrp-app/`、`rustfrp-web/`（见设计文档 §5）。
+- `rustfrp-server/`、`rustfrp-agent/`、`rustfrp-app/`（Flutter：Web 面板 + 桌面）已建；待建：`rustfrp-web/`（官网）、`installer/`、`deploy/`。
 
 ## 架构要点（Controller）
 - `rustfrp-server` = SQLite（单连接 + spawn_blocking）+ axum 管理 API + **内置 Edge**（`rustfrp-agent::edge`，通过 `Policy` 接入 `DbPolicy`）。
@@ -40,3 +46,5 @@ Flutter 部分（`rustfrp-app`）尚未创建，规范见设计文档 §2–§3�
   配置里出现这些时会在兼容报告 / 日志里明确列出并跳过。
 - P02 Controller：`rustfrp-server`（SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD、配置热下发、审计、REST、面板静态托管）✔；
   `rustfrp-agent --controller … --enroll-token …` 受管模式 ✔。尚未做：流量统计/曲线、日志尾随、API Token、多 Edge 节点、安装脚本 `install.sh`/`install.ps1` 的托管。
+- P03 Flutter：登录、概览、节点、客户端（含重命名/停用/下线/删除）、隧道 CRUD、接入向导、审计、设置（主题/令牌/管理员）、宽窄屏、深浅色 ✔；
+  Web 由 Controller 同源托管并在严格 CSP 下实测 ✔。桌面：窗口壳（隐藏标题栏、自绘窗口按钮）+「管理员控制台模式」✔；**托管本机 agent 的「本机模式」、托盘、开机启动、应用内更新、三平台安装包 ✘**（P05）。
