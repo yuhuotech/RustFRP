@@ -13,6 +13,15 @@ serde_ignored.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 serde_yaml_ng = "0.10"
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+yamux.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 proptest = "1"

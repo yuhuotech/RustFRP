@@ -14,7 +14,8 @@
 ```sh
 make lint        # fmt --check + clippy
 make test        # cargo test --workspace
-make core-cov    # rustfrp-core 覆盖率（行/函数/分支）并校验门槛与基线
+make cov         # 全部 crate 覆盖率（行/函数/分支）并校验门槛与基线
+make bench-mem   # release 内存基准（≤10 MB）
 ```
 Flutter 部分（`rustfrp-app`）尚未创建，规范见设计文档 §2–§3、§5.6。
 
@@ -27,4 +28,7 @@ Flutter 部分（`rustfrp-app`）尚未创建，规范见设计文档 §2–§3�
 
 ## 当前进度
 - P00 工程初始化：Cargo workspace、CI、覆盖率门槛工具 ✔；Flutter 工程 ✘。
-- P01：`frpcfg` ✔（INI 转换 `convert` 未做）；传输 / 多路复用 / 代理运行时 ✘。
+- P01 隧道核心：`frpcfg` ✔（INI 转换 `convert` 未做）；TLS1.3 + yamux 多路复用 + TCP 隧道 + 令牌鉴权 + 重连 + 心跳 ✔；
+  `rustfrp-agent` 的 client / edge 模式、`verify`、frpc/frps 别名 ✔；内存基线 ✔（见 `tools/bench/README.md`）。
+  **尚未实现**：UDP、http/https/vhost、stcp/sudp/xtcp、tcpmux、插件、带宽限制、健康检查、负载均衡、visitors、PROXY protocol——
+  配置里出现这些时会在兼容报告 / 日志里明确列出并跳过。

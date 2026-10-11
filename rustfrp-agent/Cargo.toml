@@ -1,0 +1,27 @@
+[package]
+name = "rustfrp-agent"
+description = "RustFRP agent: frpc-compatible client and frps-compatible edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustfrp-agent"
+path = "src/main.rs"
+
+[dependencies]
+rustfrp-core = { path = "../rustfrp-core" }
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+
+[lints]
+workspace = true
