@@ -1,0 +1,17 @@
+{
+  "revision": 12,
+  "proxies": [
+    {
+      "name": "tunnel-static",
+      "kind": "tcp",
+      "remote_port": 6000,
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "plugin": {
+        "kind": "static_file",
+        "local_path": "/srv/www",
+        "strip_prefix": "/public"
+      }
+    }
+  ]
+}

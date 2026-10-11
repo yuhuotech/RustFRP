@@ -765,6 +765,100 @@ async fn managed_health_checks_report_state_and_groups_rotate_members() {
     rig.stop.cancel();
 }
 
+#[tokio::test]
+async fn managed_plugin_from_controller_snapshot_serves_local_files() {
+    let mut rig = rig().await;
+    let dir = std::env::temp_dir().join(format!(
+        "rustfrp-managed-static-{}",
+        rustfrp_core::auth::random_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hello.txt"), "managed plugin response").unwrap();
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 2,
+        proxies: vec![ManagedProxy {
+            name: "static-managed".into(),
+            kind: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            plugin: Some(rustfrp_core::wire::PluginOpts {
+                kind: "static_file".into(),
+                local_path: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let (mut events, cancel, task) =
+        spawn_client(managed_client(rig.port, key, None, Some("good")));
+    until(&mut events, |event| {
+        matches!(event, Event::ConfigApplied { .. })
+    })
+    .await;
+    let proxy = until(&mut rig.events, |event| {
+        matches!(&event.state, ProxyState::Running(_))
+    })
+    .await;
+    let port = match proxy.state {
+        ProxyState::Running(port) => port,
+        _ => unreachable!(),
+    };
+    let mut visitor = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    visitor
+        .write_all(b"GET /hello.txt HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    visitor.read_to_string(&mut response).await.unwrap();
+    assert!(response.contains("managed plugin response"), "{response}");
+
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 3,
+        proxies: vec![ManagedProxy {
+            name: "static-managed".into(),
+            kind: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            plugin: Some(rustfrp_core::wire::PluginOpts {
+                kind: "static_file".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    let disconnected = until(&mut events, |event| matches!(event, Event::Disconnected(_))).await;
+    assert!(matches!(disconnected, Event::Disconnected(reason) if reason.contains("localPath")));
+
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 4,
+        proxies: vec![ManagedProxy {
+            name: "tls-managed".into(),
+            kind: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            plugin: Some(rustfrp_core::wire::PluginOpts {
+                kind: "https2http".into(),
+                local_addr: "127.0.0.1:9".into(),
+                enable_http2: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    until(&mut events, |event| {
+        matches!(event, Event::ConfigApplied { revision: 4, .. })
+    })
+    .await;
+    cancel.cancel();
+    let _ = timeout(T, task).await.unwrap();
+    rig.stop.cancel();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 // ---------- 命令行入口：身份持久化与重连 ----------
 
 mod cli_flow {
@@ -949,7 +1043,7 @@ mod cli_flow {
             1,
         )
         .await;
-        assert!(run.0 == 1 && run.1.contains("requires managed"));
+        assert!(run.0 == 1 && run.1.contains("requires a client mode"));
         o.managed = match opts(rig.port, Some("good"), Some("/local")) {
             Command::Run(o) => o.managed,
             _ => unreachable!(),

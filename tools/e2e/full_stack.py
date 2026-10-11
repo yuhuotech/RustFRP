@@ -299,7 +299,7 @@ def main():
             assert saved.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert saved.execute("SELECT count(*) FROM clients WHERE deleted_at IS NULL").fetchone()[0] == 1
             assert saved.execute("SELECT count(*) FROM tunnels WHERE deleted_at IS NULL").fetchone()[0] >= 3
-            assert saved.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert saved.execute("PRAGMA user_version").fetchone()[0] == 15
         assert oct(os.stat(snapshot).st_mode & 0o777) == "0o600"
         print("在线 WAL 快照 / 私有权限 / 数据完整性 OK")
 

@@ -8,4 +8,4 @@ Controller 内置 Edge 可配置 `RUSTFRP_EDGE_TLS_CERT` / `RUSTFRP_EDGE_TLS_KEY
 
 独立模式保持 frp 配置语义：仍用 `transport.tls.trustedCaFile` 进行 CA 校验，未配置时沿用 frp 默认行为。`--tls-pin` 仅适用于受管模式，不能静默忽略。HTTPS 类型隧道继续按 SNI 透传，不进行 TLS 终止。
 
-`rustfrp-protocol/fixtures/edge-test-{cert,key}.pem` 仅为自动化测试的公开、无业务用途的密钥材料，严禁用于部署。管理 HTTP 接口仍需由反向代理提供 HTTPS，证书配置只保护数据面 Edge。
+`rustfrp-protocol/fixtures/edge-test-{cert,key}.pem` 仅为自动化测试的公开、无业务用途的密钥材料，严禁用于部署。管理 HTTP 接口仍由反向代理提供 HTTPS，证书配置只保护数据面 Edge。非回环 `RUSTFRP_HTTP` 要求同时设置 `RUSTFRP_SECURE_COOKIE=true` 和 `RUSTFRP_PUBLIC_URL=https://...`，否则 Controller 拒绝启动。反向代理模板见 [`deploy/README.md`](../deploy/README.md)。

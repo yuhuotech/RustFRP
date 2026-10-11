@@ -668,7 +668,44 @@ async fn talk(
                         Some(_) => {}
                     }
                     if let Err(e) = crate::local_control::update_tunnels(&cfg.local_tunnels,&set) { break lost(e.into(),true); }
-                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: local_kind(&p.kind), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server), plugin: None })).collect();
+                    let mut map = HashMap::with_capacity(set.proxies.len());
+                    let mut plugin_error = None;
+                    for p in &set.proxies {
+                        let plugin = if let Some(options) = p.plugin.clone() {
+                            if options.enable_http2 == Some(true)
+                                && ["http2https", "https2http", "https2https"]
+                                    .contains(&options.kind.as_str())
+                            {
+                                log.warn(&format!(
+                                    "proxy [{}]: plugin.enableHTTP2 is preserved, but managed plugin forwarding supports HTTP/1.1 only",
+                                    p.name
+                                ));
+                            }
+                            match crate::plugin::from_managed(options)
+                                .await
+                                .and_then(crate::plugin::Plugin::new)
+                            {
+                                Ok(plugin) => Some(Arc::new(plugin)),
+                                Err(error) => {
+                                    plugin_error = Some(format!("proxy [{}] plugin: {error}", p.name));
+                                    break;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        map.insert(p.name.clone(), Local {
+                            kind: local_kind(&p.kind),
+                            host: p.local_ip.clone(),
+                            port: p.local_port,
+                            proxy_protocol: p.proxy_protocol,
+                            limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server),
+                            plugin,
+                        });
+                    }
+                    if let Some(error) = plugin_error {
+                        break lost(error, true);
+                    }
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
                     visitors.sync(&set.visitors);
                     monitors.sync(

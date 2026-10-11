@@ -104,6 +104,7 @@ fn plugin_cfg(
         password: x.password.clone(),
         local_path: x.local_path.clone(),
         strip_prefix: x.strip_prefix.clone(),
+        enable_http2: x.enable_http2,
     })
 }
 
@@ -174,6 +175,12 @@ pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static s
         "responseHeaders",
     );
     flag(other && !p.route_by_http_user.is_empty(), "routeByHTTPUser");
+    flag(
+        p.plugin
+            .as_ref()
+            .is_some_and(|x| x.enable_http2 == Some(true)),
+        "plugin.enableHTTP2 (plugin forwarding is HTTP/1.1)",
+    );
     v
 }
 

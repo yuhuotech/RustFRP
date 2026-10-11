@@ -1130,6 +1130,8 @@ struct CreateTunnel {
     #[serde(default)]
     health_check: Option<rustfrp_core::wire::HealthSpec>,
     #[serde(default)]
+    plugin: Option<rustfrp_core::wire::PluginOpts>,
+    #[serde(default)]
     reason: String,
 }
 
@@ -1195,6 +1197,7 @@ async fn create_tunnel(
             group_key: b.lb_group_key,
             health: b.health_check.filter(|h| !h.kind.is_empty()),
         },
+        plugin: b.plugin,
     };
     let t = st
         .db
@@ -1310,6 +1313,8 @@ struct PatchTunnel {
     lb_group_key: Option<String>,
     health_check: Option<rustfrp_core::wire::HealthSpec>,
     #[serde(default)]
+    plugin: Option<rustfrp_core::wire::PluginOpts>,
+    #[serde(default)]
     reason: String,
 }
 
@@ -1346,6 +1351,7 @@ async fn patch_tunnel(
         lb_group: b.lb_group,
         lb_group_key: b.lb_group_key,
         health_check: b.health_check,
+        plugin: b.plugin,
     };
     let t = st
         .db
@@ -1967,10 +1973,20 @@ async fn patch_admin(
     Ok(Json(updated))
 }
 
-async fn controller_logs(State(st): State<AppState>, a: Auth) -> ApiResult<serde_json::Value> {
+#[derive(Deserialize)]
+struct LogQuery {
+    after: Option<u64>,
+}
+
+async fn controller_logs(
+    State(st): State<AppState>,
+    a: Auth,
+    Query(query): Query<LogQuery>,
+) -> ApiResult<serde_json::Value> {
     a.require(&st, Role::Admin).await?;
+    let (cursor, gap, items) = st.logs.snapshot_after(query.after.unwrap_or(0));
     Ok(Json(
-        json!({"items":st.logs.snapshot(),"capacity":128,"line_bytes":512}),
+        json!({"items":items,"capacity":128,"line_bytes":512,"cursor":cursor,"gap":gap}),
     ))
 }
 

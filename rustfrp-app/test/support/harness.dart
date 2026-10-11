@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rustfrp_app/app/app.dart';
 import 'package:rustfrp_app/core/store.dart';
+import 'package:rustfrp_app/features/settings/settings_view.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'fake_server.dart';
@@ -23,6 +24,8 @@ class Harness {
     bool sameOrigin = true,
     Map<String, Object> prefs = const {},
     bool login = true,
+    Future<bool> Function()? desktopStartupEnabled,
+    Future<void> Function(bool)? desktopStartupToggle,
   }) async {
     SharedPreferences.setMockInitialValues(prefs);
     final p = await SharedPreferences.getInstance();
@@ -40,6 +43,12 @@ class Harness {
         apiFactoryProvider.overrideWithValue((base) => server.api(base)),
         sameOriginProvider.overrideWithValue(sameOrigin),
         tickProvider.overrideWith((ref) => tick.stream),
+        if (desktopStartupEnabled != null)
+          desktopStartupEnabledProvider.overrideWithValue(
+            desktopStartupEnabled,
+          ),
+        if (desktopStartupToggle != null)
+          desktopStartupToggleProvider.overrideWithValue(desktopStartupToggle),
       ],
     );
     addTearDown(container.dispose);

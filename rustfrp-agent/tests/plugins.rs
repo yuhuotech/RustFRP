@@ -14,6 +14,7 @@ use rustfrp_agent::edge::{Edge, EdgeConfig};
 use rustfrp_agent::log::Logger;
 use rustfrp_agent::plugin::PluginCfg;
 use rustfrp_core::tls;
+use rustfrp_core::wire::PluginOpts;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -671,6 +672,15 @@ async fn invalid_plugin_configs_fail_to_start() {
     c.crt_pem = "not pem".into();
     c.key_pem = "not pem".into();
     assert!(bad(c).contains("https2http"));
+
+    // Supplying only one half of a certificate pair must take the PEM parser
+    // path and fail instead of silently generating a self-signed identity.
+    let (_, key) = tls::self_signed_pem(vec!["localhost".into()]).unwrap();
+    let mut partial = cfg("https2http");
+    partial.local_addr = "127.0.0.1:1".into();
+    partial.key_pem = key;
+    assert!(bad(partial).contains("https2http"));
+
     assert!(rustfrp_agent::plugin::Plugin::new(cfg("socks5")).is_ok());
     assert_eq!(
         format!(
@@ -888,4 +898,57 @@ async fn https2http_connection_edge_cases() {
         s.shutdown().await.unwrap();
         let _ = read_to_end(&mut s).await;
     }
+}
+
+#[tokio::test]
+async fn managed_plugin_reads_certificate_files_from_the_agent_host() {
+    let dir = std::env::temp_dir().join(format!(
+        "rustfrp-managed-plugin-{}",
+        rustfrp_core::auth::random_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let crt_path = dir.join("crt.pem");
+    let key_path = dir.join("key.pem");
+    let crt = "client-local-certificate";
+    let key = "client-local-private-key";
+    std::fs::write(&crt_path, crt).unwrap();
+    std::fs::write(&key_path, key).unwrap();
+    let cfg = rustfrp_agent::plugin::from_managed(PluginOpts {
+        kind: "https2http".into(),
+        local_addr: "127.0.0.1:8080".into(),
+        crt_path: crt_path.to_string_lossy().into_owned(),
+        key_path: key_path.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(cfg.crt_pem, crt);
+    assert_eq!(cfg.key_pem, key);
+
+    let missing = dir.join("missing.pem");
+    assert!(rustfrp_agent::plugin::from_managed(PluginOpts {
+        kind: "https2http".into(),
+        local_addr: "127.0.0.1:8080".into(),
+        crt_path: missing.to_string_lossy().into_owned(),
+        key_path: missing.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await
+    .is_err());
+    let large = dir.join("large.pem");
+    std::fs::write(&large, "x".repeat(16 * 1024 + 1)).unwrap();
+    assert!(rustfrp_agent::plugin::from_managed(PluginOpts {
+        kind: "https2http".into(),
+        local_addr: "127.0.0.1:8080".into(),
+        crt_path: large.to_string_lossy().into_owned(),
+        key_path: key_path.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await
+    .is_err());
+
+    std::fs::remove_file(crt_path).unwrap();
+    std::fs::remove_file(key_path).unwrap();
+    std::fs::remove_file(large).unwrap();
+    std::fs::remove_dir(dir).unwrap();
 }

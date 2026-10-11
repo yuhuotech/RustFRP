@@ -836,6 +836,48 @@ async fn tunnel_crud_and_validation() {
 }
 
 #[tokio::test]
+async fn managed_plugin_api_returns_only_secret_set_flags() {
+    let r = rig_with(Config {
+        allow_ports: vec![(6000, 6100)],
+        ..Config::default()
+    })
+    .await;
+    let operator = r.admin("plugin-operator", Role::Operator).await;
+    let client_id = r.client("plugin-client").await;
+    let secret = "never-include-this-password";
+    let (status, response) = r
+        .send(
+            Method::POST,
+            "/api/v1/tunnels",
+            &operator,
+            json!({
+                "client_id": client_id.clone(),
+                "name": "socks",
+                "local_port": 1080,
+                "remote_port": 6002,
+                "plugin": {
+                    "kind": "socks5",
+                    "username": "user",
+                    "password": secret
+                },
+                "reason": "configure local proxy"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(response["plugin"]["kind"], "socks5");
+    assert_eq!(response["plugin"]["password_set"], true);
+    assert!(!response.to_string().contains(secret));
+
+    let id = client_id.clone();
+    let config =
+        r.db.call(move |c| store::managed_config(c, &id))
+            .await
+            .unwrap();
+    assert_eq!(config.proxies[0].plugin.as_ref().unwrap().password, secret);
+}
+
+#[tokio::test]
 async fn enroll_tokens() {
     let r = rig_with(Config {
         public_host: "frp.example.com".into(),

@@ -64,6 +64,53 @@ pub struct PluginCfg {
     pub local_path: String,
     /// static_file 去除的 URL 前缀。
     pub strip_prefix: String,
+    /// *2* 插件请求 HTTP/2；当前转发实现限定 HTTP/1.1。
+    pub enable_http2: Option<bool>,
+}
+
+impl From<rustfrp_core::wire::PluginOpts> for PluginCfg {
+    fn from(value: rustfrp_core::wire::PluginOpts) -> Self {
+        Self {
+            kind: value.kind,
+            local_addr: value.local_addr,
+            unix_path: value.unix_path,
+            host_header_rewrite: value.host_header_rewrite,
+            request_headers: value.request_headers.into_iter().collect(),
+            crt_pem: String::new(),
+            key_pem: String::new(),
+            http_user: value.http_user,
+            http_password: value.http_password,
+            username: value.username,
+            password: value.password,
+            local_path: value.local_path,
+            strip_prefix: value.strip_prefix,
+            enable_http2: value.enable_http2,
+        }
+    }
+}
+
+/// 从 Agent 本机证书路径读取受管插件证书；不把私钥传回 Controller。
+pub async fn from_managed(value: rustfrp_core::wire::PluginOpts) -> Result<PluginCfg, String> {
+    async fn read(path: &str, field: &str) -> Result<String, String> {
+        if path.is_empty() {
+            return Ok(String::new());
+        }
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("plugin {field} file {path}: {e}"))?;
+        if metadata.len() > 16 * 1024 {
+            return Err(format!("plugin {field} file exceeds 16 KiB"));
+        }
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("plugin {field} file {path}: {e}"))
+    }
+    let crt = read(&value.crt_path, "crtPath").await?;
+    let key = read(&value.key_path, "keyPath").await?;
+    let mut cfg = PluginCfg::from(value);
+    cfg.crt_pem = crt;
+    cfg.key_pem = key;
+    Ok(cfg)
 }
 
 /// 运行期插件：配置加 TLS 上下文（只构建一次）。
@@ -71,6 +118,14 @@ pub struct Plugin {
     cfg: PluginCfg,
     acceptor: Option<TlsAcceptor>,
     connector: Option<TlsConnector>,
+}
+
+fn check_platform(kind: &str, unix: bool) -> Result<(), String> {
+    if kind == "unix_domain_socket" && !unix {
+        Err("plugin unix_domain_socket is only supported on unix".into())
+    } else {
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Plugin {
@@ -100,9 +155,7 @@ impl Plugin {
             "unix_domain_socket" => need(&cfg.unix_path, "unixPath")?,
             _ => {}
         }
-        if cfg.kind == "unix_domain_socket" && !cfg!(unix) {
-            return Err("plugin unix_domain_socket is only supported on unix".into());
-        }
+        check_platform(&cfg.kind, cfg!(unix))?;
         let inbound_tls = ["https2http", "https2https", "tls2raw"].contains(&cfg.kind.as_str());
         let outbound_tls = ["http2https", "https2https"].contains(&cfg.kind.as_str());
         let acceptor = if inbound_tls {
@@ -214,5 +267,21 @@ async fn read_head<S: Duplex>(
             return Err(TunnelError::Closed);
         }
         buf.extend_from_slice(tmp.get(..n).unwrap_or(&[]));
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_plugin_platform_gate() {
+        assert!(check_platform("socks5", false).is_ok());
+        assert!(check_platform("unix_domain_socket", true).is_ok());
+        assert_eq!(
+            check_platform("unix_domain_socket", false),
+            Err("plugin unix_domain_socket is only supported on unix".into())
+        );
     }
 }

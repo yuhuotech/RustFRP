@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="RustFRP：轻量、可自托管的内网穿透与集中管理平台。">
+  <meta name="theme-color" content="#65a30d">
+  <title>RustFRP — 轻量内网穿透与集中管理</title>
+  <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header class="topbar"><a class="brand" href="#top"><img src="/logo.svg" alt=""><b>RustFRP</b></a><nav><a href="#features">产品能力</a><a href="#start">快速开始</a><a href="https://github.com/yuhuotech/RustFRP/releases">下载</a></nav><a class="source" href="https://github.com/yuhuotech/RustFRP">查看源码 ↗</a></header>
+  <main id="top">
+    <section class="hero"><div class="intro"><p class="eyebrow">自托管 · Rust 数据面 · Flutter 管理面</p><h1>把内网服务<br><em>安全地带到公网</em></h1><p class="lead">用轻量 Agent 建立加密隧道，用一个简洁面板管理节点、设备和流量。配置熟悉 frp，部署由你掌控。</p><a class="button" href="#start">开始部署 <span>→</span></a><div class="facts"><span><b>Rust</b> 数据面</span><span><b>SQLite</b> 单文件存储</span><span><b>自托管</b> 数据自主</span></div></div><div class="preview" aria-label="管理面板示意"><div class="bar"><span>●　●　●</span><span>RustFRP / 概览</span><span class="online">● 已连接</span></div><div class="panel"><aside><b>R</b><span>概览</span><span>节点</span><span>客户端</span><span class="selected">隧道</span><span>审计</span></aside><div class="dash"><small>工作区 / 隧道</small><h2>运行状态</h2><div class="stats"><div>在线客户端<strong>08</strong></div><div>运行中隧道<strong>24</strong></div><div>今日流量<strong>3.8 GB</strong></div></div><div class="chart"><span>流量趋势</span><svg viewBox="0 0 520 120" role="img" aria-label="流量趋势示意"><path d="M0 96 C40 80 56 88 85 74 S135 82 167 57 S208 75 248 53 S300 60 337 37 S398 52 430 24 S482 38 520 12"/></svg></div><div class="tunnel"><i></i><b>home-nas-web <small>HTTPS · nas.example.com</small></b><label>运行中</label></div><div class="tunnel"><i></i><b>dev-ssh <small>TCP · 203.0.113.8:2201</small></b><label>运行中</label></div></div></div></div></section>
+    <section class="trust"><span>开源</span><span>可审计</span><span>配置可迁出</span><span>无需外部数据库</span></section>
+    <section class="features" id="features"><p class="eyebrow">为真实运维场景设计</p><h2>隧道稳定，管理清楚</h2><p class="muted">从单台 NAS 到多节点部署，保持数据面轻量，管理动作可追踪。</p><div class="grid"><article><b>↗</b><h3>常用隧道类型</h3><p>TCP、UDP、HTTP、HTTPS、STCP 与 SUDP，支持域名路由、健康检查和负载均衡。</p></article><article><b>⌘</b><h3>集中配置下发</h3><p>在面板创建和调整隧道，Agent 按配置版本对账，未改动的连接继续工作。</p></article><article><b>◉</b><h3>运行状态可见</h3><p>查看节点、客户端、隧道状态、流量历史与审计记录，问题有据可查。</p></article><article><b>⌁</b><h3>配置便于迁移</h3><p>支持 frp 常见配置格式和导入导出，明确列出未支持字段。</p></article><article><b>⌂</b><h3>自托管部署</h3><p>Controller 使用 SQLite，无需单独数据库，可通过反向代理配置 HTTPS。</p></article><article><b>⛨</b><h3>身份与审计</h3><p>设备使用 Ed25519 身份，管理写操作要求理由并记录审计事件。</p></article></div></section>
+    <section class="start" id="start"><div><p class="eyebrow">几步开始</p><h2>在自己的服务器运行</h2><p class="muted">下载对应平台的发布包，配置 TLS 反向代理，然后在本机执行接入命令。</p><a class="button" href="https://github.com/yuhuotech/RustFRP/releases">获取最新版本 →</a></div><div class="code"><span>快速开始 · Linux x86_64</span><pre>curl -fLO https://github.com/yuhuotech/RustFRP/releases/latest/download/rustfrp-linux-x86_64.tar.gz<br>tar -xzf rustfrp-linux-x86_64.tar.gz<br>sudo ./rustfrp-server admin create admin</pre><small>实际命令与校验步骤以对应版本发布说明为准。</small></div></section>
+  </main>
+  <footer><a class="brand" href="#top"><img src="/logo.svg" alt=""><b>RustFRP</b></a><span>轻量内网穿透与集中管理</span><span>© 2026 RustFRP contributors</span></footer>
+</body>
+</html>

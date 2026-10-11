@@ -1,17 +1,7 @@
-# rustfrp_app
+# RustFRP Flutter 客户端
 
-A new Flutter project.
+本目录包含 Flutter Web 管理面板及 macOS、Windows、Linux 桌面客户端。桌面运行支持管理员控制台、本机受管 Agent 和读取本地 TOML 的独立模式。
 
-## Getting Started
+产品范围、逐项完成情况和未完成需求以仓库根目录 [`README.md`](../README.md) 与 [`docs/IMPLEMENTATION_STATUS.md`](../docs/IMPLEMENTATION_STATUS.md) 为准。桌面平台自动化测试可通过根目录 `make app-test` 执行；Web 发布构建使用 `make web-build`（禁用外部 CDN）。
 
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+桌面发布包依赖 Release 工作流随包提供的 `rustfrp-agent`。构建、签名、公证和发布凭据说明见 [`tools/release/README.md`](../tools/release/README.md)；真实三平台安装验收尚未完成。

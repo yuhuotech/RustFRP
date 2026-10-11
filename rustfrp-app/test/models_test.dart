@@ -402,4 +402,49 @@ void main() {
     expect((e.unauthorized, e.toString()), (true, '请登录'));
     expect(ApiException(500, 'x', 'y').unauthorized, isFalse);
   });
+
+  test('Tunnel plugin summaries expose settings state but no credentials', () {
+    final tunnel = Tunnel.fromJson({
+      'id': 'plugin',
+      'plugin': {
+        'kind': 'socks5',
+        'crt_set': true,
+        'key_set': true,
+        'http_password_set': false,
+        'password_set': true,
+        'enable_http2': true,
+        'password': 'must-not-be-read',
+      },
+    });
+    expect(tunnel.plugin?.kind, 'socks5');
+    expect(tunnel.plugin?.passwordSet, isTrue);
+    expect(tunnel.plugin?.enableHttp2, isTrue);
+    expect(tunnel.plugin?.toString(), isNot(contains('must-not-be-read')));
+    expect(
+      tunnel.plugin,
+      Tunnel.fromJson({
+        'id': 'plugin',
+        'plugin': {
+          'kind': 'socks5',
+          'crt_set': true,
+          'key_set': true,
+          'http_password_set': false,
+          'password_set': true,
+          'enable_http2': true,
+        },
+      }).plugin,
+    );
+    final equal = Tunnel.fromJson({
+      'id': 'plugin',
+      'plugin': {
+        'kind': 'socks5',
+        'crt_set': true,
+        'key_set': true,
+        'http_password_set': false,
+        'password_set': true,
+        'enable_http2': true,
+      },
+    }).plugin!;
+    expect(tunnel.plugin.hashCode, equal.hashCode);
+  });
 }

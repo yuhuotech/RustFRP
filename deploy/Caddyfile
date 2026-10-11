@@ -1,0 +1,9 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$RUSTFRP_DOMAIN} {
+	encode zstd gzip
+	request_body { max_size 2MB }
+	reverse_proxy {$RUSTFRP_UPSTREAM}
+}

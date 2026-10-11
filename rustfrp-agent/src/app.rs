@@ -92,10 +92,12 @@ pub async fn execute(
         Command::Run(o) => {
             let control = match &o.local_control {
                 Some(path) => {
-                    let Some(m) = &o.managed else {
-                        return fail(err, "local control", "requires managed client");
+                    let identity = match (&o.managed, o.mode, o.config.is_empty()) {
+                        (Some(m), Mode::Client, _) => m.controller.clone(),
+                        (None, Mode::Client, false) => format!("standalone:{}", o.config),
+                        _ => return fail(err, "local control", "requires a client mode"),
                     };
-                    match local_control::LocalControl::bind(path, &m.controller).await {
+                    match local_control::LocalControl::bind(path, &identity).await {
                         Ok(c) => Some(c),
                         Err(e) => return fail(err, "local control", e),
                     }
@@ -259,7 +261,7 @@ async fn run(
             let log = logger(&plan.log_to, &plan.log_level, err);
             log_notes(&log, &plan.notes);
             let web = l.common.web_server.clone();
-            match run_standalone_client(o, plan.cfg, &web, fs, env, log, cancel).await {
+            match run_standalone_client(o, plan.cfg, &web, (fs, env), log, cancel, status).await {
                 Ok(()) => 0,
                 Err(e) => fail(err, &o.config, e),
             }
@@ -296,15 +298,41 @@ async fn run(
 /// 独立模式的客户端；配置了 `webServer.port` 时同时提供管理接口，并支持 `reload`。
 async fn run_standalone_client(
     o: &Options,
-    cfg: client::ClientConfig,
+    mut cfg: client::ClientConfig,
     web: &rustfrp_core::frpcfg::WebServerConfig,
-    fs: &dyn ConfigFs,
-    env: &dyn Env,
-    log: Logger,
+    sources: (&dyn ConfigFs, &dyn Env),
+    mut log: Logger,
     cancel: CancellationToken,
+    local: Option<(
+        local_control::SharedStatus,
+        Arc<rustfrp_core::pipe::Traffic>,
+        Arc<crate::log_ring::LogRing>,
+        local_control::TunnelList,
+    )>,
 ) -> Result<(), String> {
     use crate::admin::{self, Admin, ProxyStatus, ReloadReq};
+    let (fs, env) = sources;
+    let local_status = local.as_ref().map(|x| x.0.clone());
+    let local_tunnels = local.as_ref().map(|x| x.3.clone());
+    if let Some((status, traffic, logs, tunnels)) = &local {
+        cfg.traffic = traffic.clone();
+        cfg.local_tunnels = tunnels.clone();
+        local_control::update_standalone_tunnels(status, tunnels, &cfg.proxies)
+            .map_err(str::to_string)?;
+        log = log.with_ring(logs.clone());
+    }
     if web.port <= 0 {
+        if let Some(status) = local_status {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let tracker = tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    local_control::apply(&status, &event);
+                }
+            });
+            let result = client::run(cfg, log, Some(tx), cancel).await;
+            let _ = tracker.await;
+            return result.map_err(|e| e.to_string());
+        }
         return client::run(cfg, log, None, cancel)
             .await
             .map_err(|e| e.to_string());
@@ -343,8 +371,17 @@ async fn run_standalone_client(
     ));
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<ReloadReq>(1);
     let (cfg_tx, cfg_rx) = tokio::sync::mpsc::channel(1);
-    let (etx, erx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(admin::track(erx, status.clone()));
+    let (etx, mut erx) = tokio::sync::mpsc::channel(64);
+    let admin_events = status.clone();
+    let local_events = local_status.clone();
+    tokio::spawn(async move {
+        while let Some(event) = erx.recv().await {
+            if let Some(local) = &local_events {
+                local_control::apply(local, &event);
+            }
+            admin::apply_event(&admin_events, event);
+        }
+    });
     let admin = Arc::new(Admin {
         user: web.user.clone(),
         password: web.password.clone(),
@@ -354,6 +391,7 @@ async fn run_standalone_client(
         stop: cancel.clone(),
     });
     let server = tokio::spawn(admin::serve(listener, admin, cancel.clone()));
+    let traffic = cfg.traffic.clone();
     let task = client::run_with_reload(cfg, log.clone(), Some(etx), cancel.clone(), Some(cfg_rx));
     tokio::pin!(task);
     let result = loop {
@@ -362,7 +400,19 @@ async fn run_standalone_client(
             Some(req) = reload_rx.recv() => {
                 let reloaded = reload_config(o, fs, env, &log);
                 let reply = match reloaded {
-                    Ok(new_cfg) => {
+                    Ok(mut new_cfg) => {
+                        new_cfg.traffic = traffic.clone();
+                        if let (Some(local), Some(tunnels)) = (&local_status, &local_tunnels) {
+                            new_cfg.local_tunnels = tunnels.clone();
+                            if let Err(error) = local_control::update_standalone_tunnels(
+                                local,
+                                tunnels,
+                                &new_cfg.proxies,
+                            ) {
+                                let _ = req.reply.send(Err(error.into()));
+                                continue;
+                            }
+                        }
                         fill(&new_cfg);
                         if let Ok(text) = fs.read_to_string(&o.config) {
                             *config_text.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text;
@@ -525,28 +575,76 @@ async fn run_node(
     loop {
         tokio::select! {
             _ = inner.cancelled() => break,
-            ev = events.recv() => match ev {
-                Some(crate::node::LinkEvent::Enrolled(id)) => {
-                    match managed::save(fs, &dir, &key, Some(&id)) {
-                        Ok(()) => log.info(&format!("enrolled as node [{id}]")),
-                        Err(e) => {
-                            code = fail(err, "managed edge identity", e);
-                            inner.cancel();
-                        }
+            event = events.recv() => {
+                match handle_node_event(event, NodeEventContext {
+                    node_id_known,
+                    fs,
+                    dir: &dir,
+                    key: &key,
+                    log: &log,
+                    cancel: &inner,
+                    err,
+                }) {
+                    NodeEventResult::Continue => {}
+                    NodeEventResult::Stop => break,
+                    NodeEventResult::Exit(exit_code) => {
+                        code = exit_code;
+                        break;
                     }
                 }
-                Some(crate::node::LinkEvent::Rejected(why)) if !node_id_known => {
-                    code = fail(err, "managed edge", format!("controller rejected the enrollment: {why}"));
-                    inner.cancel();
-                }
-                Some(_) => {}
-                None => break,
             },
         }
     }
     inner.cancel();
     handle.join().await;
     code
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NodeEventResult {
+    Continue,
+    Stop,
+    Exit(i32),
+}
+
+struct NodeEventContext<'a> {
+    node_id_known: bool,
+    fs: &'a dyn ConfigFs,
+    dir: &'a str,
+    key: &'a rustfrp_core::identity::DeviceKey,
+    log: &'a Logger,
+    cancel: &'a CancellationToken,
+    err: &'a mut dyn Write,
+}
+
+fn handle_node_event(
+    event: Option<crate::node::LinkEvent>,
+    context: NodeEventContext<'_>,
+) -> NodeEventResult {
+    match event {
+        Some(crate::node::LinkEvent::Enrolled(id)) => {
+            match managed::save(context.fs, context.dir, context.key, Some(&id)) {
+                Ok(()) => {
+                    context.log.info(&format!("enrolled as node [{id}]"));
+                    NodeEventResult::Continue
+                }
+                Err(e) => {
+                    context.cancel.cancel();
+                    NodeEventResult::Exit(fail(context.err, "managed edge identity", e))
+                }
+            }
+        }
+        Some(crate::node::LinkEvent::Rejected(why)) if !context.node_id_known => {
+            context.cancel.cancel();
+            NodeEventResult::Exit(fail(
+                context.err,
+                "managed edge",
+                format!("controller rejected the enrollment: {why}"),
+            ))
+        }
+        Some(_) => NodeEventResult::Continue,
+        None => NodeEventResult::Stop,
+    }
 }
 
 type NodePrepared = (
@@ -706,6 +804,7 @@ fn fail(err: &mut dyn Write, config: &str, e: impl std::fmt::Display) -> i32 {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+    use crate::edge::{Edge, EdgeConfig};
     use rustfrp_core::frpcfg::{MapEnv, MemFs};
     use std::time::Duration;
 
@@ -718,6 +817,114 @@ mod tests {
             strict: true,
             allow_unsafe: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn standalone_local_control_tracks_connection_events_without_web_server() {
+        let fs = MemFs::new().with(
+            "local.toml",
+            "serverAddr='127.0.0.1'\nserverPort=7000\n[[proxies]]\nname='local'\ntype='tcp'\nlocalPort=1\nremotePort=0\n",
+        );
+        let env = MapEnv::default();
+        let loaded = load_client(
+            "local.toml",
+            &LoadOptions {
+                strict: true,
+                fs: &fs,
+                env: &env,
+            },
+        )
+        .unwrap();
+        let plan = plan::client_plan(&loaded, &fs).unwrap();
+        let edge = Edge::bind(
+            EdgeConfig {
+                bind_addr: "127.0.0.1".into(),
+                bind_port: 0,
+                proxy_bind_addr: "127.0.0.1".into(),
+                ..Default::default()
+            },
+            None,
+            Logger::silent(),
+        )
+        .await
+        .unwrap();
+        let port = edge.local_addr().unwrap().port();
+        let stop_edge = CancellationToken::new();
+        tokio::spawn(edge.serve(stop_edge.clone()));
+        let mut cfg = plan.cfg;
+        cfg.server_port = port;
+        let status = local_control::SharedStatus::default();
+        let tunnels = local_control::TunnelList::default();
+        let cancel = CancellationToken::new();
+        let options = opts(Mode::Client, "local.toml");
+        let run = run_standalone_client(
+            &options,
+            cfg,
+            &loaded.common.web_server,
+            (&fs, &env),
+            Logger::silent(),
+            cancel.clone(),
+            Some((
+                status.clone(),
+                Arc::default(),
+                Arc::default(),
+                tunnels.clone(),
+            )),
+        );
+        let stop = cancel.clone();
+        let local_tunnels = tunnels.clone();
+        let wait_connected = async move {
+            for _ in 0..100 {
+                if status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .connected
+                {
+                    let has_summary = local_tunnels
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .1
+                        .len()
+                        == 1;
+                    stop.cancel();
+                    return has_summary;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            stop.cancel();
+            false
+        };
+        let (result, connected) = tokio::join!(run, wait_connected);
+        assert!(result.is_ok());
+        assert!(connected);
+        stop_edge.cancel();
+    }
+
+    #[tokio::test]
+    async fn standalone_local_control_rejects_an_oversized_initial_summary() {
+        let fs = MemFs::new();
+        let env = MapEnv::default();
+        let cfg = client::ClientConfig {
+            proxies: vec![client::ProxyCfg::default(); 1025],
+            ..Default::default()
+        };
+        let error = run_standalone_client(
+            &opts(Mode::Client, "local.toml"),
+            cfg,
+            &Default::default(),
+            (&fs, &env),
+            Logger::silent(),
+            CancellationToken::new(),
+            Some((
+                local_control::SharedStatus::default(),
+                Arc::default(),
+                Arc::default(),
+                local_control::TunnelList::default(),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("standalone tunnel summary exceeds capacity"));
     }
 
     async fn exec(cmd: Command, fs: &MemFs) -> (i32, String, String) {
@@ -1124,6 +1331,93 @@ mod tests {
         let (c, _, e) = exec(Command::Run(o), &fs).await;
         assert_eq!(c, 1);
         assert!(!e.is_empty());
+    }
+
+    #[test]
+    fn managed_edge_event_handling_persists_and_rejects_enrollment_failures() {
+        let key = rustfrp_core::identity::DeviceKey::generate().unwrap();
+        let log = Logger::silent();
+        let cancel = CancellationToken::new();
+        let failing = FlakyFs {
+            inner: MemFs::new(),
+            fail_dirs: false,
+            fail_writes: true,
+        };
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_node_event(
+                Some(crate::node::LinkEvent::Enrolled("node-7".into())),
+                NodeEventContext {
+                    node_id_known: false,
+                    fs: &failing,
+                    dir: "/state",
+                    key: &key,
+                    log: &log,
+                    cancel: &cancel,
+                    err: &mut err,
+                },
+            ),
+            NodeEventResult::Exit(1)
+        );
+        assert!(cancel.is_cancelled());
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("managed edge identity"));
+
+        let fs = MemFs::new();
+        let keep_running = CancellationToken::new();
+        assert_eq!(
+            handle_node_event(
+                Some(crate::node::LinkEvent::Enrolled("node-7".into())),
+                NodeEventContext {
+                    node_id_known: false,
+                    fs: &fs,
+                    dir: "/state",
+                    key: &key,
+                    log: &log,
+                    cancel: &keep_running,
+                    err: &mut Vec::new(),
+                },
+            ),
+            NodeEventResult::Continue
+        );
+        assert_eq!(
+            managed::load_or_create(&fs, "/state")
+                .unwrap()
+                .client_id
+                .as_deref(),
+            Some("node-7")
+        );
+        assert_eq!(
+            handle_node_event(
+                Some(crate::node::LinkEvent::Rejected("disabled".into())),
+                NodeEventContext {
+                    node_id_known: true,
+                    fs: &fs,
+                    dir: "/state",
+                    key: &key,
+                    log: &log,
+                    cancel: &keep_running,
+                    err: &mut Vec::new(),
+                },
+            ),
+            NodeEventResult::Continue
+        );
+        assert_eq!(
+            handle_node_event(
+                None,
+                NodeEventContext {
+                    node_id_known: false,
+                    fs: &fs,
+                    dir: "/state",
+                    key: &key,
+                    log: &log,
+                    cancel: &keep_running,
+                    err: &mut Vec::new(),
+                },
+            ),
+            NodeEventResult::Stop
+        );
     }
 
     #[tokio::test]

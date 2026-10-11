@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -313,6 +314,52 @@ class ClientDetail extends ConsumerWidget {
     }
   }
 
+  Future<void> _exportConfig(
+    BuildContext context,
+    WidgetRef ref,
+    ClientDevice device,
+  ) async {
+    final text = await guarded(
+      context,
+      () => ref.read(actionsProvider).exportConfig(device.id),
+    );
+    if (text == null || !context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => DialogShell(
+        title: '导出 frpc 配置',
+        maxWidth: 700,
+        content: SelectableText(
+          text,
+          key: const Key('config-export-text'),
+          style: Type.caption.copyWith(color: dialogContext.c.text2),
+        ),
+        actions: [
+          LButton(
+            label: '复制',
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: text));
+              if (dialogContext.mounted) {
+                showToast(dialogContext, '配置已复制');
+              }
+            },
+          ),
+          LButton(label: '关闭', onPressed: () => Navigator.pop(dialogContext)),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _importConfig(BuildContext context, ClientDevice device) async {
+    final imported = await showDialog<bool>(
+      context: context,
+      builder: (_) => ConfigImportDialog(clientId: device.id),
+    );
+    if (imported == true && context.mounted) {
+      showToast(context, '配置已导入');
+    }
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final c = context.c;
@@ -366,6 +413,26 @@ class ClientDetail extends ConsumerWidget {
             ],
           ),
           actions: [
+            if (!isNarrow(context)) ...[
+              if (role.atLeast(Role.operator))
+                LIconButton(
+                  key: const Key('client-config-import'),
+                  icon: LucideIcons.fileUp,
+                  tooltip: '导入 frpc 配置',
+                  size: 32,
+                  iconSize: 16,
+                  onPressed: () => _importConfig(context, d),
+                ),
+              if (role.atLeast(Role.admin))
+                LIconButton(
+                  key: const Key('client-config-export'),
+                  icon: LucideIcons.fileDown,
+                  tooltip: '导出 frpc 配置',
+                  size: 32,
+                  iconSize: 16,
+                  onPressed: () => _exportConfig(context, ref, d),
+                ),
+            ],
             if (canAdmin) ...[
               LIconButton(
                 icon: LucideIcons.pencil,
@@ -455,6 +522,29 @@ class ClientDetail extends ConsumerWidget {
                   ],
                 ),
               ),
+              if (isNarrow(context) && role.atLeast(Role.operator)) ...[
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    LButton(
+                      key: const Key('client-config-import'),
+                      label: '导入 frpc 配置',
+                      icon: LucideIcons.fileUp,
+                      compact: true,
+                      onPressed: () => _importConfig(context, d),
+                    ),
+                    if (role.atLeast(Role.admin))
+                      LButton(
+                        key: const Key('client-config-export'),
+                        label: '导出 frpc 配置',
+                        icon: LucideIcons.fileDown,
+                        compact: true,
+                        onPressed: () => _exportConfig(context, ref, d),
+                      ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 24),
               SectionTitle(
                 '隧道（${mine.length}）',
@@ -486,6 +576,217 @@ class ClientDetail extends ConsumerWidget {
               VisitorsSection(clientId: d.id),
             ],
           ),
+        ),
+      ],
+    );
+  }
+}
+
+class ConfigImportDialog extends ConsumerStatefulWidget {
+  const ConfigImportDialog({super.key, required this.clientId});
+  final String clientId;
+  @override
+  ConsumerState<ConfigImportDialog> createState() => _ConfigImportDialogState();
+}
+
+class _ConfigImportDialogState extends ConsumerState<ConfigImportDialog> {
+  final _text = TextEditingController();
+  final _reason = TextEditingController();
+  Map<String, dynamic>? _preview;
+  String? _previewText;
+  String? _error;
+  bool _loading = false;
+  bool _acceptWarnings = false;
+
+  @override
+  void dispose() {
+    _text.dispose();
+    _reason.dispose();
+    super.dispose();
+  }
+
+  Future<void> _previewConfig() async {
+    final source = _text.text;
+    if (source.trim().isEmpty || source.length > 1024 * 1024) {
+      setState(() => _error = '请填写不超过 1 MiB 的 frpc 配置文本。');
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+      _preview = null;
+      _acceptWarnings = false;
+    });
+    try {
+      final preview = await ref
+          .read(actionsProvider)
+          .previewConfigImport(widget.clientId, source);
+      if (mounted) {
+        setState(() {
+          _preview = preview;
+          _previewText = source;
+          final warnings = preview['warnings'];
+          _acceptWarnings = warnings is List && warnings.isEmpty;
+        });
+      }
+    } on Object catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _applyConfig() async {
+    final preview = _preview;
+    final digest = preview?['digest'];
+    if (preview == null ||
+        _previewText != _text.text ||
+        digest is! String ||
+        !_acceptWarnings ||
+        _reason.text.trim().isEmpty) {
+      setState(() => _error = '重新预览配置，并填写理由、确认兼容报告后再导入。');
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await ref
+          .read(actionsProvider)
+          .importConfig(
+            widget.clientId,
+            text: _text.text,
+            digest: digest,
+            reason: _reason.text.trim(),
+          );
+      if (mounted) {
+        Navigator.pop(context, true);
+      }
+    } on Object catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final preview = _preview;
+    final changes = preview?['changes'] is List
+        ? (preview!['changes'] as List).whereType<Map<String, dynamic>>()
+        : const <Map<String, dynamic>>[];
+    final warnings = preview?['warnings'] is List
+        ? (preview!['warnings'] as List).whereType<String>()
+        : const <String>[];
+    final canApply =
+        !_loading &&
+        preview != null &&
+        _previewText == _text.text &&
+        _acceptWarnings &&
+        _reason.text.trim().isNotEmpty;
+    return DialogShell(
+      title: '导入 frpc 配置',
+      maxWidth: 720,
+      content: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '支持 TOML、YAML、JSON。导入只新增或更新配置中出现的隧道，不会删除其他隧道。',
+            style: Type.caption.copyWith(color: c.text2),
+          ),
+          const SizedBox(height: 8),
+          LTextField(
+            key: const Key('config-import-text'),
+            controller: _text,
+            maxLines: 10,
+            hint: '粘贴 frpc.toml / YAML / JSON',
+            onChanged: (_) => setState(() {
+              _preview = null;
+              _previewText = null;
+              _acceptWarnings = false;
+            }),
+          ),
+          const SizedBox(height: 10),
+          LButton(
+            key: const Key('config-import-preview'),
+            label: '预览差异',
+            variant: BtnVariant.neutral,
+            loading: _loading,
+            onPressed: _loading ? null : _previewConfig,
+          ),
+          if (preview != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              '将应用 ${changes.length} 条隧道',
+              style: Type.strong.copyWith(color: c.text1),
+            ),
+            for (final change in changes)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '${change['action']} · ${change['name']} · ${change['kind']}',
+                  style: Type.caption.copyWith(color: c.text2),
+                ),
+              ),
+            if (warnings.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Text('兼容提示', style: Type.strong.copyWith(color: c.warningText)),
+              for (final warning in warnings)
+                Padding(
+                  padding: const EdgeInsets.only(top: 3),
+                  child: Text(
+                    warning,
+                    style: Type.caption.copyWith(color: c.text2),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  LSwitch(
+                    key: const Key('config-import-ack'),
+                    value: _acceptWarnings,
+                    onChanged: _loading
+                        ? null
+                        : (value) => setState(() => _acceptWarnings = value),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '我已阅读提示，并接受未激活项保留在导出配置中。',
+                      style: Type.caption.copyWith(color: c.text2),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 8),
+            LTextField(
+              key: const Key('config-import-reason'),
+              controller: _reason,
+              hint: '导入理由',
+              onChanged: (_) => setState(() {}),
+            ),
+          ],
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: Type.caption.copyWith(color: c.dangerText)),
+          ],
+        ],
+      ),
+      actions: [
+        LButton(
+          label: '取消',
+          onPressed: _loading ? null : () => Navigator.pop(context),
+        ),
+        LButton(
+          key: const Key('config-import-apply'),
+          label: '确认导入',
+          variant: BtnVariant.solid,
+          loading: _loading && preview != null,
+          onPressed: canApply ? _applyConfig : null,
         ),
       ],
     );

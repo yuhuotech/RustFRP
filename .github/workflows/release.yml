@@ -1,0 +1,187 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Rust checks
+        run: make lint test
+      - name: Flutter and web checks
+        run: |
+          cd rustfrp-app
+          flutter pub get
+          flutter analyze
+          flutter test
+          flutter build web --release --no-web-resources-cdn
+          tar -czf ../rustfrp-panel.tar.gz -C build/web .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-panel
+          path: rustfrp-panel.tar.gz
+
+  linux:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Install Linux desktop build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libx11-dev libxi-dev
+      - name: Build and package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --release --bins
+          mkdir -p dist
+          cp target/release/rustfrp-agent dist/rustfrp-agent-linux-x86_64
+          sha256sum dist/rustfrp-agent-linux-x86_64 | cut -d ' ' -f 1 > dist/rustfrp-agent-linux-x86_64.sha256
+          cd rustfrp-app && flutter pub get && flutter build linux --release && cd ..
+          mkdir -p dist/rustfrp-linux-x86_64/app dist/rustfrp-linux-x86_64/bin
+          cp target/release/rustfrp-agent target/release/rustfrp-server dist/rustfrp-linux-x86_64/bin/
+          cp -R rustfrp-app/build/linux/x64/release/bundle/. dist/rustfrp-linux-x86_64/app/
+          tar -czf "dist/rustfrp-linux-x86_64.tar.gz" -C dist rustfrp-linux-x86_64
+          mkdir -p deb/usr/bin deb/usr/lib/rustfrp/bin deb/usr/lib/rustfrp/app deb/usr/share/applications deb/DEBIAN
+          cp target/release/rustfrp-agent target/release/rustfrp-server deb/usr/lib/rustfrp/bin/
+          ln -s ../lib/rustfrp/bin/rustfrp-agent deb/usr/bin/rustfrp-agent
+          ln -s ../lib/rustfrp/bin/rustfrp-server deb/usr/bin/rustfrp-server
+          cp -R rustfrp-app/build/linux/x64/release/bundle/. deb/usr/lib/rustfrp/app/
+          printf '[Desktop Entry]\nType=Application\nName=RustFRP\nExec=/usr/lib/rustfrp/app/rustfrp_app\nIcon=rustfrp\nCategories=Network;Utility;\n' > deb/usr/share/applications/rustfrp.desktop
+          printf 'Package: rustfrp\nVersion: %s\nArchitecture: amd64\nMaintainer: RustFRP contributors\nDepends: libgtk-3-0, libx11-6, libxi6, libstdc++6, libglib2.0-0, libdbus-1-3\nDescription: Lightweight self-hosted tunneling client and controller\n' "$VERSION" > deb/DEBIAN/control
+          dpkg-deb --root-owner-group --build deb "dist/rustfrp-linux-x86_64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*
+
+  macos:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build and sign application
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          RUSTFRP_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_DEVELOPER_IDENTITY APPLE_ID APPLE_APP_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name}" || { echo "Missing required release secret: $name" >&2; exit 1; }
+          done
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --release --bins
+          cd rustfrp-app && flutter pub get && flutter build macos --release && cd ..
+          APP="rustfrp-app/build/macos/Build/Products/Release/rustfrp_app.app"
+          mkdir -p "$APP/Contents/Resources/bin" dist
+          cp target/release/rustfrp-agent target/release/rustfrp-server "$APP/Contents/Resources/bin/"
+          cp target/release/rustfrp-agent "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}"
+          shasum -a 256 "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}" | cut -d ' ' -f 1 > "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}.sha256"
+          KEYCHAIN="$RUNNER_TEMP/rustfrp-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+          codesign --force --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP/Contents/Resources/bin/rustfrp-agent"
+          codesign --force --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP/Contents/Resources/bin/rustfrp-server"
+          codesign --force --deep --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/rustfrp-macos-${RUSTFRP_ARCH}.zip"
+          hdiutil create -volname RustFRP -srcfolder "$APP" -ov -format UDZO "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
+          codesign --force --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
+          xcrun notarytool submit "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: dist/*
+
+  windows:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $env:RUSTFRP_VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
+          cargo build --release --bins
+          Push-Location rustfrp-app
+          flutter pub get
+          flutter build windows --release
+          Pop-Location
+          New-Item -ItemType Directory -Force dist/windows | Out-Null
+          Copy-Item rustfrp-app/build/windows/x64/runner/Release/* dist/windows/ -Recurse -Force
+          Copy-Item target/release/rustfrp-agent.exe,target/release/rustfrp-server.exe dist/windows/ -Force
+          Copy-Item target/release/rustfrp-agent.exe dist/rustfrp-agent-windows-x86_64.exe -Force
+          $agentHash = (Get-FileHash dist/rustfrp-agent-windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -NoNewline dist/rustfrp-agent-windows-x86_64.exe.sha256 $agentHash
+          Compress-Archive -Path dist/windows/* -DestinationPath dist/rustfrp-windows-x86_64.zip -Force
+          choco install innosetup --yes --no-progress
+          iscc tools/release/rustfrp.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*
+
+  publish:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Sign release manifest and publish
+        env:
+          RUSTFRP_RELEASE_SIGNING_KEY_PEM: ${{ secrets.RUSTFRP_RELEASE_SIGNING_KEY_PEM }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$RUSTFRP_RELEASE_SIGNING_KEY_PEM" || { echo 'Missing RUSTFRP_RELEASE_SIGNING_KEY_PEM secret' >&2; exit 1; }
+          cd dist
+          printf '%s\n' "$RUSTFRP_RELEASE_SIGNING_KEY_PEM" > "$RUNNER_TEMP/rustfrp-release-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/rustfrp-release-key.pem" -pubout -out RUSTFRP_RELEASE_PUBLIC_KEY.pem
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/rustfrp-release-key.pem" -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f "$RUNNER_TEMP/rustfrp-release-key.pem"
+          cd ..
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

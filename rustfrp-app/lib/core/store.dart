@@ -340,6 +340,7 @@ class Actions {
     String lbGroup = '',
     String lbGroupKey = '',
     HealthCheck? healthCheck,
+    Map<String, dynamic>? plugin,
     required String reason,
   }) => _do(
     () => _api.createTunnel(
@@ -364,6 +365,7 @@ class Actions {
       lbGroup: lbGroup,
       lbGroupKey: lbGroupKey,
       healthCheck: healthCheck,
+      plugin: plugin,
       reason: reason,
     ),
   );
@@ -390,6 +392,7 @@ class Actions {
     String? lbGroup,
     String? lbGroupKey,
     HealthCheck? healthCheck,
+    Map<String, dynamic>? plugin,
     required String reason,
   }) => _do(
     () => _api.patchTunnel(
@@ -414,9 +417,27 @@ class Actions {
       lbGroup: lbGroup,
       lbGroupKey: lbGroupKey,
       healthCheck: healthCheck,
+      plugin: plugin,
       reason: reason,
     ),
   );
+
+  Future<Map<String, dynamic>> previewConfigImport(
+    String clientId,
+    String text,
+  ) => _api.previewConfigImport(clientId, text);
+
+  Future<void> importConfig(
+    String clientId, {
+    required String text,
+    required String digest,
+    required String reason,
+  }) => _do(
+    () =>
+        _api.importConfig(clientId, text: text, digest: digest, reason: reason),
+  );
+
+  Future<String> exportConfig(String clientId) => _api.exportConfig(clientId);
 
   Future<Visitor> createVisitor({
     required String clientId,

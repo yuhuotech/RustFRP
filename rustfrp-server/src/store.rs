@@ -6,7 +6,9 @@ use rustfrp_core::auth::random_id;
 use rustfrp_core::wire::{ConfigSet, ManagedProxy, SecretOpts, VisitorSpec};
 
 use crate::db::StoreError;
-use crate::models::{Admin, AuditEntry, Client, EnrollToken, Node, Role, Tunnel, Visitor};
+use crate::models::{
+    Admin, AuditEntry, Client, EnrollToken, Node, PluginSummary, Role, Tunnel, Visitor,
+};
 use rustfrp_core::node::{NodeDevice, NodeInfo};
 use rustfrp_core::wire::{HealthSpec, HttpOpts, LbOpts};
 
@@ -537,11 +539,15 @@ pub fn client_node_id_any(c: &Connection, client_id: &str) -> Res<String> {
 /// 下发给节点的设备条目；已删除的设备返回 `NotFound`。
 pub fn node_device(c: &Connection, client_id: &str) -> Res<NodeDevice> {
     let (client, pubkey) = get_client_with_key(c, client_id)?;
+    let mut config = managed_config(c, client_id)?;
+    for proxy in &mut config.proxies {
+        proxy.plugin = None;
+    }
     Ok(NodeDevice {
         id: client.id.clone(),
         pubkey,
         disabled: client.disabled_at.is_some(),
-        config: managed_config(c, client_id)?,
+        config,
     })
 }
 
@@ -786,6 +792,8 @@ pub struct NewTunnel {
     pub bandwidth_server: bool,
     /// 负载均衡组与健康检查。
     pub lb: LbOpts,
+    /// Agent 本地插件配置。
+    pub plugin: Option<rustfrp_core::wire::PluginOpts>,
 }
 
 /// 修改隧道的参数（`None` 表示不改）。
@@ -831,6 +839,8 @@ pub struct TunnelPatch {
     pub lb_group_key: Option<String>,
     /// 健康检查（`kind` 为空表示取消）。
     pub health_check: Option<HealthSpec>,
+    /// 插件配置；默认 `None` 保留现值，`Some(default)` 清除插件。
+    pub plugin: Option<rustfrp_core::wire::PluginOpts>,
 }
 
 fn parse_opts(raw: &str) -> HttpOpts {
@@ -849,6 +859,31 @@ fn parse_lb(raw: &str) -> LbOpts {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+fn parse_plugin(raw: &str) -> Option<rustfrp_core::wire::PluginOpts> {
+    serde_json::from_str(raw)
+        .ok()
+        .filter(|p: &rustfrp_core::wire::PluginOpts| !p.is_default())
+}
+
+fn store_plugin(plugin: &Option<rustfrp_core::wire::PluginOpts>) -> String {
+    plugin
+        .as_ref()
+        .filter(|p| !p.is_default())
+        .and_then(|p| serde_json::to_string(p).ok())
+        .unwrap_or_default()
+}
+
+fn plugin_summary(plugin: Option<rustfrp_core::wire::PluginOpts>) -> Option<PluginSummary> {
+    plugin.map(|p| PluginSummary {
+        kind: p.kind,
+        crt_set: !p.crt_path.is_empty(),
+        key_set: !p.key_path.is_empty(),
+        http_password_set: !p.http_password.is_empty(),
+        password_set: !p.password.is_empty(),
+        enable_http2: p.enable_http2,
+    })
+}
+
 fn store_lb(o: &LbOpts) -> String {
     if o.is_default() {
         String::new()
@@ -860,6 +895,7 @@ fn store_lb(o: &LbOpts) -> String {
 fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
     let opts = parse_opts(&r.get::<_, String>(16)?);
     let lb = parse_lb(&r.get::<_, String>(20)?);
+    let plugin = parse_plugin(&r.get::<_, String>(21)?);
     Ok(Tunnel {
         id: r.get(0)?,
         client_id: r.get(1)?,
@@ -889,9 +925,10 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         lb_group: lb.group,
         lb_group_key_set: !lb.group_key.is_empty(),
         health_check: lb.health,
+        plugin: plugin_summary(plugin),
     })
 }
-const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts";
+const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts";
 
 fn check_port(v: i64, what: &str, allow_zero: bool) -> Res<()> {
     let lo = i64::from(!allow_zero);
@@ -1152,6 +1189,87 @@ fn effective_locations(o: &HttpOpts) -> Vec<String> {
 const MAX_LOCATIONS: usize = 16;
 const MAX_REQUEST_HEADERS: usize = 16;
 
+const MANAGED_PLUGIN_KINDS: [&str; 8] = [
+    "socks5",
+    "http_proxy",
+    "static_file",
+    "unix_domain_socket",
+    "http2https",
+    "https2http",
+    "https2https",
+    "tls2raw",
+];
+
+fn check_plugin(
+    tunnel_kind: &str,
+    plugin: Option<rustfrp_core::wire::PluginOpts>,
+) -> Res<Option<rustfrp_core::wire::PluginOpts>> {
+    let Some(p) = plugin.filter(|p| !p.is_default()) else {
+        return Ok(None);
+    };
+    let bad = |message: &str| Err(StoreError::Invalid(message.into()));
+    if !MANAGED_PLUGIN_KINDS.contains(&p.kind.as_str()) {
+        return bad("unsupported local plugin kind");
+    }
+    if !["tcp", "http", "https"].contains(&tunnel_kind) {
+        return bad("local plugins are supported only for tcp, http and https tunnels");
+    }
+    if p.local_addr.len() > 256
+        || p.unix_path.len() > 1024
+        || p.host_header_rewrite.len() > 253
+        || p.local_path.len() > 1024
+        || p.strip_prefix.len() > 256
+        || p.http_user.len() > 128
+        || p.username.len() > 128
+        || p.http_password.len() > 128
+        || p.password.len() > 128
+        || p.crt_path.len() > 1024
+        || p.key_path.len() > 1024
+        || p.request_headers.len() > MAX_REQUEST_HEADERS
+    {
+        return bad("local plugin configuration exceeds field limits");
+    }
+    if [
+        &p.local_addr,
+        &p.unix_path,
+        &p.host_header_rewrite,
+        &p.local_path,
+        &p.strip_prefix,
+        &p.crt_path,
+        &p.key_path,
+    ]
+    .iter()
+    .any(|v| v.chars().any(char::is_control))
+        || [&p.http_user, &p.http_password, &p.username, &p.password]
+            .iter()
+            .any(|v| v.chars().any(char::is_control))
+    {
+        return bad("local plugin fields must not contain control characters");
+    }
+    for (name, value) in &p.request_headers {
+        if !rustfrp_core::http1::valid_header(name, value) || name.len() > 64 || value.len() > 1024
+        {
+            return bad("invalid local plugin request header");
+        }
+    }
+    let required = match p.kind.as_str() {
+        "static_file" => p.local_path.is_empty(),
+        "unix_domain_socket" => p.unix_path.is_empty(),
+        "http2https" | "https2http" | "https2https" | "tls2raw" => p.local_addr.is_empty(),
+        _ => false,
+    };
+    if required {
+        return bad("local plugin is missing a required path or address");
+    }
+    if p.crt_path.is_empty() != p.key_path.is_empty() {
+        return bad("local plugin certificate and private key must be provided together");
+    }
+    if p.kind == "socks5" && p.username.is_empty() != p.password.is_empty() {
+        return bad("socks5 username and password must be provided together");
+    }
+    Ok(Some(p))
+}
+
 /// 校验 http 选项；非 http 隧道不得带有任何选项。
 fn check_http_opts(kind: &str, o: HttpOpts) -> Res<HttpOpts> {
     if o.is_default() {
@@ -1222,6 +1340,7 @@ struct Checked {
     bandwidth_bps: u64,
     bandwidth_server: bool,
     lb: LbOpts,
+    plugin: Option<rustfrp_core::wire::PluginOpts>,
 }
 
 fn check_tunnel(
@@ -1284,6 +1403,17 @@ fn check_tunnel(
         ));
     }
     let lb = check_lb(&t.kind, t.lb.clone())?;
+    let plugin = check_plugin(&t.kind, t.plugin.clone())?;
+    if plugin.is_some() && t.proxy_protocol != 0 {
+        return Err(StoreError::Invalid(
+            "PROXY protocol cannot be combined with a local plugin".into(),
+        ));
+    }
+    if plugin.is_some() && lb.health.is_some() {
+        return Err(StoreError::Invalid(
+            "health checks are not supported for local plugin tunnels".into(),
+        ));
+    }
     ensure_remote_port_free(c, &t.kind, t.remote_port, &lb, except_id)?;
     ensure_domains_free(c, &t.kind, &domains, &t.subdomain, &http, &lb, except_id)?;
     let dup: Option<String> = c
@@ -1303,6 +1433,7 @@ fn check_tunnel(
         domains,
         http,
         lb,
+        plugin,
         ..t
     })
 }
@@ -1326,15 +1457,16 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
             bandwidth_bps: t.bandwidth_bps,
             bandwidth_server: t.bandwidth_server,
             lb: t.lb.clone(),
+            plugin: t.plugin.clone(),
         },
         None,
         &t.client_id,
     )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, secret_key)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), if is_secret(&k.kind) { random_id() } else { String::new() }],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts, secret_key)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin), if is_secret(&k.kind) { random_id() } else { String::new() }],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
@@ -1382,6 +1514,7 @@ pub fn list_tunnels(c: &Connection, client_id: Option<&str>) -> Res<Vec<Tunnel>>
 pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res<Tunnel> {
     let cur = get_tunnel(c, id)?;
     let cur_opts = tunnel_http_opts(c, id)?;
+    let cur_plugin = tunnel_plugin_opts(c, id)?;
     let new_opts = HttpOpts {
         locations: p
             .locations
@@ -1409,6 +1542,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             .unwrap_or_else(|| cur_opts.response_headers.clone()),
     };
     let cur_lb = tunnel_lb(c, id)?;
+    let plugin = p.plugin.clone().or_else(|| cur_plugin.clone());
     let new_lb = LbOpts {
         group: p.lb_group.clone().unwrap_or_else(|| cur_lb.group.clone()),
         group_key: p
@@ -1447,6 +1581,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             bandwidth_bps: p.bandwidth_bps.unwrap_or(cur.bandwidth_bps),
             bandwidth_server: p.bandwidth_server.unwrap_or(cur.bandwidth_server),
             lb: new_lb,
+            plugin,
         },
         Some(id),
         &cur.client_id,
@@ -1457,6 +1592,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
         || k.bandwidth_bps != cur.bandwidth_bps
         || k.bandwidth_server != cur.bandwidth_server
         || k.lb != cur_lb
+        || k.plugin != cur_plugin
         || k.local_ip != cur.local_ip
         || k.local_port != i64::from(cur.local_port)
         || k.remote_port != i64::from(cur.remote_port)
@@ -1466,8 +1602,8 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
     // 仅数据面配置变化时等待 Edge 回报；重复启停和改显示名保留实际状态。
     c.execute(
         "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state=CASE WHEN ?11 THEN 'pending' ELSE status_state END, status_error=CASE WHEN ?11 THEN '' ELSE status_error END,
-                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15, lb_opts=?16 WHERE id=?1",
-        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb)],
+                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15, lb_opts=?16, plugin_opts=?17 WHERE id=?1",
+        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin)],
     )?;
     bump_revision(c, &cur.client_id)?;
     // 访问者只在目标隧道启用时才下发：启停会改变它们所在设备的配置。
@@ -1497,6 +1633,16 @@ pub fn tunnel_lb(c: &Connection, id: &str) -> Res<LbOpts> {
         |r| r.get(0),
     )?;
     Ok(parse_lb(&raw))
+}
+
+/// 隧道的插件配置（含凭据，仅供内部下发使用，不得经 REST 返回）。
+pub fn tunnel_plugin_opts(c: &Connection, id: &str) -> Res<Option<rustfrp_core::wire::PluginOpts>> {
+    let raw: String = c.query_row(
+        "SELECT plugin_opts FROM tunnels WHERE id=?1 AND deleted_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(parse_plugin(&raw))
 }
 
 /// 软删除隧道。
@@ -1639,15 +1785,19 @@ pub fn mark_client_tunnels_stopped(c: &Connection, client_id: &str) -> Res<()> {
 pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
     let client = get_client(c, client_id)?;
     let mut opts = c.prepare(
-        "SELECT id, http_opts, lb_opts FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL",
+        "SELECT id, http_opts, lb_opts, plugin_opts FROM tunnels WHERE client_id = ?1 AND deleted_at IS NULL",
     )?;
-    let mut opts: std::collections::HashMap<String, (HttpOpts, LbOpts)> = opts
+    let mut opts: std::collections::HashMap<
+        String,
+        (HttpOpts, LbOpts, Option<rustfrp_core::wire::PluginOpts>),
+    > = opts
         .query_map([client_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 (
                     parse_opts(&r.get::<_, String>(1)?),
                     parse_lb(&r.get::<_, String>(2)?),
+                    parse_plugin(&r.get::<_, String>(3)?),
                 ),
             ))
         })?
@@ -1681,7 +1831,7 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
         .into_iter()
         .filter(|t| t.enabled)
         .map(|t| {
-            let (http, lb) = opts.remove(&t.id).unwrap_or_default();
+            let (http, lb, plugin) = opts.remove(&t.id).unwrap_or_default();
             ManagedProxy {
                 http,
                 lb,
@@ -1689,6 +1839,7 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
                     sk: secrets.remove(&t.id).unwrap_or_default(),
                     allow_users: vec![],
                 },
+                plugin,
                 proxy_protocol: t.proxy_protocol,
                 bandwidth_bps: t.bandwidth_bps,
                 bandwidth_server: t.bandwidth_server,
@@ -2971,6 +3122,7 @@ mod tests {
             bandwidth_bps: 0,
             bandwidth_server: false,
             lb: Default::default(),
+            plugin: None,
         };
         let a = create_tunnel(&c, &mk("a", 1), 1).unwrap();
         assert!(enforce_tunnel_quota(&c, &cl.id, 1).is_ok());
@@ -3287,6 +3439,7 @@ mod tests {
             bandwidth_bps: 0,
             bandwidth_server: false,
             lb: Default::default(),
+            plugin: None,
         };
         let w = create_tunnel(
             &c,
@@ -3647,5 +3800,276 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.state, "pending");
+    }
+
+    #[test]
+    fn managed_plugin_credentials_are_redacted_and_not_sent_to_edge_nodes() {
+        let c = conn();
+        let a = client(&c, "plugin-client");
+        let plugin = rustfrp_core::wire::PluginOpts {
+            kind: "socks5".into(),
+            username: "operator".into(),
+            password: "plugin-password-never-returned".into(),
+            ..Default::default()
+        };
+        let tunnel = create_tunnel(
+            &c,
+            &NewTunnel {
+                plugin: Some(plugin),
+                ..nt(&a.id, "managed-socks", 6001)
+            },
+            1,
+        )
+        .unwrap();
+        let summary = tunnel.plugin.as_ref().unwrap();
+        assert_eq!(summary.kind, "socks5");
+        assert!(summary.password_set);
+        assert!(!serde_json::to_string(&tunnel)
+            .unwrap()
+            .contains("plugin-password-never-returned"));
+
+        let client_config = managed_config(&c, &a.id).unwrap();
+        assert_eq!(
+            client_config.proxies[0].plugin.as_ref().unwrap().password,
+            "plugin-password-never-returned"
+        );
+        let edge_config = node_device(&c, &a.id).unwrap().config;
+        assert!(edge_config.proxies[0].plugin.is_none());
+
+        let cleared = update_tunnel(
+            &c,
+            &tunnel.id,
+            &TunnelPatch {
+                plugin: Some(Default::default()),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert!(cleared.plugin.is_none());
+        assert!(managed_config(&c, &a.id).unwrap().proxies[0]
+            .plugin
+            .is_none());
+
+        let mut https = nt(&a.id, "managed-https-plugin", 0);
+        https.kind = "https".into();
+        https.custom_domains = vec!["secure.example.test".into()];
+        https.plugin = Some(rustfrp_core::wire::PluginOpts {
+            kind: "https2http".into(),
+            local_addr: "127.0.0.1:8080".into(),
+            ..Default::default()
+        });
+        let created = create_tunnel(&c, &https, 3).unwrap();
+        assert_eq!(
+            tunnel_plugin_opts(&c, &created.id).unwrap().unwrap().kind,
+            "https2http"
+        );
+    }
+
+    #[test]
+    fn managed_plugin_validation_rejects_incompatible_and_incomplete_options() {
+        let c = conn();
+        let a = client(&c, "invalid-plugin-client");
+        let create = |kind: &str, plugin: rustfrp_core::wire::PluginOpts| {
+            let mut tunnel = nt(&a.id, "invalid-plugin", 6002);
+            tunnel.kind = kind.into();
+            tunnel.plugin = Some(plugin);
+            create_tunnel(&c, &tunnel, 1)
+        };
+        assert!(create(
+            "udp",
+            rustfrp_core::wire::PluginOpts {
+                kind: "socks5".into(),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(create(
+            "tcp",
+            rustfrp_core::wire::PluginOpts {
+                kind: "static_file".into(),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(create(
+            "tcp",
+            rustfrp_core::wire::PluginOpts {
+                kind: "http2https".into(),
+                local_addr: "127.0.0.1:443".into(),
+                crt_path: "/client/cert.pem".into(),
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        let mut proxy_protocol = nt(&a.id, "invalid-plugin", 6002);
+        proxy_protocol.plugin = Some(rustfrp_core::wire::PluginOpts {
+            kind: "socks5".into(),
+            ..Default::default()
+        });
+        proxy_protocol.proxy_protocol = 1;
+        assert!(create_tunnel(&c, &proxy_protocol, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("PROXY protocol"));
+
+        let mut health_check = nt(&a.id, "invalid-plugin", 6002);
+        health_check.plugin = Some(rustfrp_core::wire::PluginOpts {
+            kind: "static_file".into(),
+            local_path: "/srv/site".into(),
+            ..Default::default()
+        });
+        health_check.lb.health = Some(rustfrp_core::wire::HealthSpec {
+            kind: "tcp".into(),
+            timeout_secs: 3,
+            max_failed: 1,
+            interval_secs: 10,
+            ..Default::default()
+        });
+        assert!(create_tunnel(&c, &health_check, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("health checks"));
+    }
+
+    #[test]
+    fn managed_plugin_validation_covers_bounded_fields_and_pairs() {
+        use rustfrp_core::wire::PluginOpts;
+
+        let rejected =
+            |tunnel: &str, plugin: PluginOpts| check_plugin(tunnel, Some(plugin)).is_err();
+        assert_eq!(
+            check_plugin("tcp", Some(PluginOpts::default())).unwrap(),
+            None
+        );
+        assert!(check_plugin(
+            "http",
+            Some(PluginOpts {
+                kind: "socks5".into(),
+                ..Default::default()
+            })
+        )
+        .unwrap()
+        .is_some());
+
+        for plugin in [
+            PluginOpts {
+                kind: "virtual_net".into(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                local_addr: "x".repeat(257),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                unix_path: "x".repeat(1025),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                host_header_rewrite: "x".repeat(254),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "static_file".into(),
+                local_path: String::new(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "static_file".into(),
+                local_path: "x".repeat(1025),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                strip_prefix: "x".repeat(257),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                http_user: "x".repeat(129),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                username: "x".repeat(129),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                http_password: "x".repeat(129),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                password: "x".repeat(129),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                crt_path: "x".repeat(1025),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                key_path: "x".repeat(1025),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                request_headers: (0..17).map(|i| (format!("X-{i}"), "v".into())).collect(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "unix_domain_socket".into(),
+                unix_path: String::new(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "https2http".into(),
+                local_addr: String::new(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                crt_path: "/cert".into(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                username: "user".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(rejected("tcp", plugin));
+        }
+
+        for plugin in [
+            PluginOpts {
+                kind: "socks5".into(),
+                local_addr: "x\n".into(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                username: "user\n".into(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                request_headers: [("Bad Header".into(), "v".into())].into(),
+                ..Default::default()
+            },
+            PluginOpts {
+                kind: "socks5".into(),
+                request_headers: [("X".into(), "v".repeat(1025))].into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(rejected("tcp", plugin));
+        }
     }
 }

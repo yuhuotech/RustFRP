@@ -56,32 +56,37 @@ pub struct Admin {
 /// 用事件更新状态表，直到通道关闭。
 pub async fn track(mut rx: mpsc::Receiver<Event>, table: StatusTable) {
     while let Some(e) = rx.recv().await {
-        let mut t = table.lock().unwrap_or_else(PoisonError::into_inner);
-        match e {
-            Event::ProxyStarted { name, remote_port } => {
-                if let Some(s) = t.get_mut(&name) {
-                    s.state = "running".into();
-                    s.error.clear();
-                    s.remote = if remote_port == 0 {
-                        String::new()
-                    } else {
-                        format!(":{remote_port}")
-                    };
-                }
+        apply_event(&table, e);
+    }
+}
+
+/// 把一个客户端事件应用到共享状态表。
+pub fn apply_event(table: &StatusTable, event: Event) {
+    let mut t = table.lock().unwrap_or_else(PoisonError::into_inner);
+    match event {
+        Event::ProxyStarted { name, remote_port } => {
+            if let Some(s) = t.get_mut(&name) {
+                s.state = "running".into();
+                s.error.clear();
+                s.remote = if remote_port == 0 {
+                    String::new()
+                } else {
+                    format!(":{remote_port}")
+                };
             }
-            Event::ProxyFailed { name, error } => {
-                if let Some(s) = t.get_mut(&name) {
-                    s.state = "start error".into();
-                    s.error = error;
-                }
-            }
-            Event::Disconnected(_) => {
-                for s in t.values_mut() {
-                    s.state = "wait start".into();
-                }
-            }
-            _ => {}
         }
+        Event::ProxyFailed { name, error } => {
+            if let Some(s) = t.get_mut(&name) {
+                s.state = "start error".into();
+                s.error = error;
+            }
+        }
+        Event::Disconnected(_) => {
+            for s in t.values_mut() {
+                s.state = "wait start".into();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -193,11 +198,7 @@ async fn handle(mut s: TcpStream, admin: Arc<Admin>) {
         ("GET", "/api/reload") => {
             let (tx, rx) = oneshot::channel();
             let result = match admin.reload.send(ReloadReq { reply: tx }).await {
-                Ok(()) => match tokio::time::timeout(Duration::from_secs(30), rx).await {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) => Err("reload was abandoned".to_string()),
-                    Err(_) => Err("reload timed out".to_string()),
-                },
+                Ok(()) => await_reload(rx, Duration::from_secs(30)).await,
                 Err(_) => Err("reload is not available".to_string()),
             };
             match result {
@@ -210,6 +211,17 @@ async fn handle(mut s: TcpStream, admin: Arc<Admin>) {
             admin.stop.cancel();
         }
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found", "").await,
+    }
+}
+
+async fn await_reload(
+    reply: oneshot::Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, reply).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("reload was abandoned".to_string()),
+        Err(_) => Err("reload timed out".to_string()),
     }
 }
 
@@ -378,6 +390,26 @@ mod tests {
         assert_eq!(
             json_escape("a\"b\\c\n\r\t\u{1}é"),
             "a\\\"b\\\\c\\n\\r\\t\\u0001é"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_wait_handles_success_abandonment_and_timeout() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(())).unwrap();
+        assert_eq!(await_reload(rx, Duration::from_secs(1)).await, Ok(()));
+
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        assert_eq!(
+            await_reload(rx, Duration::from_secs(1)).await,
+            Err("reload was abandoned".into())
+        );
+
+        let (_tx, rx) = oneshot::channel();
+        assert_eq!(
+            await_reload(rx, Duration::from_millis(1)).await,
+            Err("reload timed out".into())
         );
     }
 }

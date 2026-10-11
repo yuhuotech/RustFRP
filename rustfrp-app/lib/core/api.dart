@@ -23,6 +23,8 @@ class ApiClient {
 
   String? _cookie;
   String? csrf;
+  int _controllerLogCursor = 0;
+  final List<String> _controllerLogCache = [];
 
   /// Called whenever the server says the session is no longer valid.
   void Function()? onUnauthorized;
@@ -221,8 +223,28 @@ class ApiClient {
   Future<void> deleteVisitor(String id, {required String reason}) async =>
       _send('DELETE', '/visitors/$id', query: {'reason': reason});
 
-  Future<List<String>> controllerLogs() async =>
-      ((await _send('GET', '/logs') as Map)['items'] as List).cast<String>();
+  Future<List<String>> controllerLogs() async {
+    final raw = await _send(
+      'GET',
+      '/logs',
+      query: {'after': '$_controllerLogCursor'},
+    );
+    if (raw is! Map<String, dynamic> || raw['items'] is! List) {
+      throw ProtocolException('controller log response is invalid');
+    }
+    final items = (raw['items'] as List).whereType<String>().toList();
+    if (items.length > 128 || items.length != (raw['items'] as List).length) {
+      throw ProtocolException('controller log page exceeds bounds');
+    }
+    if (raw['gap'] == true) _controllerLogCache.clear();
+    _controllerLogCache.addAll(items);
+    if (_controllerLogCache.length > 128) {
+      _controllerLogCache.removeRange(0, _controllerLogCache.length - 128);
+    }
+    final cursor = raw['cursor'];
+    if (cursor is int && cursor >= 0) _controllerLogCursor = cursor;
+    return List.unmodifiable(_controllerLogCache);
+  }
 
   Future<List<Map<String, dynamic>>> apiTokens() async =>
       (await _send('GET', '/api-tokens') as List).cast<Map<String, dynamic>>();
@@ -359,6 +381,7 @@ class ApiClient {
     String lbGroup = '',
     String lbGroupKey = '',
     HealthCheck? healthCheck,
+    Map<String, dynamic>? plugin,
     required String reason,
   }) async => Tunnel.fromJson(
     await _send(
@@ -383,6 +406,7 @@ class ApiClient {
         'lb_group': lbGroup,
         'lb_group_key': lbGroupKey,
         'health_check': ?healthCheck?.toJson(),
+        'plugin': ?plugin,
         'local_ip': localIp,
         'local_port': localPort,
         'remote_port': remotePort,
@@ -414,6 +438,7 @@ class ApiClient {
     String? lbGroup,
     String? lbGroupKey,
     HealthCheck? healthCheck,
+    Map<String, dynamic>? plugin,
     required String reason,
   }) async => Tunnel.fromJson(
     await _send(
@@ -440,6 +465,7 @@ class ApiClient {
         'lb_group': ?lbGroup,
         'lb_group_key': ?lbGroupKey,
         'health_check': ?healthCheck?.toJson(),
+        'plugin': ?plugin,
         'reason': reason,
       },
     ),
@@ -447,6 +473,38 @@ class ApiClient {
 
   Future<void> deleteTunnel(String id, {required String reason}) async =>
       _send('DELETE', '/tunnels/$id', query: {'reason': reason});
+
+  Future<Map<String, dynamic>> previewConfigImport(
+    String clientId,
+    String text,
+  ) async => (await _send(
+    'POST',
+    '/clients/$clientId/config/preview',
+    body: {'text': text},
+  )) as Map<String, dynamic>;
+
+  Future<void> importConfig(
+    String clientId, {
+    required String text,
+    required String digest,
+    required String reason,
+  }) async {
+    await _send(
+      'POST',
+      '/clients/$clientId/config/import',
+      body: {
+        'text': text,
+        'digest': digest,
+        'accept_warnings': true,
+        'reason': reason,
+      },
+    );
+  }
+
+  Future<String> exportConfig(String clientId) async =>
+      ((await _send('GET', '/clients/$clientId/config/export')
+              as Map<String, dynamic>)['text']
+          as String);
 
   /// [kind]：`client`（默认）或 `node`；[nodeId]：设备令牌指定由哪个外置节点服务。
   Future<EnrollResult> createEnrollToken({

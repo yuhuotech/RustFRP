@@ -26,6 +26,8 @@ class FakeServer {
   final List<Map<String, Object?>> tokens = [];
   final List<Map<String, Object?>> apiTokens = [];
   final List<Map<String, Object?>> audit = [];
+  final List<Map<String, Object?>> configImports = [];
+  String exportedConfig = '[[proxies]]\nname = "ssh"\ntype = "tcp"\n';
 
   /// 内置节点是否启用（`/node` 与 `/nodes` 据此返回）。
   bool builtinEnabled = true;
@@ -262,10 +264,13 @@ class FakeServer {
       case ('GET', ['logs']):
         final denied = guard('admin');
         if (denied != null) return denied;
+        final after = int.tryParse(r.url.queryParameters['after'] ?? '0') ?? 0;
         return _json({
-          'items': controllerLogs,
+          'items': controllerLogs.skip(after).toList(),
           'capacity': 128,
           'line_bytes': 512,
+          'cursor': controllerLogs.length,
+          'gap': false,
         });
       case ('GET', ['api-tokens']):
         return _json(apiTokens);
@@ -430,6 +435,44 @@ class FakeServer {
         clients.removeWhere((x) => x['id'] == id);
         tunnels.removeWhere((x) => x['client_id'] == id);
         return _json({'ok': true});
+      case ('POST', ['clients', final id, 'config', 'preview']):
+        if (_rank(role) < _rank('operator')) {
+          return _err(403, 'forbidden', 'insufficient permissions');
+        }
+        if (!clients.any((c) => c['id'] == id)) {
+          return _err(404, 'not_found', 'not found');
+        }
+        return _json({
+          'digest': 'preview-digest',
+          'changes': [
+            {
+              'name': 'ssh',
+              'action': 'update',
+              'kind': 'tcp',
+              'local_ip': '127.0.0.1',
+              'local_port': 22,
+              'remote_port': 6000,
+              'enabled': true,
+            },
+          ],
+          'warnings': ['部分配置仅保留、不会激活'],
+        });
+      case ('POST', ['clients', final id, 'config', 'import']):
+        final e = guard('operator');
+        if (e != null) return e;
+        configImports.add({'client_id': id, ...body});
+        return _json({'updated': 1});
+      case ('GET', ['clients', final id, 'config', 'export']):
+        final e = guard('admin');
+        if (e != null) return e;
+        if (!clients.any((client) => client['id'] == id)) {
+          return _err(404, 'not_found', 'not found');
+        }
+        return _json({
+          'format': 'toml',
+          'text': exportedConfig,
+          'notice': 'secrets omitted',
+        });
       case ('GET', ['tunnels']):
         final cid = r.url.queryParameters['client_id'];
         return _json([

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -392,6 +394,59 @@ void main() {
     await tapKey(tester, 'logout');
     await settle(tester, 10);
     expect(find.byKey(const Key('login-submit')), findsOneWidget);
+  });
+
+  testWidgets('desktop preferences toggle startup, tray and notifications', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final h = await Harness.create(
+      tester,
+      s,
+      desktopStartupEnabled: () async => false,
+      desktopStartupToggle: (enabled) async => expect(enabled, true),
+    );
+    await tester.tap(find.byTooltip('设置'));
+    await settle(tester);
+    await tapKey(tester, 'settings-appearance');
+    await settle(tester, 12);
+    expect(find.text('桌面行为'), findsOneWidget);
+    final switches = find.byType(LSwitch);
+    expect(switches, findsNWidgets(3));
+
+    await tester.tap(switches.at(0));
+    await settle(tester);
+    await tester.tap(find.byType(LSwitch).at(1));
+    await settle(tester);
+    await tester.tap(find.byType(LSwitch).at(2));
+    await settle(tester);
+    expect(h.container.read(prefsProvider).getBool('close_to_tray'), false);
+    expect(
+      h.container.read(prefsProvider).getBool('notifications_enabled'),
+      false,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('desktop startup errors stay visible and recoverable', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    await Harness.create(
+      tester,
+      s,
+      desktopStartupEnabled: () async => false,
+      desktopStartupToggle: (_) async {
+        throw const FileSystemException('settings directory is read-only');
+      },
+    );
+    await tester.tap(find.byTooltip('设置'));
+    await settle(tester);
+    await tapKey(tester, 'settings-appearance');
+    await settle(tester, 12);
+    await tester.tap(find.byType(LSwitch).first);
+    await settle(tester);
+    expect(find.textContaining('开机启动设置失败'), findsOneWidget);
   });
 
   testWidgets(

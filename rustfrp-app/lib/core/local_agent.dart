@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'platform/local_backend.dart';
+import 'notification_service.dart';
 import 'store.dart';
 
 @immutable
@@ -14,16 +15,20 @@ class LocalAgentConfig {
     this.controller = '',
     this.name = '',
     this.stateDir = '',
+    this.configFile = '',
     this.caFile = '',
     this.tlsPin = '',
   });
-  final String binary, controller, name, stateDir, caFile, tlsPin;
+  final String binary, controller, name, stateDir, configFile, caFile, tlsPin;
+  String get discoveryIdentity =>
+      configFile.isEmpty ? controller : 'standalone:$configFile';
   String get discoveryPath => '$stateDir/control.json';
   Map<String, Object> toJson() => {
     'binary': binary,
     'controller': controller,
     'name': name,
     'stateDir': stateDir,
+    'configFile': configFile,
     'caFile': caFile,
     'tlsPin': tlsPin,
   };
@@ -33,6 +38,7 @@ class LocalAgentConfig {
         controller: json['controller'] as String,
         name: json['name'] as String,
         stateDir: json['stateDir'] as String,
+        configFile: json['configFile'] as String? ?? '',
         caFile: json['caFile'] as String,
         tlsPin: json['tlsPin'] as String? ?? '',
       );
@@ -43,11 +49,19 @@ class LocalAgentConfig {
       controller == other.controller &&
       name == other.name &&
       stateDir == other.stateDir &&
+      configFile == other.configFile &&
       caFile == other.caFile &&
       tlsPin == other.tlsPin;
   @override
-  int get hashCode =>
-      Object.hash(binary, controller, name, stateDir, caFile, tlsPin);
+  int get hashCode => Object.hash(
+    binary,
+    controller,
+    name,
+    stateDir,
+    configFile,
+    caFile,
+    tlsPin,
+  );
 }
 
 @immutable
@@ -152,6 +166,7 @@ class LocalAgentState {
 class LocalAgentNotifier extends Notifier<LocalAgentState> {
   bool _working = false;
   bool _disposed = false;
+  bool? _lastConnected;
   @override
   LocalAgentState build() {
     final backend = ref.read(localBackendProvider);
@@ -180,13 +195,17 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
       : '无法操作本机 agent，请检查路径、版本和本机权限';
 
   Future<void> refresh() async {
-    if (_working || state.config.controller.isEmpty) return;
+    if (_working ||
+        (state.config.controller.isEmpty && state.config.configFile.isEmpty)) {
+      return;
+    }
     _working = true;
     final old = state;
     final config = old.config;
     state = LocalAgentState(config: config, status: old.status, busy: true);
     try {
       final status = await ref.read(localBackendProvider).status(config);
+      _recordConnection(status?.connected ?? false);
       if (!_disposed) state = LocalAgentState(config: config, status: status);
     } on Exception catch (e) {
       if (!_disposed) {
@@ -198,6 +217,18 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
       }
     } finally {
       _working = false;
+    }
+  }
+
+  void _recordConnection(bool connected) {
+    final previous = _lastConnected;
+    _lastConnected = connected;
+    if (previous != null &&
+        previous != connected &&
+        ref.read(prefsProvider).getBool('notifications_enabled') != false) {
+      unawaited(
+        DesktopNotificationService.instance.agentConnectionChanged(connected),
+      );
     }
   }
 
@@ -221,6 +252,7 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
       await backend.start(config, token);
       final status = await backend.status(config);
       if (status == null) throw const FormatException('agent 已退出，请检查接入令牌或证书');
+      _recordConnection(status.connected);
       if (!_disposed) state = LocalAgentState(config: config, status: status);
     } on Exception catch (e) {
       if (!_disposed) {

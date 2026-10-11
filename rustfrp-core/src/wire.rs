@@ -183,6 +183,48 @@ impl HttpOpts {
     }
 }
 
+/// 客户端本地插件配置。凭据只存在于受管配置下发帧中，REST 模型需使用脱敏摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PluginOpts {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local_addr: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unix_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_header_rewrite: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// 证书文件路径，由拥有隧道的客户端 Agent 本机读取。
+    pub crt_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// 私钥文件路径；文件内容不经过 Controller。
+    pub key_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub strip_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_http2: Option<bool>,
+}
+
+impl PluginOpts {
+    /// 未启用插件。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// 受管代理：Controller 下发给 Edge 与 Client 的完整定义。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ManagedProxy {
@@ -223,6 +265,9 @@ pub struct ManagedProxy {
     /// stcp / sudp 的访问控制。
     #[serde(default, skip_serializing_if = "SecretOpts::is_default")]
     pub secret: SecretOpts,
+    /// Agent 本地插件（仅 Client 执行）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginOpts>,
 }
 
 fn is_false(b: &bool) -> bool {

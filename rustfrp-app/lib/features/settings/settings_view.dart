@@ -4,6 +4,9 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../core/models.dart';
 import '../../core/local_agent.dart';
+import '../../core/desktop.dart';
+import '../../core/notification_service.dart';
+import '../../core/platform/startup.dart';
 import '../../core/store.dart';
 import '../../shared/format.dart';
 import '../../shared/panel_widgets.dart';
@@ -11,6 +14,13 @@ import '../../shared/widgets.dart';
 import '../../theme/tokens.dart';
 import '../shell/shell.dart';
 import 'api_tokens_view.dart';
+
+final desktopStartupEnabledProvider = Provider<Future<bool> Function()>(
+  (ref) => startupEnabled,
+);
+final desktopStartupToggleProvider = Provider<Future<void> Function(bool)>(
+  (ref) => setStartupEnabled,
+);
 
 class SettingsPage {
   const SettingsPage(
@@ -241,9 +251,146 @@ class _Appearance extends ConsumerWidget {
               ),
           ],
         ),
+        if (isDesktop) ...[
+          const SizedBox(height: 20),
+          const _DesktopPreferences(),
+        ],
       ],
     );
   }
+}
+
+class _DesktopPreferences extends ConsumerStatefulWidget {
+  const _DesktopPreferences();
+  @override
+  ConsumerState<_DesktopPreferences> createState() =>
+      _DesktopPreferencesState();
+}
+
+class _DesktopPreferencesState extends ConsumerState<_DesktopPreferences> {
+  bool _loading = true;
+  bool _startup = false;
+  bool _closeToTray = true;
+  bool _notifications = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_load);
+  }
+
+  Future<void> _load() async {
+    final prefs = ref.read(prefsProvider);
+    try {
+      final startup = await ref.read(desktopStartupEnabledProvider)();
+      if (!mounted) return;
+      setState(() {
+        _startup = startup;
+        _closeToTray = prefs.getBool('close_to_tray') ?? true;
+        _notifications = prefs.getBool('notifications_enabled') ?? true;
+        _loading = false;
+      });
+    } on Object catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '读取桌面启动设置失败：$e';
+          _closeToTray = prefs.getBool('close_to_tray') ?? true;
+          _notifications = prefs.getBool('notifications_enabled') ?? true;
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setStartup(bool value) async {
+    setState(() => _loading = true);
+    try {
+      await ref.read(desktopStartupToggleProvider)(value);
+      if (mounted) {
+        setState(() {
+          _startup = value;
+          _error = null;
+          _loading = false;
+        });
+      }
+    } on Object catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '开机启动设置失败：$e';
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setCloseToTray(bool value) async {
+    await ref.read(prefsProvider).setBool('close_to_tray', value);
+    if (mounted) setState(() => _closeToTray = value);
+  }
+
+  Future<void> _setNotifications(bool value) async {
+    if (value) await DesktopNotificationService.instance.requestPermission();
+    await ref.read(prefsProvider).setBool('notifications_enabled', value);
+    if (mounted) setState(() => _notifications = value);
+  }
+
+  Widget _row(
+    String title,
+    String detail,
+    bool value,
+    ValueChanged<bool>? onChanged,
+  ) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: Type.body.copyWith(color: context.c.text1)),
+              Text(
+                detail,
+                style: Type.caption.copyWith(color: context.c.text3),
+              ),
+            ],
+          ),
+        ),
+        LSwitch(value: value, onChanged: onChanged),
+      ],
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const SectionTitle('桌面行为'),
+      _row(
+        '登录时启动 RustFRP',
+        '启动到系统托盘；Agent 可继续在后台运行。',
+        _startup,
+        _loading ? null : _setStartup,
+      ),
+      _row(
+        '关闭窗口时隐藏到托盘',
+        '从托盘菜单可重新打开窗口或退出应用。',
+        _closeToTray,
+        _loading ? null : _setCloseToTray,
+      ),
+      _row(
+        '本机连接通知',
+        '本机 Agent 连接和断开时显示系统通知。',
+        _notifications,
+        _loading ? null : _setNotifications,
+      ),
+      if (_error != null)
+        Text(
+          _error!,
+          style: Type.caption.copyWith(color: context.c.dangerText),
+        ),
+    ],
+  );
 }
 
 class _Tokens extends ConsumerWidget {

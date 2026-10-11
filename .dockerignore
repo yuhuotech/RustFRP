@@ -1,0 +1,9 @@
+.git
+target
+**/build
+**/coverage
+**/.dart_tool
+rustfrp-app
+rustfrp-web
+installer
+tools

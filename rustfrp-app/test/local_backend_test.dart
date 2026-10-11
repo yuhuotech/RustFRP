@@ -27,7 +27,7 @@ class Rig {
     await Directory(config.stateDir).create();
   }
 
-  Future<void> serve() async {
+  Future<void> serve({String? discoveryIdentity}) async {
     await File('${config.stateDir}/identity.json')
         .writeAsString('{"client_id":"enrolled"}');
     server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
@@ -58,7 +58,7 @@ class Rig {
       jsonEncode({
         'version': 1,
         'port': server!.port,
-        'controller': config.controller,
+        'controller': discoveryIdentity ?? config.discoveryIdentity,
         'token': 'a' * 64,
       }),
     );
@@ -270,6 +270,72 @@ void main() {
       }
     },
   );
+  test('bundled agent paths and first-run installation', () async {
+    final sep = Platform.pathSeparator;
+    final root = Directory.systemTemp.path;
+    final windowsExe = '$root${sep}bundle${sep}app${sep}rustfrp_app.exe';
+    final macExe =
+        '$root${sep}RustFRP.app${sep}Contents${sep}MacOS${sep}rustfrp_app';
+    final linuxExe = '$root${sep}RustFRP${sep}app${sep}rustfrp_app';
+    expect(
+      bundledAgentPathFor(
+        windowsExe,
+        windows: true,
+        macos: false,
+        linux: false,
+      ),
+      '${File(windowsExe).parent.path}${sep}rustfrp-agent.exe',
+    );
+    expect(
+      bundledAgentPathFor(macExe, windows: false, macos: true, linux: false),
+      '${File(macExe).parent.parent.path}${sep}Resources${sep}bin${sep}rustfrp-agent',
+    );
+    expect(
+      bundledAgentPathFor(linuxExe, windows: false, macos: false, linux: true),
+      '${File(linuxExe).parent.parent.path}${sep}bin${sep}rustfrp-agent',
+    );
+    expect(
+      bundledAgentPathFor(linuxExe, windows: false, macos: false, linux: false),
+      isNull,
+    );
+
+    final r = Rig();
+    await r.init();
+    addTearDown(r.close);
+    await File(r.config.binary).delete();
+    final source = File('${r.dir.path}${sep}packaged-agent');
+    await source.writeAsString('bundled agent');
+    final backend = IoLocalBackend(
+      defaults: r.config,
+      bundledAgentBinary: source.path,
+      launch: (binary, _) async {
+        expect(await File(binary).readAsString(), 'bundled agent');
+        await r.serve();
+      },
+    );
+    await backend.start(r.config, 'test-token');
+    expect(await File(r.config.binary).readAsString(), 'bundled agent');
+    if (!Platform.isWindows) {
+      final permissions = await Process.run(
+        '/usr/bin/stat',
+        Platform.isMacOS
+            ? ['-f', '%Lp', r.config.binary]
+            : ['-c', '%a', r.config.binary],
+      );
+      expect(permissions.stdout.toString().trim(), '700');
+    }
+    await backend.stop(r.config);
+
+    final missing = IoLocalBackend(
+      defaults: r.config,
+      bundledAgentBinary: '${r.dir.path}${sep}missing-agent',
+    );
+    await File(r.config.binary).delete();
+    await expectLater(
+      missing.start(r.config, 'test-token'),
+      throwsA(isA<FormatException>()),
+    );
+  });
   test('status, stopped discovery, start and stop; literal arguments and no duplicate', () async {
     final r = Rig();
     await r.init();
@@ -312,6 +378,37 @@ void main() {
       'never-used',
     );
     await enrolled.stop(r.config);
+  });
+  test('independent mode validates a local frpc file and starts without enrollment', () async {
+    final r = Rig();
+    await r.init();
+    addTearDown(r.close);
+    final configPath = '${r.dir.path}/frpc.toml';
+    await File(configPath).writeAsString('serverAddr="127.0.0.1"');
+    final config = LocalAgentConfig(
+      binary: r.config.binary,
+      stateDir: r.config.stateDir,
+      configFile: configPath,
+      name: 'standalone',
+    );
+    final backend = IoLocalBackend(
+      defaults: config,
+      startTimeout: const Duration(seconds: 1),
+      launch: (binary, args) async {
+        expect(binary, config.binary);
+        expect(args, contains('--local-control'));
+        expect(args, contains('--mode'));
+        expect(args, contains('client'));
+        expect(args, contains('-c'));
+        expect(args, contains(configPath));
+        expect(args, isNot(contains('--controller')));
+        expect(args, isNot(contains('--enroll-token')));
+        await r.serve(discoveryIdentity: config.discoveryIdentity);
+      },
+    );
+    await backend.start(config, 'unused');
+    expect((await backend.status(config))!.connected, true);
+    await backend.stop(config);
   });
   test(
     'invalid paths, controller, credentials, discovery and bounded file reads',

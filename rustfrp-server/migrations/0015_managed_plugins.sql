@@ -1,0 +1,1 @@
+ALTER TABLE tunnels ADD COLUMN plugin_opts TEXT NOT NULL DEFAULT '';

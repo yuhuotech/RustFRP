@@ -70,6 +70,19 @@ async fn http(web: u16, path: &str, auth: bool) -> (u16, String) {
         .unwrap()
 }
 
+async fn local_request(discovery: &serde_json::Value, command: &str) -> String {
+    let port = discovery["port"].as_u64().unwrap() as u16;
+    let token = discovery["token"].as_str().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(format!("{{\"token\":\"{token}\",\"command\":\"{command}\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
 async fn eventually<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) {
     for _ in 0..100 {
         if f().await {
@@ -292,6 +305,106 @@ async fn status_reload_and_stop_through_the_admin_interface_and_cli() {
     let _ = cancel;
 }
 
+#[tokio::test]
+async fn standalone_client_local_control_reports_applied_tunnels() {
+    let edge = Edge::bind(
+        EdgeConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            proxy_bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        },
+        None,
+        Logger::silent(),
+    )
+    .await
+    .unwrap();
+    let edge_port = edge.local_addr().unwrap().port();
+    let stop_edge = CancellationToken::new();
+    tokio::spawn(edge.serve(stop_edge.clone()));
+    let local_port = echo().await;
+    let web_port = free_port();
+    let source = config(edge_port, web_port, local_port, "", "");
+    let fs = MemFs::new().with("frpc.toml", &source);
+    let dir = std::env::temp_dir().join(format!(
+        "rustfrp-standalone-control-{}",
+        rustfrp_core::auth::random_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let discovery = dir.join("control.json").to_string_lossy().into_owned();
+    let cancel = CancellationToken::new();
+    let run = {
+        let cancel = cancel.clone();
+        let fs = fs.clone();
+        let discovery = discovery.clone();
+        async move {
+            let mut options = options("frpc.toml");
+            options.local_control = Some(discovery);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let env = MapEnv::default();
+            app::execute(Command::Run(options), &fs, &env, &mut out, &mut err, cancel).await
+        }
+    };
+    let driver = {
+        let cancel = cancel.clone();
+        let fs = fs.clone();
+        let discovery = discovery.clone();
+        async move {
+            eventually(|| async { std::path::Path::new(&discovery).exists() }).await;
+            eventually(|| async {
+                let text = std::fs::read_to_string(&discovery).unwrap_or_default();
+                let d: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let port = d["port"].as_u64().unwrap_or_default() as u16;
+                let token = d["token"].as_str().unwrap_or_default();
+                if port == 0 || token.len() != 64 {
+                    return false;
+                }
+                let body = local_request(&d, "status").await;
+                body.contains("\"connected\":true") && body.contains("\"proxies\":1")
+            })
+            .await;
+            let d: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&discovery).unwrap()).unwrap();
+            let tunnels = local_request(&d, "tunnels").await;
+            assert!(tunnels.contains("first"), "{tunnels}");
+            fs.write_private(
+                "frpc.toml",
+                &config(
+                    edge_port,
+                    web_port,
+                    local_port,
+                    &format!("[[proxies]]\nname = \"second\"\ntype = \"tcp\"\nlocalPort = {local_port}\n"),
+                    "",
+                ),
+            )
+            .unwrap();
+            assert_eq!(http(web_port, "/api/reload", true).await.0, 200);
+            eventually(|| async { local_request(&d, "tunnels").await.contains("second") }).await;
+            assert!(local_request(&d, "status").await.contains("\"proxies\":2"));
+
+            // A rejected local-control summary must fail the reload before
+            // publishing an invalid tunnel list or changing active state.
+            fs.write_private(
+                "frpc.toml",
+                &format!(
+                    "serverAddr = '127.0.0.1'\nserverPort = {edge_port}\nwebServer.port = {web_port}\nwebServer.user = 'u'\nwebServer.password = 'p'\n[[proxies]]\nname = '{}'\ntype = 'tcp'\nlocalPort = {local_port}\n",
+                    "x".repeat(257)
+                ),
+            )
+            .unwrap();
+            let (code, body) = http(web_port, "/api/reload", true).await;
+            assert_eq!(code, 400, "{body}");
+            assert!(body.contains("exceeds capacity"), "{body}");
+            assert!(local_request(&d, "tunnels").await.contains("second"));
+            cancel.cancel();
+        }
+    };
+    let (code, ()) = tokio::join!(run, driver);
+    assert_eq!(code, 0);
+    stop_edge.cancel();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn command_line_parsing_and_basic_credentials() {
     let a = |args: &[&str]| {
@@ -342,6 +455,15 @@ async fn reload_is_refused_when_the_client_loop_is_gone() {
         stop: cancel.clone(),
     });
     tokio::spawn(admin::serve(l, a, cancel.clone()));
+    let mut incomplete = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    incomplete
+        .write_all(b"GET /api/status HTTP/1.1\r\nHost:")
+        .await
+        .unwrap();
+    incomplete.shutdown().await.unwrap();
+    let mut abandoned = Vec::new();
+    incomplete.read_to_end(&mut abandoned).await.unwrap();
+    assert!(abandoned.is_empty());
     let (code, body) = admin::request(&format!("127.0.0.1:{port}"), "/api/reload", "", "")
         .await
         .unwrap();

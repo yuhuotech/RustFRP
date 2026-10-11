@@ -5,14 +5,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app/app.dart';
 import 'core/desktop.dart';
+import 'core/desktop_lifecycle.dart';
 import 'core/fonts.dart';
+import 'core/notification_service.dart';
 import 'core/store.dart';
 
-Future<void> main() async {
+Future<void> main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
   await loadWebFonts();
-  await initDesktopWindow();
+  final startHidden = arguments.contains('--startup-to-tray');
+  await initDesktopWindow(showAtStartup: !startHidden);
   final prefs = await SharedPreferences.getInstance();
+  await DesktopAppLifecycle(prefs).initialize(startHidden: startHidden);
+  await DesktopNotificationService.instance.initialize();
   runApp(
     ProviderScope(
       // Live data is re-fetched by the periodic tick anyway; no hidden exponential retries.

@@ -1,5 +1,6 @@
 //! 运行配置（环境变量 + 默认值）。
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// 服务配置。
@@ -43,6 +44,8 @@ pub struct Config {
     pub subdomain_host: String,
     /// 审计保留天数；0 保留全部。
     pub audit_retention_days: i64,
+    /// 流量分钟桶保留天数；0 保留全部。
+    pub traffic_retention_days: i64,
     /// 每轮、每表清理上限。
     pub cleanup_batch: i64,
     /// 内置 Edge 的 PEM 证书链与私钥，必须成对配置。
@@ -74,6 +77,7 @@ impl Default for Config {
             vhost_https: None,
             subdomain_host: String::new(),
             audit_retention_days: 90,
+            traffic_retention_days: 7,
             cleanup_batch: 500,
             edge_tls_cert: None,
             edge_tls_key: None,
@@ -198,6 +202,12 @@ impl Config {
                 3650,
             ),
             (
+                "RUSTFRP_TRAFFIC_RETENTION_DAYS",
+                &mut c.traffic_retention_days,
+                0,
+                3650,
+            ),
+            (
                 "RUSTFRP_MAX_TUNNELS_PER_CLIENT",
                 &mut c.max_tunnels_per_client,
                 0,
@@ -217,6 +227,13 @@ impl Config {
                 }
                 *slot = n;
             }
+        }
+        if !loopback_http(&c.http_addr)
+            && (!c.secure_cookie || !c.public_url.starts_with("https://"))
+        {
+            return Err(
+                "non-loopback RUSTFRP_HTTP requires RUSTFRP_SECURE_COOKIE=true and an https:// RUSTFRP_PUBLIC_URL behind a TLS reverse proxy".into(),
+            );
         }
         Ok(c)
     }
@@ -263,6 +280,16 @@ impl Config {
     }
 }
 
+fn loopback_http(addr: &str) -> bool {
+    addr.parse::<SocketAddr>()
+        .map(|s| s.ip().is_loopback())
+        .unwrap_or_else(|_| {
+            addr.strip_prefix("localhost:").is_some()
+                || addr.starts_with("127.")
+                || addr.starts_with("[::1]:")
+        })
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
@@ -273,6 +300,7 @@ mod tests {
     fn retention_config_is_bounded() {
         let defaults = cfg(&[]).unwrap();
         assert_eq!(defaults.audit_retention_days, 90);
+        assert_eq!(defaults.traffic_retention_days, 7);
         assert_eq!(defaults.cleanup_batch, 500);
         assert_eq!(
             cfg(&[
@@ -286,11 +314,18 @@ mod tests {
         assert_eq!(
             cfg(&[
                 ("RUSTFRP_AUDIT_RETENTION_DAYS", "3650"),
+                ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "0"),
                 ("RUSTFRP_CLEANUP_BATCH", "1000")
             ])
             .unwrap()
             .cleanup_batch,
             1000
+        );
+        assert_eq!(
+            cfg(&[("RUSTFRP_TRAFFIC_RETENTION_DAYS", "3650")])
+                .unwrap()
+                .traffic_retention_days,
+            3650
         );
         for (key, value) in [
             ("RUSTFRP_AUDIT_RETENTION_DAYS", "bad"),
@@ -303,9 +338,24 @@ mod tests {
             ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "10001"),
             ("RUSTFRP_RESERVED_PORTS", "x"),
             ("RUSTFRP_CLEANUP_BATCH", "1001"),
+            ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "bad"),
+            ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "-1"),
+            ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "3651"),
         ] {
             assert!(cfg(&[(key, value)]).is_err());
         }
+    }
+
+    #[test]
+    fn public_management_listener_requires_secure_public_url() {
+        assert!(cfg(&[("RUSTFRP_HTTP", "0.0.0.0:8080")]).is_err());
+        assert!(cfg(&[
+            ("RUSTFRP_HTTP", "0.0.0.0:8080"),
+            ("RUSTFRP_SECURE_COOKIE", "true"),
+            ("RUSTFRP_PUBLIC_URL", "https://panel.example.test"),
+        ])
+        .is_ok());
+        assert!(cfg(&[("RUSTFRP_HTTP", "127.0.0.1:8080")]).is_ok());
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, String> {

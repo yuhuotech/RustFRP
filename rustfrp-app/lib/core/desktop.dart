@@ -22,7 +22,7 @@ bool get isDesktop =>
 bool _initialized = false;
 
 /// Hidden title bar, sensible minimum size. Desktop only; a no-op elsewhere.
-Future<void> initDesktopWindow() async {
+Future<void> initDesktopWindow({bool showAtStartup = true}) async {
   if (!isDesktop) return;
   await windowManager.ensureInitialized();
   await windowManager.waitUntilReadyToShow(
@@ -33,8 +33,10 @@ Future<void> initDesktopWindow() async {
       title: 'RustFRP',
     ),
     () async {
-      await windowManager.show();
-      await windowManager.focus();
+      if (showAtStartup) {
+        await windowManager.show();
+        await windowManager.focus();
+      }
     },
   );
   _initialized = true;

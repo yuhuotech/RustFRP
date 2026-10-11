@@ -301,6 +301,52 @@ class HealthCheck {
   );
 }
 
+@immutable
+class TunnelPluginSummary {
+  const TunnelPluginSummary({
+    required this.kind,
+    required this.crtSet,
+    required this.keySet,
+    required this.httpPasswordSet,
+    required this.passwordSet,
+    required this.enableHttp2,
+  });
+  final String kind;
+  final bool crtSet, keySet, httpPasswordSet, passwordSet;
+  final bool? enableHttp2;
+
+  factory TunnelPluginSummary.fromJson(Map<String, dynamic> m) =>
+      TunnelPluginSummary(
+        kind: _str(m['kind']),
+        crtSet: m['crt_set'] == true,
+        keySet: m['key_set'] == true,
+        httpPasswordSet: m['http_password_set'] == true,
+        passwordSet: m['password_set'] == true,
+        enableHttp2: m['enable_http2'] is bool
+            ? m['enable_http2'] as bool
+            : null,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is TunnelPluginSummary &&
+      other.kind == kind &&
+      other.crtSet == crtSet &&
+      other.keySet == keySet &&
+      other.httpPasswordSet == httpPasswordSet &&
+      other.passwordSet == passwordSet &&
+      other.enableHttp2 == enableHttp2;
+  @override
+  int get hashCode => Object.hash(
+    kind,
+    crtSet,
+    keySet,
+    httpPasswordSet,
+    passwordSet,
+    enableHttp2,
+  );
+}
+
 class Tunnel {
   const Tunnel({
     required this.id,
@@ -331,6 +377,7 @@ class Tunnel {
     this.lbGroup = '',
     this.lbGroupKeySet = false,
     this.healthCheck,
+    this.plugin,
   });
 
   /// 负载均衡组名（同组隧道共用端口 / 域名，连接在健康成员间轮转）；空 = 不入组。
@@ -339,6 +386,7 @@ class Tunnel {
   /// 是否设置了组密钥（密钥本身不由服务器返回）。
   final bool lbGroupKeySet;
   final HealthCheck? healthCheck;
+  final TunnelPluginSummary? plugin;
 
   /// PROXY protocol 版本：0 = 不写，1 / 2 = v1 / v2。
   final int proxyProtocol;
@@ -426,6 +474,9 @@ class Tunnel {
             if (e.key is String && e.value is String)
               e.key as String: e.value as String,
       },
+      plugin: m['plugin'] is Map<String, dynamic>
+          ? TunnelPluginSummary.fromJson(m['plugin'] as Map<String, dynamic>)
+          : null,
     );
   }
 
@@ -459,7 +510,8 @@ class Tunnel {
       other.lbGroupKeySet == lbGroupKeySet &&
       other.healthCheck == healthCheck &&
       mapEquals(other.requestHeaders, requestHeaders) &&
-      mapEquals(other.responseHeaders, responseHeaders);
+      mapEquals(other.responseHeaders, responseHeaders) &&
+      other.plugin == plugin;
   @override
   int get hashCode => Object.hashAll([
     id,
@@ -490,6 +542,7 @@ class Tunnel {
     healthCheck,
     ...requestHeaders.entries.map((e) => Object.hash(e.key, e.value)),
     ...responseHeaders.entries.map((e) => Object.hash('r', e.key, e.value)),
+    plugin,
   ]);
 }
 

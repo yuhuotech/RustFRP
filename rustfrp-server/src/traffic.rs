@@ -56,22 +56,6 @@ pub fn persist(
         tx.execute("INSERT INTO traffic_minutes VALUES (?1,?2,?3,?4,?5,?6,1,?7) ON CONFLICT(tunnel_id,minute) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,connections_total=connections_total+excluded.connections_total,connections_peak=max(connections_peak,excluded.connections_peak),samples=samples+1,gap=max(gap,excluded.gap)", params![sample.name,now/MINUTE*MINUTE,incoming-bi,outgoing-bo,total-ct,connections,gap])?;
         tx.execute("INSERT INTO traffic_cursors VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(epoch,tunnel_id,generation) DO UPDATE SET sampled_at=excluded.sampled_at,bytes_in=excluded.bytes_in,bytes_out=excluded.bytes_out,connections_total=excluded.connections_total",params![epoch,sample.name,g,now,incoming,outgoing,total])?;
     }
-    let cutoff = now.saturating_sub(7 * crate::maintenance::DAY_MS);
-    let minutes = tx.execute("DELETE FROM traffic_minutes WHERE (tunnel_id,minute) IN (SELECT tunnel_id,minute FROM traffic_minutes WHERE minute < ?1 ORDER BY minute,tunnel_id LIMIT 2048)",[cutoff])?;
-    let cursors = tx.execute("DELETE FROM traffic_cursors WHERE (epoch,tunnel_id,generation) IN (SELECT epoch,tunnel_id,generation FROM traffic_cursors WHERE sampled_at < ?1 ORDER BY sampled_at LIMIT 2048)",[cutoff])?;
-    if minutes + cursors > 0 {
-        store::audit(
-            &tx,
-            "system",
-            "maintenance.traffic",
-            "database",
-            "",
-            &format!("traffic retention: 7 days; minutes={minutes}, cursors={cursors}"),
-            "ok",
-            "",
-            now,
-        )?;
-    }
     tx.commit()?;
     Ok(())
 }
@@ -349,7 +333,7 @@ mod tests {
             1
         );
         c.execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
-        assert!(persist(&mut c, "e", boundary + 1, &[]).is_err());
+        assert!(crate::maintenance::purge(&mut c, boundary + 1, 90, 7, 2,).is_err());
         assert_eq!(
             c.query_row("SELECT count(*) FROM traffic_cursors", [], |r| r
                 .get::<_, i64>(0))
@@ -357,7 +341,8 @@ mod tests {
             1
         );
         c.execute_batch("DROP TRIGGER fail_audit").unwrap();
-        persist(&mut c, "e", boundary + 1, &[]).unwrap();
+        let purged = crate::maintenance::purge(&mut c, boundary + 1, 90, 7, 2).unwrap();
+        assert_eq!((purged.traffic_minutes, purged.traffic_cursors), (1, 1));
         assert_eq!(
             c.query_row("SELECT count(*) FROM traffic_minutes", [], |r| r
                 .get::<_, i64>(0))
@@ -366,7 +351,7 @@ mod tests {
         );
         assert_eq!(
             crate::store::list_audit(&c, 10, None).unwrap()[0].action,
-            "maintenance.traffic"
+            "maintenance.purge"
         );
         let mut big = sample("max", 0, 0);
         big.traffic.bytes_in = i64::MAX as u64;

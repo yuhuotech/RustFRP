@@ -67,6 +67,36 @@ pub fn update_tunnels(
     Ok(())
 }
 
+/// 为独立 frpc 配置建立本机只读隧道摘要；不包含密码、令牌或证书私钥。
+pub fn update_standalone_tunnels(
+    status: &SharedStatus,
+    list: &TunnelList,
+    proxies: &[crate::client::ProxyCfg],
+) -> Result<(), &'static str> {
+    if proxies.len() > 1024
+        || proxies
+            .iter()
+            .any(|p| p.name.len() > 256 || p.kind.len() > 256 || p.local_ip.len() > 256)
+    {
+        return Err("standalone tunnel summary exceeds capacity");
+    }
+    let items = proxies
+        .iter()
+        .map(|p| LocalTunnel {
+            id: p.name.clone(),
+            kind: p.kind.clone(),
+            local_ip: p.local_ip.clone(),
+            local_port: p.local_port,
+            remote_port: p.remote_port,
+        })
+        .collect::<Vec<_>>();
+    *list.lock().unwrap_or_else(PoisonError::into_inner) = (1, items);
+    let mut current = status.lock().unwrap_or_else(PoisonError::into_inner);
+    current.revision = 1;
+    current.proxies = proxies.len();
+    Ok(())
+}
+
 /// 共享状态只保存几个标量，不缓存配置或日志。
 pub type SharedStatus = Arc<Mutex<Status>>;
 
@@ -79,6 +109,7 @@ pub fn apply(status: &SharedStatus, event: &Event) {
             s.revision = *revision;
             s.proxies = *proxies;
         }
+        Event::ProxyStarted { .. } => {}
         Event::Disconnected(_) => {
             s.connected = false;
             s.proxies = 0;
@@ -121,6 +152,9 @@ pub struct LocalControl {
 impl LocalControl {
     /// 创建私有发现文件。已有端口仍在监听或绑定其他 Controller 时拒绝启动。
     pub async fn bind(path: &str, controller: &str) -> io::Result<Self> {
+        if path.is_empty() || path.len() > 1024 || controller.len() > 1024 {
+            return Err(io::Error::other("local control identity is too long"));
+        }
         let old = match tokio::fs::File::open(path).await {
             Ok(file) => {
                 let mut bytes = Vec::new();
@@ -351,6 +385,7 @@ mod tests {
         }
         assert!(LocalControl::bind(&p, "host:7000").await.is_err());
         assert!(LocalControl::bind(&p, "other:7000").await.is_err());
+        assert!(LocalControl::bind(&p, &"x".repeat(1025)).await.is_err());
         control.logs.push("test log");
         update_tunnels(
             &control.tunnels,
@@ -529,5 +564,42 @@ mod tests {
         assert_eq!(list.lock().unwrap().0, 7);
         update_tunnels(&list, &ConfigSet::default()).unwrap();
         assert!(list.lock().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn standalone_tunnel_summary_excludes_plugin_credentials() {
+        let status = Arc::new(Mutex::new(Status {
+            version: 1,
+            pid: 123,
+            ..Default::default()
+        }));
+        let list = Arc::new(Mutex::new((0, Vec::new())));
+        let proxy = crate::client::ProxyCfg {
+            name: "local-socks".into(),
+            kind: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 1080,
+            remote_port: 6080,
+            plugin: Some(crate::plugin::PluginCfg {
+                kind: "socks5".into(),
+                username: "alice".into(),
+                password: "never-in-summary".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        update_standalone_tunnels(&status, &list, std::slice::from_ref(&proxy)).unwrap();
+        let state = status.lock().unwrap().clone();
+        assert_eq!((state.revision, state.proxies), (1, 1));
+        let snapshot = serde_json::to_string(&list.lock().unwrap().1).unwrap();
+        assert!(snapshot.contains("local-socks"));
+        assert!(!snapshot.contains("never-in-summary"));
+        assert!(update_standalone_tunnels(&status, &list, &vec![proxy; 1025]).is_err());
+        let oversized = crate::client::ProxyCfg {
+            name: "x".repeat(257),
+            ..Default::default()
+        };
+        assert!(update_standalone_tunnels(&status, &list, &[oversized]).is_err());
+        assert_eq!(list.lock().unwrap().1.len(), 1);
     }
 }

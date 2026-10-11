@@ -264,7 +264,7 @@ flowchart TB
 - 仅监听 `127.0.0.1:<随机端口>`，采用有界、带本地令牌的 JSON 控制请求（非 HTTP，浏览器不能直接调用）。协议与共享 fixture 见 `rustfrp-protocol/LOCAL_CONTROL.md`。
 - macOS 首次用令牌接入并保存身份，然后交给 `launchd bootstrap gui/<uid>`；服务定义放在用户状态目录，**不含接入令牌**。Linux / Windows 使用独立后台进程，尚需实机验收。
 - 关闭窗口只关闭界面，重开恢复原进程的状态；仅显式「停止」发出带本地令牌的停止请求，不通过 PID 强杀。
-- 当前实现为受管本机连接、状态与启停。系统开机启动、托盘、本地 frp 配置编辑、日志页、应用更新和安装包仍待后续阶段完成；目前不向系统登录启动目录写入服务定义。
+- 当前实现覆盖受管与独立本机入口、随包 Agent、本机隧道/状态/日志/诊断、托盘、关闭到托盘、用户级开机启动和连接通知。完整 frp 配置编辑、CA-07 更新器及三平台真实安装验收仍待完成。
 - 设计增量内存：仅在显式 `--local-control` 时分配监听器、几个状态标量和约 2 KiB 请求缓冲；请求串行处理，读写 2 秒超时，无额外 per-connection 线程或无界容器。
 
 ### 3.4 Flutter 平台差异隔离
@@ -285,7 +285,8 @@ core/platform/
 | 管理会话 | Bearer（短期 access + 可轮换 refresh） | Cookie + `X-CSRF-Token` + 同源 Origin 校验 |
 | 实时事件 | WebSocket | WebSocket（同源，Origin 校验天然通过） |
 | 本机 agent | ✅ | ❌（隐藏入口） |
-| 托盘 / 开机启动 / 更新 / 窗口控制 | ✅ | ❌（隐藏） |
+| 托盘 / 开机启动 / 窗口控制 | ✅ | ❌（隐藏） |
+| 应用内更新（CA-07） | ❌（更新器未实现） | ❌（隐藏） |
 | 多标签页 | — | Web Locks 互斥，非活动标签页只读提示（沿用 linkory） |
 | 构建 | `flutter build macos|linux|windows` | `flutter build web --release --wasm`，**CanvasKit 随包、不依赖外部 CDN**，内置中文字体 |
 
@@ -635,7 +636,7 @@ Controller 先发 `Challenge{nonce}`，节点用身份密钥签名应答 `Hello`
 - `https`：只解析 TLS ClientHello 的 SNI，**不解密**，按 SNI 选隧道后原样转发。
 - 同端口复用：80/443 可与其它 TCP 隧道分流（P1）。
 
-**实现补充（http 逐请求路由）**：`rustfrp-core::http1` 用 `httparse` 严格解析请求头（拒绝 Content-Length 与 Transfer-Encoding 并存、冲突的 Content-Length、重复 Host、非 chunked 结尾的 TE、CONNECT），`ChunkedScanner` 只数边界不缓冲正文，因此**保持连接上的每个请求都独立选路与鉴权**：同域名下按「最长路径前缀 → 与请求 Basic 用户名一致的 `routeByHTTPUser` → 未限定用户」选路（同 frp），Basic Auth 在 Edge 校验（定时无关比较），`requestHeaders.set` / Host 改写只作用于头部。一个访问者连接最多同时连 8 条后端流（不同路由各一条）；切换后端前，`ResponseTracker` 观察上一条后端的响应并等它完整送完，保证流水线请求的响应顺序；无法判定边界（协议升级、畸形响应）时关闭连接而不是冒险乱序。`Upgrade`（WebSocket）在头之后转为原样透传。尚未实现 `responseHeaders` 与 PROXY protocol。
+**实现补充（HTTP/HTTPS 逐请求路由）**：`rustfrp-core::http1` 用 `httparse` 严格解析请求头（拒绝 Content-Length 与 Transfer-Encoding 并存、冲突的 Content-Length、重复 Host、非 chunked 结尾的 TE、CONNECT），`ChunkedScanner` 只数边界不缓冲正文，因此保持连接上的每个请求都独立选路与鉴权：同域名下按「最长路径前缀 → 与请求 Basic 用户名一致的 `routeByHTTPUser` → 未限定用户」选路（同 frp），Basic Auth 在 Edge 校验（定时无关比较），Host 改写与 `requestHeaders.set` 只作用于头部。一个访问者连接最多同时连 8 条后端流（不同路由各一条）；切换后端前，`ResponseTracker` 等上一条响应完整送完，保持流水线顺序；无法判定边界时关闭连接。`Upgrade` 在头后原样透传。`responseHeaders.set` 会改写每个最终响应且拒绝分帧头；PROXY protocol v1/v2、限速、HTTP/HTTPS 健康检查和负载均衡也已接入。当前 V1.0 剩余项见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。
 
 ---
 
@@ -703,20 +704,20 @@ Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用 Flutter 静
 接入命令的 POSIX 参数使用单引号转义，Windows 返回可直接粘贴到 PowerShell 的表达式，保留设备名中的引号、中文及特殊字符。
 脚本按系统/架构选择 `/downloads/` 下的原始 agent，通过 HTTPS 下载并校验对应 SHA256 文件，失败保留旧 agent。
 下载目录由外部静态服务器托管，避免管理 API 整包读取发布二进制。
-当前仅提供用户级安装与前台接入，尚未注册托盘、开机启动或系统服务；发布签名验证、平台发布产物与官网仍待开发。
+当前桌面实现包含托盘、用户级开机启动和通知；Agent 的 systemd/launchd/Windows 任务计划服务命令也已实现。多平台 Release workflow、静态官网和部署模板已加入，但尚未运行真实 Release 或部署官网。签名/公证依赖未配置的 CI 凭据；安装器/更新器尚未固定并校验可信公钥，CA-07 应用更新器和正式安全审计报告仍缺。
 目录约定、验证命令与增量内存评估见 [installer/README.md](../installer/README.md)。
 
 
 ### 本轮验收记录
 
 宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；颜色与字号 token 无变更。
-Flutter 89 项测试、覆盖率门槛、Web 同源构建、macOS release 构建与真实字体截图通过。
+Flutter 132 项测试通过；2026-10-12 最终 Rust/Flutter 覆盖率和 Web 同源构建结果见 [HANDOFF.md](HANDOFF.md)。macOS ARM64 Release `.app` 已构建；托盘、自启动、通知及 Linux/Windows 后台进程仍需真实目标主机验收。
 macOS 隔离实例实测：首次接入错误提示、有效接入、停止、复用身份启动、菜单收起、重开保留折叠与原 PID、窗口完全退出后真实 TCP 隧道继续回显；最后通过本地控制接口停止并清理临时 launchd 任务。
-Rust 全仓测试、fmt / clippy、覆盖率与全链路冒烟通过。正常数据面的内存基准空载约 4.31 MB，100 连接约 6.12–6.23 MB；本机控制开启、承载单条 TCP 隧道的 agent RSS 实测约 4.34 MB。
+Rust 全仓测试、fmt / clippy、覆盖率与全链路冒烟通过。2026-10-12 `make bench-mem`（10 条隧道）100 条空闲连接 Edge / Client 为 6.78 / 7.12 MiB，20 次 512 KiB 回显后为 7.12 / 7.69 MiB，连接关闭后为 7.14 / 7.70 MiB；均低于 10 MiB 上限。
 
 菜单顶部品牌区：logo 22px、名称使用常规 13px；桌面顶部留 44px，Web 留 24px。收起时整行隐藏品牌图形与名称，只显示水平居中的展开按钮。
 
 
 ## 运维增量：在线备份与有界清理
 
-2026-10-11 完成 `rustfrp-server backup <new-file>`、只读源库快照、私有权限/不覆盖/原子发布、schema v3 到期索引及逐表有界清理；删除与系统审计同事务，审计失败回滚。配置与恢复流程见 [BACKUP_AND_RETENTION.md](BACKUP_AND_RETENTION.md)，全项目差距和下一阶段见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。流量桶保留仍未实现，不将 SV-11 全部标记完成。
+2026-10-11 完成 `rustfrp-server backup <new-file>`、只读源库快照、私有权限/不覆盖/原子发布、schema v3 到期索引及逐表有界清理；删除与系统审计同事务，审计失败回滚。2026-10-12 补入可配置的审计与流量保留周期，分别默认为 90 天和 7 天，0 表示永久保留。配置与恢复流程见 [BACKUP_AND_RETENTION.md](BACKUP_AND_RETENTION.md)，全项目差距和下一阶段见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。

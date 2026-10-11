@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -437,6 +439,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
             .join('\n') ??
         '',
   );
+  final _pluginJson = TextEditingController();
   bool _clearPassword = false;
   late int _proxyProtocol = widget.existing?.proxyProtocol ?? 0;
   late final _bandwidth = TextEditingController(
@@ -545,6 +548,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       _routeUser,
       _headers,
       _respHeaders,
+      _pluginJson,
       _bandwidth,
       _lbGroup,
       _lbKey,
@@ -601,9 +605,24 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       (_locationList.every((l) => l.startsWith('/')) &&
           _headerMap != null &&
           _respHeaderMap != null);
+  Map<String, dynamic>? get _pluginOptions {
+    final raw = _pluginJson.text.trim();
+    if (raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  bool get _pluginValid =>
+      _pluginJson.text.trim().isEmpty ||
+      (((_kind == 'tcp' || _kind == 'http') && _pluginOptions != null));
   bool get _valid =>
       _client != null &&
       _httpValid &&
+      _pluginValid &&
       (_datagram ||
           (_bandwidthBps != null && (!_balanced || _health != _badHealth))) &&
       _name.text.trim().isNotEmpty &&
@@ -642,6 +661,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           lbGroup: _balanced ? _lbGroup.text.trim() : '',
           lbGroupKey: _balanced ? _lbKey.text : '',
           healthCheck: _balanced ? _health : null,
+          plugin: _pluginOptions,
           reason: '通过面板创建隧道',
         );
       } else {
@@ -678,6 +698,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           healthCheck: !_balanced
               ? null
               : (_health ?? const HealthCheck(kind: '')),
+          plugin: _pluginOptions,
           reason: '通过面板修改隧道',
         );
       }
@@ -798,6 +819,33 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               ),
             ],
           ),
+          if (_kind == 'tcp' || _kind == 'http') ...[
+            const SizedBox(height: 12),
+            label('本地插件（可选 JSON）'),
+            if (widget.existing?.plugin != null)
+              Text(
+                '当前已配置 ${widget.existing!.plugin!.kind}。留空保留原配置；填写 {} 可清除，填写完整 JSON 可替换。',
+                style: Type.caption.copyWith(color: c.text3),
+              )
+            else
+              Text(
+                '支持 socks5、http_proxy、static_file、unix_domain_socket、http2https、https2http、https2https、tls2raw。',
+                style: Type.caption.copyWith(color: c.text3),
+              ),
+            const SizedBox(height: 6),
+            LTextField(
+              key: const Key('tunnel-plugin-json'),
+              controller: _pluginJson,
+              hint: '{"kind":"static_file","local_path":"/srv/www"}',
+              maxLines: 5,
+              onChanged: (_) => setState(() {}),
+            ),
+            if (!_pluginValid)
+              Text(
+                '插件 JSON 无效，且插件只支持 TCP 与 HTTP 隧道。',
+                style: Type.caption.copyWith(color: c.dangerText),
+              ),
+          ],
           if (_balanced) ...[
             const SizedBox(height: 12),
             label('PROXY protocol（把访问者真实地址告诉内网服务，服务端需支持）'),

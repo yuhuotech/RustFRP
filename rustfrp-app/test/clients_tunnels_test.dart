@@ -187,6 +187,42 @@ void main() {
     expect(find.byTooltip('无法连接控制器'), findsOneWidget);
   });
 
+  testWidgets('client config import previews changes before applying', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final c = s.addClient('nas');
+    await Harness.create(tester, s);
+    await openClients(tester);
+    await tester.tap(find.byKey(Key('client-row-${c['id']}')));
+    await settle(tester);
+    await tapKey(tester, 'client-config-import');
+    await tester.enterText(
+      find.byKey(const Key('config-import-text')),
+      '[[proxies]]\nname="ssh"\ntype="tcp"',
+    );
+    await tapKey(tester, 'config-import-preview');
+    await settle(tester, 10);
+    expect(find.text('将应用 1 条隧道'), findsOneWidget);
+    expect(find.textContaining('兼容提示'), findsOneWidget);
+    final apply = find.byKey(const Key('config-import-apply'));
+    expect(tester.widget<LButton>(apply).onPressed, isNull);
+    await tester.enterText(
+      find.byKey(const Key('config-import-reason')),
+      '按批准的配置迁移',
+    );
+    await tester.tap(find.byKey(const Key('config-import-ack')));
+    await settle(tester);
+    expect(tester.widget<LButton>(apply).onPressed, isNotNull);
+    await tester.tap(apply);
+    await settle(tester, 10);
+    expect(s.configImports, hasLength(1));
+    expect(find.text('配置已导入'), findsOneWidget);
+    expect(s.configImports.single['digest'], 'preview-digest');
+    expect(s.configImports.single['accept_warnings'], true);
+    expect(s.configImports.single['reason'], '按批准的配置迁移');
+  });
+
   testWidgets('tunnels page: list, filter, toggle, edit, delete', (
     tester,
   ) async {

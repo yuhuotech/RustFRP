@@ -46,7 +46,7 @@ async fn wal_snapshot_is_consistent_private_and_never_overwrites() {
     assert_eq!(names, ["root"]);
     assert_eq!(audits, 1);
     assert_eq!(integrity, "ok");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -147,7 +147,7 @@ async fn retention_is_bounded_keeps_boundaries_and_audits_in_same_transaction() 
     .await
     .unwrap();
     let n = db
-        .call(move |c| maintenance::purge(c, now, 1, 2))
+        .call(move |c| maintenance::purge(c, now, 1, 0, 2))
         .await
         .unwrap();
     assert_eq!(
@@ -157,6 +157,8 @@ async fn retention_is_bounded_keeps_boundaries_and_audits_in_same_transaction() 
             tokens: 2,
             audits: 2,
             api_tokens: 0,
+            traffic_minutes: 0,
+            traffic_cursors: 0,
         }
     );
     assert_eq!(
@@ -169,7 +171,7 @@ async fn retention_is_bounded_keeps_boundaries_and_audits_in_same_transaction() 
         1
     );
     for _ in 0..3 {
-        db.call(move |c| maintenance::purge(c, now, 1, 2))
+        db.call(move |c| maintenance::purge(c, now, 1, 0, 2))
             .await
             .unwrap();
     }
@@ -182,13 +184,13 @@ async fn retention_is_bounded_keeps_boundaries_and_audits_in_same_transaction() 
         .await
         .is_ok());
     let remaining = db
-        .call(move |c| maintenance::purge(c, now, 0, 2))
+        .call(move |c| maintenance::purge(c, now, 0, 0, 2))
         .await
         .unwrap();
     assert_eq!(remaining, maintenance::Purged::default());
     for (days, batch) in [(-1, 2), (3651, 2), (1, 0), (1, 1001)] {
         assert!(db
-            .call(move |c| maintenance::purge(c, now, days, batch))
+            .call(move |c| maintenance::purge(c, now, days, 0, batch))
             .await
             .is_err());
     }
@@ -206,7 +208,7 @@ async fn failed_audit_rolls_back_session_deletion_and_disabled_retention_keeps_h
     .await
     .unwrap();
     let n = db
-        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 0, 2))
+        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 0, 0, 2))
         .await
         .unwrap();
     assert_eq!(n.sessions, 1);
@@ -220,7 +222,7 @@ async fn failed_audit_rolls_back_session_deletion_and_disabled_retention_keeps_h
     .await
     .unwrap();
     assert!(db
-        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 1, 2))
+        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 1, 0, 2))
         .await
         .is_err());
     assert_eq!(
@@ -264,6 +266,7 @@ async fn maintenance_timer_runs_and_cancellation_stops_future_batches() {
     let run = tokio::spawn(maintenance::run(
         db.clone(),
         90,
+        7,
         2,
         Duration::from_millis(5),
         cancel.clone(),
@@ -300,6 +303,7 @@ async fn maintenance_timer_runs_and_cancellation_stops_future_batches() {
     let run = tokio::spawn(maintenance::run(
         db,
         -1,
+        7,
         2,
         Duration::from_millis(5),
         cancel.clone(),
@@ -383,7 +387,7 @@ async fn audit_insert_failure_rolls_back_every_retention_delete() {
         Ok(())
     }).await.unwrap();
     assert!(db
-        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 1, 500))
+        .call(|c| maintenance::purge(c, 10 * maintenance::DAY_MS, 1, 0, 500))
         .await
         .is_err());
     let counts = db
@@ -426,9 +430,15 @@ async fn automation_token_retention_is_bounded_and_audited() {
     })
     .await
     .unwrap();
-    let first = db.call(|c| maintenance::purge(c, 100, 0, 2)).await.unwrap();
+    let first = db
+        .call(|c| maintenance::purge(c, 100, 0, 0, 2))
+        .await
+        .unwrap();
     assert_eq!(first.api_tokens, 2);
-    let second = db.call(|c| maintenance::purge(c, 100, 0, 2)).await.unwrap();
+    let second = db
+        .call(|c| maintenance::purge(c, 100, 0, 0, 2))
+        .await
+        .unwrap();
     assert_eq!(second.api_tokens, 2);
     assert_eq!(
         db.call(

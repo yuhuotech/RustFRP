@@ -219,7 +219,11 @@ pub async fn start(mut cfg: Config, log: Logger) -> Result<Server, String> {
         log.clone(),
     )));
 
-    let retention = (cfg.audit_retention_days, cfg.cleanup_batch);
+    let retention = (
+        cfg.audit_retention_days,
+        cfg.traffic_retention_days,
+        cfg.cleanup_batch,
+    );
     let state = AppState {
         db: db.clone(),
         hub: hub.clone(),
@@ -241,6 +245,7 @@ pub async fn start(mut cfg: Config, log: Logger) -> Result<Server, String> {
         db.clone(),
         retention.0,
         retention.1,
+        retention.2,
         Duration::from_secs(60),
         cancel.clone(),
         log.clone(),

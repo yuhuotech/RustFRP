@@ -13,16 +13,46 @@ pub const LINE_BYTES: usize = 512;
 
 /// 有界内存日志，不保存流量载荷。
 #[derive(Default)]
-pub struct LogRing(Mutex<VecDeque<String>>);
+struct State {
+    cursor: u64,
+    lines: VecDeque<Entry>,
+}
+
+struct Entry {
+    cursor: u64,
+    line: String,
+}
+
+#[derive(Default)]
+pub struct LogRing(Mutex<State>);
 impl LogRing {
     /// 取一份最多 64 KiB 的快照。
     pub fn snapshot(&self) -> Vec<String> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .lines
             .iter()
-            .cloned()
+            .map(|entry| entry.line.clone())
             .collect()
+    }
+
+    /// 返回给定游标之后的新日志；`gap` 表示游标失效或旧日志已被环形缓冲淘汰。
+    pub fn snapshot_after(&self, after: u64) -> (u64, bool, Vec<String>) {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let oldest = state
+            .lines
+            .front()
+            .map_or(state.cursor.saturating_add(1), |entry| entry.cursor);
+        let gap = after > state.cursor || after.saturating_add(1) < oldest;
+        let start = after.min(state.cursor);
+        let lines = state
+            .lines
+            .iter()
+            .filter(|entry| entry.cursor > start)
+            .map(|entry| entry.line.clone())
+            .collect();
+        (state.cursor, gap, lines)
     }
     pub(crate) fn push(&self, line: &str) {
         // 检查原始文本但不复制整条消息：日志调用方可能传入很长的错误。
@@ -52,11 +82,16 @@ impl LogRing {
             .get(..end)
             .unwrap_or_default()
             .replace(['\r', '\n'], " ");
-        let mut lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if lines.len() == CAPACITY {
-            lines.pop_front();
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.lines.len() == CAPACITY {
+            state.lines.pop_front();
         }
-        lines.push_back(bounded);
+        state.cursor = state.cursor.saturating_add(1);
+        let cursor = state.cursor;
+        state.lines.push_back(Entry {
+            cursor,
+            line: bounded,
+        });
     }
 }
 #[cfg(test)]
@@ -98,5 +133,25 @@ mod tests {
         assert_eq!(ring.snapshot().last().unwrap(), "hello world");
         logger.error("logged");
         assert_eq!(ring.snapshot().last().unwrap(), "logged");
+    }
+
+    #[test]
+    fn tail_cursor_returns_only_new_lines_and_signals_eviction() {
+        let ring = LogRing::default();
+        ring.push("first");
+        let (cursor, gap, first) = ring.snapshot_after(0);
+        assert_eq!((cursor, gap, first), (1, false, vec!["first".to_string()]));
+        ring.push("second");
+        assert_eq!(
+            ring.snapshot_after(cursor),
+            (2, false, vec!["second".into()])
+        );
+        assert!(ring.snapshot_after(99).1);
+        for n in 0..CAPACITY {
+            ring.push(&n.to_string());
+        }
+        let (_, gap, items) = ring.snapshot_after(cursor);
+        assert!(gap);
+        assert_eq!(items.len(), CAPACITY);
     }
 }

@@ -180,3 +180,83 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn delayed_request_body_is_forwarded_and_counted() {
+        let (mut visitor, mut inbound) = duplex(1024);
+        let (mut outbound, mut backend) = duplex(1024);
+        let cfg = PluginCfg {
+            kind: "https2http".into(),
+            ..Default::default()
+        };
+        let traffic = Arc::new(Traffic::default());
+        let observed = traffic.snapshot();
+        assert_eq!(observed.bytes_in, 0);
+
+        let request_traffic = traffic.clone();
+        let request_task = tokio::spawn(async move {
+            requests(&mut inbound, &mut outbound, &cfg, &request_traffic).await
+        });
+        let head = b"POST /upload HTTP/1.1\r\nHost: local\r\nContent-Length: 6\r\n\r\n";
+        visitor.write_all(head).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        visitor.write_all(b"abcdef").await.unwrap();
+        visitor.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        backend.read_to_end(&mut received).await.unwrap();
+        request_task.await.unwrap().unwrap();
+        assert_eq!(received, [head.as_slice(), b"abcdef"].concat());
+        assert_eq!(traffic.snapshot().bytes_in, (head.len() + 6) as u64);
+    }
+
+    #[tokio::test]
+    async fn tls2raw_relays_and_counts_both_directions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut incoming = Vec::new();
+            stream.read_to_end(&mut incoming).await.unwrap();
+            assert_eq!(incoming, b"raw request");
+            stream.write_all(b"backend response").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let cfg = PluginCfg {
+            kind: "tls2raw".into(),
+            local_addr: address.to_string(),
+            ..Default::default()
+        };
+        let traffic = Arc::new(Traffic::default());
+        let relay_traffic = traffic.clone();
+        let (mut visitor, relay) = duplex(1024);
+        let task = tokio::spawn(async move {
+            serve(
+                relay,
+                &cfg,
+                None,
+                None,
+                &relay_traffic,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        visitor.write_all(b"raw request").await.unwrap();
+        visitor.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        visitor.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"backend response");
+        task.await.unwrap().unwrap();
+        backend.await.unwrap();
+        let counts = traffic.snapshot();
+        assert_eq!(counts.bytes_in, b"raw request".len() as u64);
+        assert_eq!(counts.bytes_out, b"backend response".len() as u64);
+    }
+}

@@ -224,6 +224,16 @@ void main() {
       reason: 'r',
     );
     expect((t.name, t.remotePort), ('ssh', 6000));
+    const plugin = {'kind': 'socks5', 'username': 'alice', 'password': 's'};
+    await api.createTunnel(
+      clientId: id,
+      name: 'socks',
+      localPort: 1080,
+      remotePort: 6002,
+      plugin: plugin,
+      reason: 'r',
+    );
+    expect((jsonDecode(server.requests.last.body) as Map)['plugin'], plugin);
     final upd = await api.patchTunnel(
       t.id,
       name: 'ssh2',
@@ -241,6 +251,15 @@ void main() {
     expect(jsonDecode(server.requests.last.body), {
       'enabled': true,
       'reason': 'r',
+    });
+
+    await api.patchTunnel(
+      t.id,
+      plugin: const {'kind': ''},
+      reason: 'remove plugin',
+    );
+    expect((jsonDecode(server.requests.last.body) as Map)['plugin'], {
+      'kind': '',
     });
 
     await api.deleteTunnel(t.id, reason: 'bye');
@@ -302,4 +321,47 @@ void main() {
   test('close releases the underlying client', () {
     api.close();
   });
+
+  test(
+    'config import requires preview digest, warning acknowledgement and reason',
+    () async {
+      await login();
+      final client = server.addClient('config-target');
+      const text = '[[proxies]]\nname="ssh"\ntype="tcp"';
+      final preview = await api.previewConfigImport(
+        client['id']! as String,
+        text,
+      );
+      expect(preview['digest'], 'preview-digest');
+      expect(jsonDecode(server.requests.last.body), {'text': text});
+      await api.importConfig(
+        client['id']! as String,
+        text: text,
+        digest: preview['digest']! as String,
+        reason: 'move ssh tunnel',
+      );
+      expect(jsonDecode(server.requests.last.body), {
+        'text': text,
+        'digest': 'preview-digest',
+        'accept_warnings': true,
+        'reason': 'move ssh tunnel',
+      });
+      expect(
+        await api.exportConfig(client['id']! as String),
+        server.exportedConfig,
+      );
+    },
+  );
+
+  test(
+    'controller log polling requests only entries after its cursor',
+    () async {
+      await login();
+      server.controllerLogs = ['one'];
+      expect(await api.controllerLogs(), ['one']);
+      server.controllerLogs.add('two');
+      expect(await api.controllerLogs(), ['one', 'two']);
+      expect(server.requests.last.url.queryParameters['after'], '1');
+    },
+  );
 }

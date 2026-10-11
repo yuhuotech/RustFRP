@@ -48,11 +48,6 @@ fn load(text: &str) -> Result<frpcfg::LoadedClient, StoreError> {
         },
     )
     .map_err(invalid)?;
-    if !loaded.source.includes.is_empty() || loaded.source.auth.token_source.is_some() {
-        return Err(invalid(
-            "includes and tokenSource are not allowed in managed import",
-        ));
-    }
     if loaded.source.proxies.len() > 100 {
         return Err(invalid("import maximum 100 proxies"));
     }
@@ -61,7 +56,33 @@ fn load(text: &str) -> Result<frpcfg::LoadedClient, StoreError> {
     Ok(loaded)
 }
 fn supported(p: &Proxy) -> bool {
-    ["tcp", "udp", "http", "https"].contains(&p.kind.as_str()) && p.plugin.is_none()
+    ["tcp", "udp", "http", "https"].contains(&p.kind.as_str())
+        && p.plugin.as_ref().is_none_or(plugin_supported)
+}
+fn plugin_supported(p: &rustfrp_core::frpcfg::Plugin) -> bool {
+    rustfrp_agent::plugin::KINDS.contains(&p.kind.as_str())
+}
+fn plugin_opts(p: &Proxy) -> Option<rustfrp_core::wire::PluginOpts> {
+    let x = p.plugin.as_ref().filter(|x| !x.kind.is_empty())?;
+    if !plugin_supported(x) {
+        return None;
+    }
+    Some(rustfrp_core::wire::PluginOpts {
+        kind: x.kind.clone(),
+        local_addr: x.local_addr.clone(),
+        unix_path: x.unix_path.clone(),
+        host_header_rewrite: x.host_header_rewrite.clone(),
+        request_headers: x.request_headers.set.clone(),
+        crt_path: x.crt_path.clone(),
+        key_path: x.key_path.clone(),
+        http_user: x.http_user.clone(),
+        http_password: x.http_password.clone(),
+        username: x.username.clone(),
+        password: x.password.clone(),
+        local_path: x.local_path.clone(),
+        strip_prefix: x.strip_prefix.clone(),
+        enable_http2: x.enable_http2,
+    })
 }
 fn spec(p: &Proxy, client: &str, enabled: bool) -> store::NewTunnel {
     store::NewTunnel {
@@ -80,6 +101,7 @@ fn spec(p: &Proxy, client: &str, enabled: bool) -> store::NewTunnel {
         bandwidth_bps: bandwidth(p),
         bandwidth_server: p.transport.bandwidth_limit_mode == "server",
         lb: rustfrp_agent::plan::lb_opts(p),
+        plugin: plugin_opts(p),
     }
 }
 /// frp 的 `transport.bandwidthLimit`（字节 / 秒）；udp 上 frp 不支持。
@@ -173,6 +195,7 @@ fn apply(
                     lb_group: Some(lb.group.clone()),
                     lb_group_key: Some(lb.group_key.clone()),
                     health_check: Some(lb.health.clone().unwrap_or_default()),
+                    plugin: Some(plugin_opts(&p).unwrap_or_default()),
                 },
                 now,
             )?;
@@ -271,6 +294,15 @@ fn warnings(loaded: &frpcfg::LoadedClient) -> Vec<String> {
                     p.name
                 ));
             }
+        }
+        if p.plugin
+            .as_ref()
+            .is_some_and(|plugin| plugin.enable_http2 == Some(true))
+        {
+            warnings.push(format!(
+                "proxy [{}] plugin.enableHTTP2 preserved; runtime supports HTTP/1.1 only",
+                p.name
+            ));
         }
     }
     for v in &loaded.source.visitors {
@@ -408,6 +440,30 @@ pub fn export(c: &Connection, cfg: &Config, client: &str) -> Result<String, Stor
                 2 => "v2".into(),
                 _ => String::new(),
             };
+            let plugin = store::tunnel_plugin_opts(c, &t.id)?;
+            if let Some(plugin) = plugin {
+                p.plugin = Some(rustfrp_core::frpcfg::Plugin {
+                    kind: plugin.kind,
+                    local_addr: plugin.local_addr,
+                    unix_path: plugin.unix_path,
+                    host_header_rewrite: plugin.host_header_rewrite,
+                    request_headers: rustfrp_core::frpcfg::HeaderOperations {
+                        set: plugin.request_headers,
+                    },
+                    crt_path: plugin.crt_path,
+                    key_path: plugin.key_path,
+                    http_user: plugin.http_user,
+                    http_password: plugin.http_password,
+                    username: plugin.username,
+                    password: plugin.password,
+                    local_path: plugin.local_path,
+                    strip_prefix: plugin.strip_prefix,
+                    enable_http2: plugin.enable_http2,
+                    destination_ip: String::new(),
+                });
+            } else if p.plugin.as_ref().is_none_or(plugin_supported) {
+                p.plugin = None;
+            }
         }
     }
     frpcfg::export(&source, ExportFormat::Toml).map_err(invalid)
@@ -802,6 +858,78 @@ mod tests {
                 1
             );
             assert!(export(&c, &cfg, "c").unwrap().contains("localPort = 81"));
+        }
+
+        #[test]
+        fn managed_plugins_activate_roundtrip_and_keep_unsupported_source() {
+            let cfg = Config {
+                allow_ports: vec![(1, 65535)],
+                vhost_http: Some(80),
+                vhost_https: Some(443),
+                subdomain_host: "example.com".into(),
+                ..Default::default()
+            };
+            let supported = "serverAddr='x'\n[[proxies]]\nname='socks'\ntype='tcp'\nlocalPort=1080\nremotePort=6000\n[proxies.plugin]\ntype='socks5'\nusername='alice'\npassword='secret'\n[[proxies]]\nname='secure'\ntype='https'\nlocalPort=443\ncustomDomains=['secure.example.com']\n[proxies.plugin]\ntype='https2http'\nlocalAddr='127.0.0.1:8080'\ncrtPath='/client/cert.pem'\nkeyPath='/client/key.pem'\nenableHTTP2=true\n";
+            let loaded = load(supported).unwrap();
+            assert_eq!(loaded.proxies.len(), 2);
+            assert!(plugin_opts(&loaded.proxies[0]).is_some());
+            let mut first = c();
+            let p = preview(&mut first, &cfg, "c", supported).unwrap();
+            let warning_text = p.warnings.join("\n");
+            assert!(!warning_text.contains("not activated"));
+            assert!(warning_text.contains("enableHTTP2"));
+            assert_eq!(
+                import(&mut first, &cfg, "c", supported, ("root", "r", "")).unwrap(),
+                2
+            );
+            let tunnels = store::list_tunnels(&first, Some("c")).unwrap();
+            let tunnel = tunnels.iter().find(|t| t.name == "socks").unwrap();
+            let options = store::tunnel_plugin_opts(&first, &tunnel.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (options.kind.as_str(), options.username.as_str()),
+                ("socks5", "alice")
+            );
+            assert_eq!(options.password, "secret");
+            let secure = tunnels.iter().find(|t| t.name == "secure").unwrap();
+            let secure_plugin = store::tunnel_plugin_opts(&first, &secure.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(secure_plugin.kind, "https2http");
+            assert_eq!(secure_plugin.enable_http2, Some(true));
+            let out = export(&first, &cfg, "c").unwrap();
+            assert!(out.contains("type = \"socks5\""), "{out}");
+            assert!(out.contains("password = \"secret\""), "{out}");
+            assert!(out.contains("type = \"https2http\""), "{out}");
+            assert!(out.contains("enableHTTP2 = true"), "{out}");
+
+            let mut c2 = c();
+            let unsupported = "serverAddr='x'\n[[proxies]]\nname='legacy-plugin'\ntype='tcp'\nlocalPort=80\nremotePort=6001\n[proxies.plugin]\ntype='http2http'\nlocalAddr='127.0.0.1:8080'\n";
+            let loaded = load(unsupported).unwrap();
+            assert!(plugin_opts(&loaded.proxies[0]).is_none());
+            let p = preview(&mut c2, &cfg, "c", unsupported).unwrap();
+            assert!(p.warnings.join("\n").contains("not activated"));
+            assert_eq!(
+                import(&mut c2, &cfg, "c", unsupported, ("root", "r", "")).unwrap(),
+                0
+            );
+            assert!(store::list_tunnels(&c2, Some("c")).unwrap().is_empty());
+            assert!(export(&c2, &cfg, "c").unwrap().contains("http2http"));
+
+            let plain = load(&text("")).unwrap();
+            assert!(plugin_opts(&plain.proxies[0]).is_none());
+            let many = format!(
+                "serverAddr='x'\n{}",
+                (0..101)
+                    .map(|i| format!(
+                        "[[proxies]]\nname='p{i}'\ntype='tcp'\nlocalPort=1\nremotePort={}\n",
+                        1000 + i
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("")
+            );
+            assert!(load(&many).is_err());
         }
     }
 }

@@ -162,6 +162,20 @@ pub struct Tunnel {
     /// 健康检查（`None` = 不检查）。
     #[serde(default)]
     pub health_check: Option<rustfrp_core::wire::HealthSpec>,
+    /// 本地插件的脱敏配置摘要。
+    #[serde(default)]
+    pub plugin: Option<PluginSummary>,
+}
+
+/// 插件配置的 REST 摘要；密码、凭据和证书私钥仅在创建/更新请求中传入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSummary {
+    pub kind: String,
+    pub crt_set: bool,
+    pub key_set: bool,
+    pub http_password_set: bool,
+    pub password_set: bool,
+    pub enable_http2: Option<bool>,
 }
 
 /// 访问者：在设备上监听本机端口，把连接送到一条 stcp / sudp 隧道。

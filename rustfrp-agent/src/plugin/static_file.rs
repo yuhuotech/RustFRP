@@ -132,6 +132,32 @@ async fn respond<S: Duplex>(
     Ok(())
 }
 
+async fn copy_file_body<R, W>(
+    file: &mut R,
+    stream: &mut W,
+    len: u64,
+    traffic: &Traffic,
+) -> Result<(), TunnelError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut chunk = vec![0u8; 16 * 1024];
+    let mut sent = 0u64;
+    while sent < len {
+        let n = file.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        // 文件在读取期间变长时不超出已声明的长度。
+        let take = usize::try_from(len - sent).unwrap_or(usize::MAX).min(n);
+        stream.write_all(chunk.get(..take).unwrap_or(&[])).await?;
+        sent += take as u64;
+        traffic.record_out(take as u64);
+    }
+    Ok(())
+}
+
 async fn listing(dir: &Path, shown: &str) -> std::io::Result<Vec<u8>> {
     let mut names = Vec::new();
     let mut rd = tokio::fs::read_dir(dir).await?;
@@ -290,20 +316,70 @@ pub(super) async fn serve<S: Duplex>(
     s.write_all(header.as_bytes()).await?;
     traffic.record_out(header.len() as u64);
     if !head_only {
-        let mut chunk = vec![0u8; 16 * 1024];
-        let mut sent = 0u64;
-        while sent < len {
-            let n = file.read(&mut chunk).await?;
-            if n == 0 {
-                break;
-            }
-            // 文件在读取期间变长时不超出已声明的长度。
-            let take = usize::try_from(len - sent).unwrap_or(usize::MAX).min(n);
-            s.write_all(chunk.get(..take).unwrap_or(&[])).await?;
-            sent += take as u64;
-            traffic.record_out(take as u64);
-        }
+        copy_file_body(&mut file, &mut s, len, traffic).await?;
     }
     s.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_writer_counts_body_and_supports_head_requests() {
+        let traffic = Traffic::default();
+        let (mut reader, mut writer) = tokio::io::duplex(256);
+        respond(
+            &mut writer,
+            &traffic,
+            "200 OK",
+            "Content-Type: text/plain\r\n",
+            b"hello",
+            false,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        assert!(response.ends_with(b"\r\n\r\nhello"));
+        assert_eq!(traffic.snapshot().bytes_out, response.len() as u64);
+
+        let (mut reader, mut writer) = tokio::io::duplex(256);
+        respond(
+            &mut writer,
+            &traffic,
+            "200 OK",
+            "Content-Type: text/plain\r\n",
+            b"hello",
+            true,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        let mut head = Vec::new();
+        reader.read_to_end(&mut head).await.unwrap();
+        assert!(head.ends_with(b"\r\n\r\n"));
+        assert_eq!(
+            traffic.snapshot().bytes_out,
+            response.len() as u64 + head.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn file_truncated_before_first_read_stops_without_inventing_bytes() {
+        let mut file = tokio::io::empty();
+        let traffic = Traffic::default();
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        copy_file_body(&mut file, &mut writer, 1, &traffic)
+            .await
+            .unwrap();
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(traffic.snapshot().bytes_out, 0);
+    }
 }

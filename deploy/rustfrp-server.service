@@ -1,0 +1,25 @@
+[Unit]
+Description=RustFRP Controller and built-in Edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustfrp
+Group=rustfrp
+WorkingDirectory=/var/lib/rustfrp
+EnvironmentFile=-/etc/rustfrp/rustfrp-server.env
+ExecStart=/usr/local/bin/rustfrp-server run
+Restart=on-failure
+RestartSec=3
+StateDirectory=rustfrp
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rustfrp
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

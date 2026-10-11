@@ -459,6 +459,43 @@ async fn request_headers_are_set_and_host_is_rewritten_without_touching_the_body
 }
 
 #[tokio::test]
+async fn server_limiter_covers_delayed_http_bodies_and_upgraded_streams() {
+    let rig = start().await;
+    let (port, seen) = backend("limited").await;
+    let mut proxy = web("limited", port, "a.example.com", HttpOpts::default());
+    proxy.bandwidth_bps = 64 * 1024;
+    proxy.bandwidth_server = true;
+    let (mut rx, cancel) = run_client(&rig, vec![proxy]);
+    events(&mut rx, 1).await;
+
+    let mut client = TcpStream::connect(rig.http).await.unwrap();
+    client
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: 6\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    client.write_all(b"abcdef").await.unwrap();
+    let mut pending = Vec::new();
+    let response = read_response(&mut client, &mut pending).await.unwrap();
+    assert!(response.contains("backend=limited"), "{response}");
+    assert_eq!(seen.lock().unwrap()[0].1, b"abcdef");
+
+    let mut upgraded = TcpStream::connect(rig.http).await.unwrap();
+    upgraded
+        .write_all(b"GET /ws HTTP/1.1\r\nHost: a.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    upgraded.write_all(b"frame").await.unwrap();
+    upgraded.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    upgraded.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response).contains("frame"));
+    cancel.cancel();
+    rig.stop.cancel();
+}
+
+#[tokio::test]
 async fn response_headers_are_set_on_every_response_and_framing_headers_are_refused() {
     let rig = start().await;
     let (port, _) = backend("r").await;

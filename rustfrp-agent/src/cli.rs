@@ -83,7 +83,7 @@ OPTIONS:
       --enroll-token <token>   one-time token from the panel (first run only)
       --name <name>            device name shown in the panel (default: host name)
       --state-dir <dir>        where the device identity is stored (default: ~/.rustfrp)
-      --local-control <file>   private loopback control discovery (managed client only)
+      --local-control <file>   private loopback control discovery (client only)
       --public-host <name>     managed edge: host name clients use to reach this node (required at first run)
       --tls-pin <sha256>      fix the server leaf certificate fingerprint (managed only)
       --ca-file <pem>          verify the controller certificate against this CA
@@ -222,8 +222,8 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
         (None, Some(c)) => c,
         (None, None) => return Err("missing -c <config>".into()),
     };
-    if local_control.is_some() && (managed.is_none() || verify) {
-        return Err("--local-control requires a managed client run".into());
+    if local_control.is_some() && (mode != Mode::Client || verify || convert || admin.is_some()) {
+        return Err("--local-control requires a running client mode".into());
     }
     let opts = Options {
         mode,
@@ -270,11 +270,16 @@ mod tests {
             panic!("run")
         };
         assert_eq!(o.local_control.as_deref(), Some("/s/control.json"));
-        assert!(p(
+        let Command::Run(standalone) = p(
             "x",
-            &["--mode", "client", "-c", "x", "--local-control", "p"]
+            &["--mode", "client", "-c", "x", "--local-control", "p"],
         )
-        .is_err());
+        .unwrap() else {
+            panic!("standalone client run")
+        };
+        assert_eq!(standalone.config, "x");
+        assert_eq!(standalone.local_control.as_deref(), Some("p"));
+        assert!(p("x", &["--mode", "edge", "-c", "x", "--local-control", "p"]).is_err());
         assert!(p(
             "x",
             &[

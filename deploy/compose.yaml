@@ -1,0 +1,41 @@
+services:
+  rustfrp-server:
+    image: rustfrp-server:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RUSTFRP_DB: /var/lib/rustfrp/rustfrp.db
+      RUSTFRP_HTTP: 0.0.0.0:8080
+      RUSTFRP_EDGE: 0.0.0.0:7000
+      RUSTFRP_PANEL_DIR: /opt/rustfrp/panel
+    volumes:
+      - rustfrp-data:/var/lib/rustfrp
+      - ./panel:/opt/rustfrp/panel:ro
+    expose: ["8080"]
+    ports:
+      - "7000:7000/tcp"
+      - "20000-30000:20000-30000/tcp"
+      - "20000-30000:20000-30000/udp"
+    networks: [private]
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      RUSTFRP_DOMAIN: ${RUSTFRP_DOMAIN:?set RUSTFRP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      RUSTFRP_UPSTREAM: rustfrp-server:8080
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [private]
+volumes:
+  rustfrp-data:
+  caddy-data:
+  caddy-config:
+networks:
+  private:

@@ -19,6 +19,7 @@ class _LocalPageState extends ConsumerState<LocalPage> {
   late final Map<String, TextEditingController> _fields;
   final _token = TextEditingController();
   final _scroll = ScrollController();
+  bool _standaloneMode = false;
   bool _exporting = false;
   String? _diagnosticResult;
   Future<void> _exportDiagnostic() async {
@@ -51,6 +52,7 @@ class _LocalPageState extends ConsumerState<LocalPage> {
   void initState() {
     super.initState();
     final config = ref.read(localAgentProvider).config;
+    _standaloneMode = config.configFile.isNotEmpty;
     _fields = {
       for (final e in config.toJson().entries)
         e.key: TextEditingController(text: e.value as String),
@@ -69,9 +71,12 @@ class _LocalPageState extends ConsumerState<LocalPage> {
   }
 
   Future<void> _start() async {
-    final config = LocalAgentConfig.fromJson({
+    final fields = {
       for (final e in _fields.entries) e.key: e.value.text.trim(),
-    });
+    };
+    fields['controller'] = _standaloneMode ? '' : fields['controller']!;
+    fields['configFile'] = _standaloneMode ? fields['configFile']! : '';
+    final config = LocalAgentConfig.fromJson(fields);
     final token = _token.text;
     _token.clear();
     await ref.read(localAgentProvider.notifier).start(config, token);
@@ -188,13 +193,42 @@ class _LocalPageState extends ConsumerState<LocalPage> {
               const SectionTitle('连接设置'),
               // Running profiles are immutable until explicitly stopped.
               if (status == null) ...[
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    LButton(
+                      key: const Key('local-managed-mode'),
+                      label: '受管模式',
+                      compact: true,
+                      variant: _standaloneMode
+                          ? BtnVariant.neutral
+                          : BtnVariant.solid,
+                      onPressed: () => setState(() => _standaloneMode = false),
+                    ),
+                    LButton(
+                      key: const Key('local-standalone-mode'),
+                      label: '独立模式',
+                      compact: true,
+                      variant: _standaloneMode
+                          ? BtnVariant.solid
+                          : BtnVariant.neutral,
+                      onPressed: () => setState(() => _standaloneMode = true),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
                 for (final field in [
-                  ('binary', 'Agent 路径', '/绝对路径/rustfrp-agent'),
-                  ('controller', 'Edge 地址', 'frp.example.com:7000'),
-                  ('name', '设备名称', '家里的 NAS'),
-                  ('stateDir', '状态目录', '/绝对路径/状态目录'),
-                  ('caFile', 'CA 证书（可选）', '/绝对路径/ca.pem'),
-                  ('tlsPin', '证书指纹（来自可信接入命令）', '64 位 SHA256，可与 CA 同时使用'),
+                  ('binary', 'Agent 路径', '留空采用安装包内置 Agent'),
+                  if (_standaloneMode)
+                    ('configFile', 'frpc 配置文件', '/绝对路径/frpc.toml')
+                  else ...[
+                    ('controller', 'Edge 地址', 'frp.example.com:7000'),
+                    ('name', '设备名称', '家里的 NAS'),
+                    ('stateDir', '状态目录', '/绝对路径/状态目录'),
+                    ('caFile', 'CA 证书（可选）', '/绝对路径/ca.pem'),
+                    ('tlsPin', '证书指纹（来自可信接入命令）', '64 位 SHA256，可与 CA 同时使用'),
+                  ],
+                  if (_standaloneMode) ('stateDir', '状态目录', '/绝对路径/状态目录'),
                 ]) ...[
                   Text(field.$2, style: Type.caption.copyWith(color: c.text3)),
                   const SizedBox(height: 4),
@@ -205,26 +239,38 @@ class _LocalPageState extends ConsumerState<LocalPage> {
                   ),
                   const SizedBox(height: 12),
                 ],
-                Text(
-                  '一次性接入令牌（首次接入填写）',
-                  style: Type.caption.copyWith(color: c.text3),
-                ),
-                const SizedBox(height: 4),
-                LTextField(
-                  key: const Key('local-token'),
-                  controller: _token,
-                  obscure: true,
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  '令牌不会保存。已接入设备复用状态目录中的身份；不同控制器请使用不同的状态目录。',
-                  style: Type.caption.copyWith(color: c.text3),
-                ),
+                if (_standaloneMode)
+                  Text(
+                    '独立模式直接读取本机 frpc 配置，不连接 Controller。配置文件由 Agent 读取；修改后请先停止再启动。',
+                    style: Type.caption.copyWith(color: c.text3),
+                  )
+                else ...[
+                  Text(
+                    '一次性接入令牌（首次接入填写）',
+                    style: Type.caption.copyWith(color: c.text3),
+                  ),
+                  const SizedBox(height: 4),
+                  LTextField(
+                    key: const Key('local-token'),
+                    controller: _token,
+                    obscure: true,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '令牌不会保存。已接入设备复用状态目录中的身份；不同控制器请使用不同的状态目录。',
+                    style: Type.caption.copyWith(color: c.text3),
+                  ),
+                ],
               ] else
                 PanelCard(
                   child: Column(
                     children: [
-                      InfoRow('Edge', state.config.controller),
+                      InfoRow(
+                        state.config.configFile.isEmpty ? 'Edge' : '配置文件',
+                        state.config.configFile.isEmpty
+                            ? state.config.controller
+                            : state.config.configFile,
+                      ),
                       InfoRow('设备名称', state.config.name),
                       InfoRow('Agent 路径', state.config.binary, mono: true),
                       InfoRow('状态目录', state.config.stateDir, mono: true),
@@ -244,7 +290,9 @@ class _LocalPageState extends ConsumerState<LocalPage> {
                 alignment: Alignment.centerLeft,
                 child: LButton(
                   key: Key(status == null ? 'local-start' : 'local-stop'),
-                  label: status == null ? '启动并接入' : '停止',
+                  label: status == null
+                      ? (_standaloneMode ? '启动独立客户端' : '启动并接入')
+                      : '停止',
                   icon: status == null ? LucideIcons.play : LucideIcons.square,
                   variant: status == null
                       ? BtnVariant.solid

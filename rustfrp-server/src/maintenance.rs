@@ -22,6 +22,10 @@ pub struct Purged {
     pub tokens: usize,
     /// 超出保留期限的审计。
     pub audits: usize,
+    /// 超出保留期限的流量分钟桶。
+    pub traffic_minutes: usize,
+    /// 超出保留期限的流量采样游标。
+    pub traffic_cursors: usize,
     /// 已过期或已撤销自动化令牌。
     pub api_tokens: usize,
 }
@@ -31,11 +35,15 @@ pub fn purge(
     c: &mut Connection,
     now: i64,
     audit_days: i64,
+    traffic_days: i64,
     batch: i64,
 ) -> Result<Purged, StoreError> {
-    if !(0..=3650).contains(&audit_days) || !(1..=MAX_BATCH).contains(&batch) {
+    if !(0..=3650).contains(&audit_days)
+        || !(0..=3650).contains(&traffic_days)
+        || !(1..=MAX_BATCH).contains(&batch)
+    {
         return Err(StoreError::Invalid(
-            "audit retention must be 0..3650 days; batch must be 1..1000".into(),
+            "audit and traffic retention must be 0..3650 days; batch must be 1..1000".into(),
         ));
     }
     let tx = c.transaction()?;
@@ -47,8 +55,18 @@ pub fn purge(
     } else {
         tx.execute("DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE ts < ?1 ORDER BY ts, id LIMIT ?2)",params![now.saturating_sub(audit_days * DAY_MS),batch])?
     };
-    if sessions + tokens + audits + api_tokens > 0 {
-        let reason = format!("retention policy: sessions={sessions}, enroll_tokens={tokens}, audit={audits}, api_tokens={api_tokens}; audit_days={audit_days}");
+    let traffic_minutes = if traffic_days == 0 {
+        0
+    } else {
+        tx.execute("DELETE FROM traffic_minutes WHERE (tunnel_id,minute) IN (SELECT tunnel_id,minute FROM traffic_minutes WHERE minute < ?1 ORDER BY minute,tunnel_id LIMIT ?2)", params![now.saturating_sub(traffic_days * DAY_MS), batch])?
+    };
+    let traffic_cursors = if traffic_days == 0 {
+        0
+    } else {
+        tx.execute("DELETE FROM traffic_cursors WHERE (epoch,tunnel_id,generation) IN (SELECT epoch,tunnel_id,generation FROM traffic_cursors WHERE sampled_at < ?1 ORDER BY sampled_at,epoch,tunnel_id,generation LIMIT ?2)", params![now.saturating_sub(traffic_days * DAY_MS), batch])?
+    };
+    if sessions + tokens + audits + api_tokens + traffic_minutes + traffic_cursors > 0 {
+        let reason = format!("retention policy: sessions={sessions}, enroll_tokens={tokens}, audit={audits}, api_tokens={api_tokens}, traffic_minutes={traffic_minutes}, traffic_cursors={traffic_cursors}; audit_days={audit_days}, traffic_days={traffic_days}");
         store::audit(
             &tx,
             "system",
@@ -67,6 +85,8 @@ pub fn purge(
         tokens,
         audits,
         api_tokens,
+        traffic_minutes,
+        traffic_cursors,
     })
 }
 
@@ -74,6 +94,7 @@ pub fn purge(
 pub async fn run(
     db: Db,
     audit_days: i64,
+    traffic_days: i64,
     batch: i64,
     period: Duration,
     cancel: CancellationToken,
@@ -83,7 +104,7 @@ pub async fn run(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(period) => {
-                if let Err(e) = db.call(move |c| purge(c, store::now_ms(), audit_days, batch)).await {
+                if let Err(e) = db.call(move |c| purge(c, store::now_ms(), audit_days, traffic_days, batch)).await {
                     log.error(&format!("retention maintenance failed: {e}"));
                 }
             }

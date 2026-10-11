@@ -41,6 +41,7 @@ class FakeLocal implements LocalAgentBackend {
   Completer<void>? pending;
   int starts = 0, stops = 0, reads = 0;
   String? receivedToken;
+  LocalAgentConfig? startedWith;
   bool exits = false;
   List<String> logLines = ['agent connected'];
   @override
@@ -73,6 +74,7 @@ class FakeLocal implements LocalAgentBackend {
   Future<void> start(LocalAgentConfig config, String enrollToken) async {
     starts++;
     receivedToken = enrollToken;
+    startedWith = config;
     if (pending != null) await pending!.future;
     if (error != null) throw error!;
     if (!exits) current = online;
@@ -117,6 +119,12 @@ void main() {
     ) as Map<String, dynamic>;
     final s = LocalAgentStatus.fromJson(fixture);
     expect([s.pid, s.connected, s.revision, s.proxies], [123, true, 7, 2]);
+    expect(s.agentVersion, '未知');
+    expect(
+      LocalAgentStatus.fromJson({...fixture, 'agent_version': '0.1.0'})
+          .agentVersion,
+      '0.1.0',
+    );
     expect([s.bytesIn, s.bytesOut, s.connections], [0, 0, 0]);
     expect(
       LocalAgentStatus.fromJson({...fixture, 'traffic': null}).bytesIn,
@@ -379,6 +387,63 @@ void main() {
     expect(find.byType(LocalPage), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
     c.dispose();
+  });
+  testWidgets('standalone mode starts a local frpc file without enrollment', (
+    tester,
+  ) async {
+    final standalone = LocalAgentConfig(
+      binary: '/agent',
+      stateDir: '/state',
+      configFile: '/etc/rustfrp/frpc.toml',
+      name: 'independent',
+    );
+    final backend = FakeLocal()..defaults = standalone;
+    final container = await make(
+      backend,
+      prefs: {
+        'local_mode': true,
+        'local_agent': jsonEncode(standalone.toJson()),
+      },
+    );
+    addTearDown(container.dispose);
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(container: container, child: RustFrpApp()),
+    );
+    await settle(tester);
+    expect(find.byKey(const Key('local-standalone-mode')), findsOneWidget);
+    await tapKey(tester, 'local-managed-mode');
+    expect(find.byKey(const Key('local-controller')), findsOneWidget);
+    expect(find.byKey(const Key('local-token')), findsOneWidget);
+    await tapKey(tester, 'local-standalone-mode');
+    expect(find.byKey(const Key('local-configFile')), findsOneWidget);
+    expect(find.byKey(const Key('local-controller')), findsNothing);
+    expect(find.byKey(const Key('local-token')), findsNothing);
+    expect(
+      find.text('独立模式直接读取本机 frpc 配置，不连接 Controller。配置文件由 Agent 读取；修改后请先停止再启动。'),
+      findsOneWidget,
+    );
+    await tester.enterText(
+      find.byKey(const Key('local-configFile')),
+      '/tmp/another-frpc.toml',
+    );
+    await tester.ensureVisible(find.byKey(const Key('local-start')));
+    await tapKey(tester, 'local-start');
+    expect(backend.startedWith?.configFile, '/tmp/another-frpc.toml');
+    expect(backend.startedWith?.controller, '');
+    expect(backend.receivedToken, '');
+    await tester.tap(find.text('本机模式').last);
+    await settle(tester);
+    final adminEntry = find.text('管理员控制台').last;
+    await tester.ensureVisible(adminEntry);
+    await tester.tap(adminEntry);
+    await settle(tester);
+    expect(find.byKey(const Key('login-submit')), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    container.dispose();
   });
   testWidgets('narrow dark restore and periodic refresh', (tester) async {
     final b = FakeLocal()..current = online;

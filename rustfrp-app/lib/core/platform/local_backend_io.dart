@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../local_agent.dart';
 
@@ -130,6 +131,7 @@ class IoLocalBackend implements LocalAgentBackend {
     LaunchAgent? launch,
     this.firstLaunch,
     this.removeRegistration,
+    this.bundledAgentBinary,
     this.startTimeout = const Duration(seconds: 10),
   }) : _launch = launch ?? launchDetached;
   @override
@@ -137,9 +139,37 @@ class IoLocalBackend implements LocalAgentBackend {
   final LaunchAgent _launch;
   final LaunchAgent? firstLaunch;
   final Future<void> Function(String path)? removeRegistration;
+  final String? bundledAgentBinary;
   final Duration startTimeout;
   @override
   bool get available => true;
+
+  String? _bundledAgentPath() {
+    if (bundledAgentBinary != null) return bundledAgentBinary;
+    return bundledAgentPathFor(
+      Platform.resolvedExecutable,
+      windows: Platform.isWindows,
+      macos: Platform.isMacOS,
+      linux: Platform.isLinux,
+    );
+  }
+
+  Future<void> _installBundledAgent(LocalAgentConfig config) async {
+    final sourcePath = _bundledAgentPath();
+    if (sourcePath == null || !await File(sourcePath).exists()) {
+      throw const FormatException('找不到随应用提供的 agent，请重新安装完整桌面包');
+    }
+    final destination = File(config.binary);
+    await destination.parent.create(recursive: true);
+    await File(sourcePath).copy(destination.path);
+    if (!Platform.isWindows) {
+      final result = await Process.run('/bin/chmod', ['700', destination.path]);
+      if (result.exitCode != 0) {
+        await destination.delete();
+        throw const FormatException('无法设置 agent 可执行权限');
+      }
+    }
+  }
 
   Future<Map<String, dynamic>?> _read(String path, {int limit = 2048}) async {
     RandomAccessFile file;
@@ -166,7 +196,7 @@ class IoLocalBackend implements LocalAgentBackend {
     final d = await _read(config.discoveryPath);
     if (d == null) return null;
     if (d['version'] != 1 ||
-        d['controller'] != config.controller ||
+        d['controller'] != config.discoveryIdentity ||
         d['port'] is! int ||
         (d['port'] as int) < 1 ||
         (d['port'] as int) > 65535 ||
@@ -318,54 +348,64 @@ class IoLocalBackend implements LocalAgentBackend {
 
   @override
   Future<void> start(LocalAgentConfig config, String enrollToken) async {
-    if (config.controller.length > 300 ||
-        !RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]+)?$')
-            .hasMatch(config.controller)) {
-      throw const FormatException(
-        '请输入 Edge 地址，例如 frp.example.com:7000，不带 http://',
-      );
-    }
-    final port = config.controller.contains(':')
-        ? int.tryParse(config.controller.split(':').last)
-        : 7000;
-    if (port == null || port < 1 || port > 65535) {
-      throw const FormatException('Edge 端口必须在 1–65535 之间');
+    final standalone = config.configFile.isNotEmpty;
+    if (standalone) {
+      if (!File(config.configFile).isAbsolute ||
+          !await File(config.configFile).exists()) {
+        throw const FormatException('独立配置文件必须存在且使用绝对路径');
+      }
+    } else {
+      if (config.controller.length > 300 ||
+          !RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]+)?$')
+              .hasMatch(config.controller)) {
+        throw const FormatException(
+          '请输入 Edge 地址，例如 frp.example.com:7000，不带 http://',
+        );
+      }
+      final port = config.controller.contains(':')
+          ? int.tryParse(config.controller.split(':').last)
+          : 7000;
+      if (port == null || port < 1 || port > 65535) {
+        throw const FormatException('Edge 端口必须在 1–65535 之间');
+      }
     }
     if (!File(config.binary).isAbsolute ||
         !Directory(config.stateDir).isAbsolute) {
       throw const FormatException('agent 与状态目录必须使用绝对路径');
     }
     if (await status(config) != null) return;
-    if (!await File(config.binary).exists()) {
-      throw const FormatException('找不到 agent，请先安装或填写已构建的二进制路径');
-    }
-    final identity = await _read(
-      '${config.stateDir}/identity.json',
-      limit: 16384,
-    );
-    if (identity?['client_id'] == null && enrollToken.trim().isEmpty) {
+    if (!await File(config.binary).exists()) await _installBundledAgent(config);
+    final identity = standalone
+        ? null
+        : await _read('${config.stateDir}/identity.json', limit: 16384);
+    if (!standalone &&
+        identity?['client_id'] == null &&
+        enrollToken.trim().isEmpty) {
       throw const FormatException('首次接入需要面板生成的一次性令牌');
     }
-    final args = [
-      '--local-control',
-      config.discoveryPath,
-      '--mode',
-      'client',
-      '--controller',
-      config.controller,
-      '--state-dir',
-      config.stateDir,
-      '--name',
-      config.name,
-    ];
-    if (config.caFile.isNotEmpty) args.addAll(['--ca-file', config.caFile]);
-    if (config.tlsPin.isNotEmpty) {
+    final args = ['--local-control', config.discoveryPath, '--mode', 'client'];
+    if (standalone) {
+      args.addAll(['-c', config.configFile]);
+    } else {
+      args.addAll([
+        '--controller',
+        config.controller,
+        '--state-dir',
+        config.stateDir,
+        '--name',
+        config.name,
+      ]);
+    }
+    if (!standalone && config.caFile.isNotEmpty) {
+      args.addAll(['--ca-file', config.caFile]);
+    }
+    if (!standalone && config.tlsPin.isNotEmpty) {
       if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(config.tlsPin)) {
         throw const FormatException('证书指纹必须为 64 位 SHA256');
       }
       args.addAll(['--tls-pin', config.tlsPin]);
     }
-    final needsEnrollment = identity?['client_id'] == null;
+    final needsEnrollment = !standalone && identity?['client_id'] == null;
     final initialArgs = [
       ...args,
       if (needsEnrollment) ...['--enroll-token', enrollToken.trim()],
@@ -424,4 +464,26 @@ class IoLocalBackend implements LocalAgentBackend {
     }
     throw const FormatException('agent 仍在退出，请稍后刷新状态');
   }
+}
+
+@visibleForTesting
+String? bundledAgentPathFor(
+  String resolvedExecutable, {
+  required bool windows,
+  required bool macos,
+  required bool linux,
+}) {
+  final executable = File(resolvedExecutable).absolute;
+  if (windows) {
+    return '${executable.parent.path}${Platform.pathSeparator}rustfrp-agent.exe';
+  }
+  if (macos) {
+    final contents = executable.parent.parent;
+    return '${contents.path}${Platform.pathSeparator}Resources${Platform.pathSeparator}bin${Platform.pathSeparator}rustfrp-agent';
+  }
+  if (linux) {
+    final bundleRoot = executable.parent.parent;
+    return '${bundleRoot.path}${Platform.pathSeparator}bin${Platform.pathSeparator}rustfrp-agent';
+  }
+  return null;
 }
