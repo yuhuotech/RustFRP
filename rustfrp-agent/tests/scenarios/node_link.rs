@@ -477,7 +477,7 @@ pub async fn reports_state_traffic_and_obeys_pushes() {
     until(&mut crx, |e| matches!(e, Event::ConfigApplied { .. })).await;
     next_msg(
         &mut fake,
-        |m| matches!(m, NodeMsg::Online { client_id } if client_id == "dev-1"),
+        |m| matches!(m, NodeMsg::Online { client_id, .. } if client_id == "dev-1"),
     )
     .await;
     let NodeMsg::Proxy(r) = next_msg(

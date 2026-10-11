@@ -73,6 +73,7 @@ class FakeServer {
       'created_at': 1700000000000,
       'last_seen_at': 1700000100000,
       'disabled_at': disabled ? 1700000200000 : null,
+      'last_ip': isOnline ? '203.0.113.7' : '',
     };
     clients.add(c);
     if (isOnline) online.add(c['id']! as String);

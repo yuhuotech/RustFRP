@@ -229,9 +229,15 @@ where
 {
     match msg {
         NodeMsg::Ping => write_frame(wr, &CtlMsg::Pong).await?,
-        NodeMsg::Online { client_id } => ctx.hub.node_client_state(node_id, &client_id, true).await,
+        NodeMsg::Online { client_id, ip } => {
+            ctx.hub
+                .node_client_state(node_id, &client_id, true, &ip)
+                .await
+        }
         NodeMsg::Offline { client_id } => {
-            ctx.hub.node_client_state(node_id, &client_id, false).await;
+            ctx.hub
+                .node_client_state(node_id, &client_id, false, "")
+                .await;
         }
         NodeMsg::Proxy(report) => ctx.hub.node_proxy(node_id, report).await,
         NodeMsg::Resync {

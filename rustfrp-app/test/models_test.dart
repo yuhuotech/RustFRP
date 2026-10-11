@@ -159,6 +159,11 @@ void main() {
     );
     expect(h.requestHeaders, {'X-A': '1'});
     expect(
+      ClientDevice.fromJson({'id': 'c', 'last_ip': '198.51.100.2'}).lastIp,
+      '198.51.100.2',
+    );
+    expect(ClientDevice.fromJson({'id': 'c'}).lastIp, '');
+    expect(
       Tunnel.fromJson({
         'id': 'r',
         'response_headers': {'X-B': '2', 'bad': 3},

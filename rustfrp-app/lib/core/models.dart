@@ -98,8 +98,12 @@ class ClientDevice {
     this.online = false,
     this.nodeId = '',
     this.tags = const [],
+    this.lastIp = '',
   });
   final String id, name, os, arch, version;
+
+  /// 最近一次登录时 Edge 看到的来源地址。
+  final String lastIp;
 
   /// 标签（最多 8 个）。
   final List<String> tags;
@@ -127,6 +131,7 @@ class ClientDevice {
       disabledAt: _intOrNull(m['disabled_at']),
       online: m['online'] == true,
       nodeId: _str(m['node_id']),
+      lastIp: _str(m['last_ip']),
       tags: [
         for (final t in _list(m['tags']))
           if (t is String) t,
@@ -148,6 +153,7 @@ class ClientDevice {
       other.disabledAt == disabledAt &&
       other.online == online &&
       other.nodeId == nodeId &&
+      other.lastIp == lastIp &&
       listEquals(other.tags, tags);
   @override
   int get hashCode => Object.hashAll([
@@ -162,6 +168,7 @@ class ClientDevice {
     disabledAt,
     online,
     nodeId,
+    lastIp,
     ...tags,
   ]);
 }

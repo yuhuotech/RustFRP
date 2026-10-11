@@ -446,6 +446,11 @@ class ClientDetail extends ConsumerWidget {
                       '最近在线',
                       d.online ? '现在' : relativeTime(d.lastSeenAt),
                     ),
+                    InfoRow(
+                      '最近 IP',
+                      d.lastIp.isEmpty ? '—' : d.lastIp,
+                      mono: true,
+                    ),
                     InfoRow('配置版本', '${d.revision}'),
                   ],
                 ),

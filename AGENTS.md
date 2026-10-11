@@ -53,7 +53,7 @@ Flutter：颜色、字号、圆角沿用 linkory 的 token / 共享控件，acti
 - P02 Controller ✔（部分）：SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD 与批量、配置热下发、审计、REST、面板托管、API Token、流量分钟桶与 24h/7d 历史、有界日志环、配置导入预览/导出、在线备份、有界保留清理、脚本托管。
   **独立节点**已实现（`RUSTFRP_NODE_ADDR` 开启节点端口；`rustfrp-agent --mode edge --controller … --enroll-token … --public-host …`，见 `docs/NODES.md`），AT-05 在同机全栈测试中通过；内置节点仍与 Controller 同进程。
   `RUSTFRP_BUILTIN_EDGE=off` 可只做管理面；`RUSTFRP_METRICS_TOKEN` 开启 Prometheus `/metrics`；客户端标签与远程重启（退出码 75，需系统服务托管）已实现。
-  **缺口**：设备跨节点迁移、流量/会话保留天数配置化、控制面 HTTPS 部署闭环、客户端 IP 展示。
+  **缺口**：设备跨节点迁移、流量/会话保留天数配置化、控制面 HTTPS 部署闭环。设备详情已显示最近登录 IP（由 Edge 填写，覆盖客户端自报值；外置节点经 `NodeMsg::Online.ip` 上报）。
 - P03 Flutter ✔（部分）：登录、概览（含流量图）、节点、客户端、隧道 CRUD/模板/批量、接入向导、审计、设置（主题/令牌/API Token/管理员）、日志、宽窄屏、深浅色；Web 同源托管并在严格 CSP 下实测。
   桌面：窗口壳、管理员控制台模式、受管「本机模式」（接入、持久身份、回环控制、本机隧道列表/日志/诊断导出；macOS 实机通过）。
   **缺口（P05）**：托盘、开机启动、通知、本地配置编辑、独立模式入口、应用内更新、内置 agent、三平台安装包；Linux / Windows 后台进程未实机验收。

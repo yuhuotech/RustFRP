@@ -572,10 +572,11 @@ fn client_from(r: &Row<'_>) -> rusqlite::Result<Client> {
         online: false,
         node_id: r.get(9)?,
         tags: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
+        last_ip: r.get(11)?,
     })
 }
 const CLIENT_COLS: &str =
-    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at, node_id, tags";
+    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at, node_id, tags, last_ip";
 
 /// 创建设备。
 #[allow(clippy::too_many_arguments)]
@@ -614,7 +615,7 @@ pub fn get_client_with_key(c: &Connection, id: &str) -> Res<(Client, String)> {
     Ok(c.query_row(
         &format!("SELECT {CLIENT_COLS}, pubkey FROM clients WHERE id = ?1 AND deleted_at IS NULL"),
         [id],
-        |r| Ok((client_from(r)?, r.get(11)?)),
+        |r| Ok((client_from(r)?, r.get(12)?)),
     )?)
 }
 
@@ -723,6 +724,17 @@ pub fn touch_client(c: &Connection, id: &str, now: i64) -> Res<()> {
         "UPDATE clients SET last_seen_at = ?2 WHERE id = ?1",
         params![id, now],
     )?;
+    Ok(())
+}
+
+/// 记录设备最近一次登录的来源地址（空串不覆盖）。
+pub fn set_client_ip(c: &Connection, id: &str, ip: &str) -> Res<()> {
+    if !ip.is_empty() && ip.len() <= 64 {
+        c.execute(
+            "UPDATE clients SET last_ip = ?2 WHERE id = ?1",
+            params![id, ip],
+        )?;
+    }
     Ok(())
 }
 
@@ -1592,6 +1604,7 @@ pub fn touch_client_of_node(
     client_id: &str,
     now: i64,
     offline: bool,
+    ip: &str,
 ) -> Res<()> {
     let owned: Option<i64> = c
         .query_row(
@@ -1604,6 +1617,9 @@ pub fn touch_client_of_node(
         return Ok(());
     }
     touch_client(c, client_id, now)?;
+    if !offline {
+        set_client_ip(c, client_id, ip)?;
+    }
     if offline {
         mark_client_tunnels_stopped(c, client_id)?;
     }
@@ -2750,6 +2766,80 @@ mod tests {
             cleared.lb_group.is_empty()
                 && cleared.health_check.is_none()
                 && !cleared.lb_group_key_set
+        );
+    }
+
+    #[test]
+    fn visitors_must_share_a_node_with_their_target_and_health_can_be_replaced() {
+        let c = conn();
+        let a = client(&c, "a");
+        let b = client(&c, "b");
+        let mut t = nt(&a.id, "ssh", 0);
+        t.kind = "stcp".into();
+        let tunnel = create_tunnel(&c, &t, 1).unwrap();
+        let key = rustfrp_core::identity::DeviceKey::generate()
+            .unwrap()
+            .public_hex();
+        let info = NodeInfo {
+            public_host: "edge.example.com".into(),
+            edge_port: 7000,
+            tls_fingerprint: "f".repeat(64),
+            vhost_http: None,
+            vhost_https: None,
+            subdomain_host: String::new(),
+            allow_ports: vec![],
+            version: "0.1".into(),
+            os: "linux".into(),
+        };
+        create_node(&c, "n1", "edge", &key, &info, 5).unwrap();
+        set_client_node(&c, &b.id, "n1").unwrap();
+        let v = NewVisitor {
+            client_id: b.id.clone(),
+            name: "v".into(),
+            tunnel_id: tunnel.id.clone(),
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            matches!(create_visitor(&c, &v, 6), Err(StoreError::Invalid(m)) if m.contains("same node"))
+        );
+        // 同一节点后可以创建。
+        set_client_node(&c, &a.id, "n1").unwrap();
+        create_visitor(&c, &v, 7).unwrap();
+
+        // 健康检查：先配、再整体替换成另一种。
+        let mut hc = nt(&a.id, "hc", 6000);
+        hc.lb = LbOpts {
+            health: Some(HealthSpec {
+                kind: "tcp".into(),
+                timeout_secs: 3,
+                max_failed: 1,
+                interval_secs: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = create_tunnel(&c, &hc, 8).unwrap();
+        let replaced = update_tunnel(
+            &c,
+            &created.id,
+            &TunnelPatch {
+                health_check: Some(HealthSpec {
+                    kind: "http".into(),
+                    path: "/h".into(),
+                    timeout_secs: 2,
+                    max_failed: 2,
+                    interval_secs: 5,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            replaced.health_check.map(|h| (h.kind, h.path)),
+            Some(("http".to_string(), "/h".to_string()))
         );
     }
 

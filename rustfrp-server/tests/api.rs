@@ -2300,7 +2300,7 @@ async fn client_tags_and_remote_restart_are_validated_and_audited() {
     .await
     .unwrap();
     r.hub.node_attach("n1", tx);
-    r.hub.node_client_state("n1", &cid, true).await;
+    r.hub.node_client_state("n1", &cid, true, "").await;
     let (st, v) = r
         .send(Method::POST, &restart, &admin, json!({"reason": "upgrade"}))
         .await;

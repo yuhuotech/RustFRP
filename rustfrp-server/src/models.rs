@@ -83,6 +83,9 @@ pub struct Client {
     /// 标签（最多 8 个，每个 1–32 个字符）。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 最近一次登录时 Edge 看到的来源地址。
+    #[serde(default)]
+    pub last_ip: String,
 }
 
 /// 隧道（spec + status）。

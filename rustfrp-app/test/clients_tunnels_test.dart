@@ -39,6 +39,7 @@ void main() {
       await tester.tap(find.byKey(Key('client-row-${a['id']}')));
       await settle(tester);
       expect(find.text('设备信息'), findsOneWidget);
+      expect(find.text('203.0.113.7'), findsOneWidget);
       expect(find.text('隧道（1）'), findsOneWidget);
       expect(find.byKey(const Key('client-new-tunnel')), findsOneWidget);
       expect(find.text('在线'), findsWidgets);
@@ -47,6 +48,7 @@ void main() {
       await tester.tap(find.byKey(Key('client-row-${b['id']}')));
       await settle(tester);
       expect(find.text('这台客户端还没有隧道。'), findsOneWidget);
+      expect(find.text('最近 IP'), findsOneWidget);
       expect(find.text('已停用'), findsWidgets);
       expect(
         find.byTooltip('强制下线'),

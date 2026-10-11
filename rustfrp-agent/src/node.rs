@@ -243,7 +243,7 @@ impl Registry {
             .count()
     }
 
-    fn went_online(&self, id: &str) {
+    fn went_online(&self, id: &str, ip: &str) {
         let first = {
             let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
             let n = live.online.entry(id.to_string()).or_insert(0);
@@ -253,6 +253,7 @@ impl Registry {
         if first {
             self.send(NodeMsg::Online {
                 client_id: id.into(),
+                ip: ip.into(),
             });
         }
     }
@@ -380,7 +381,12 @@ impl Registry {
         }
     }
 
-    fn admit(self: &Arc<Self>, id: &str, just_enrolled: bool) -> Result<Admission, String> {
+    fn admit(
+        self: &Arc<Self>,
+        id: &str,
+        just_enrolled: bool,
+        ip: &str,
+    ) -> Result<Admission, String> {
         let config = self
             .devices
             .lock()
@@ -388,7 +394,7 @@ impl Registry {
             .get(id)
             .map(|e| e.tx.subscribe())
             .ok_or("authentication failed")?;
-        self.went_online(id);
+        self.went_online(id, ip);
         Ok(Admission::Managed(Managed {
             client_id: id.into(),
             just_enrolled,
@@ -438,7 +444,11 @@ impl Registry {
         if !self.upsert(device) {
             return Err("device rejected by the node".into());
         }
-        self.admit(&id, true)
+        self.admit(
+            &id,
+            true,
+            login.metas.get("remote_ip").map_or("", String::as_str),
+        )
     }
 }
 
@@ -466,7 +476,11 @@ impl Policy for Arc<Registry> {
             if !ok {
                 return Err("authentication failed".into());
             }
-            self.admit(&login.client_id, false)
+            self.admit(
+                &login.client_id,
+                false,
+                login.metas.get("remote_ip").map_or("", String::as_str),
+            )
         })
     }
 }
@@ -1026,7 +1040,11 @@ mod tests {
         let k = DeviceKey::generate().unwrap();
         r.upsert(device("c1", &k, 1));
         r.link_up.store(true, Ordering::Relaxed);
-        let Ok(Admission::Managed(a)) = r.login(&login("c1", &k)).await else {
+        let mut first = login("c1", &k);
+        first
+            .metas
+            .insert("remote_ip".into(), "198.51.100.7".into());
+        let Ok(Admission::Managed(a)) = r.login(&first).await else {
             panic!()
         };
         let Ok(Admission::Managed(b)) = r.login(&login("c1", &k)).await else {
@@ -1035,7 +1053,8 @@ mod tests {
         assert_eq!(
             out.recv().await,
             Some(NodeMsg::Online {
-                client_id: "c1".into()
+                client_id: "c1".into(),
+                ip: "198.51.100.7".into()
             })
         );
         assert!(

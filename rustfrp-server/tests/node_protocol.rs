@@ -377,10 +377,12 @@ async fn session_syncs_devices_records_state_and_filters_foreign_data() {
     );
     c.send(&NodeMsg::Online {
         client_id: mine.clone(),
+        ip: "203.0.113.5".into(),
     })
     .await;
     c.send(&NodeMsg::Online {
         client_id: theirs.clone(),
+        ip: "203.0.113.6".into(),
     })
     .await;
     let (h, m) = (r.hub.clone(), mine.clone());
@@ -400,6 +402,24 @@ async fn session_syncs_devices_records_state_and_filters_foreign_data() {
         Some(1),
         "foreign devices are not touched in the database"
     );
+    // 来源地址只记给自己节点的设备。
+    let (db, m2) = (r.db.clone(), mine.clone());
+    wait(|| {
+        let (db, m2) = (db.clone(), m2.clone());
+        async move {
+            db.call(move |c| Ok(store::get_client(c, &m2)?.last_ip))
+                .await
+                .unwrap()
+                == "203.0.113.5"
+        }
+    })
+    .await;
+    let t2 = theirs.clone();
+    let theirs_ip =
+        r.db.call(move |c| Ok(store::get_client(c, &t2)?.last_ip))
+            .await
+            .unwrap();
+    assert_eq!(theirs_ip, "");
 
     // 隧道状态：自己的被记录；别人的被忽略；非法状态被忽略。
     for (cid, tid, state, port, err) in [
@@ -688,6 +708,7 @@ async fn hub_pushes_device_changes_to_the_owning_node_only() {
     // 设备在线时强制下线 → Kick。
     c.send(&NodeMsg::Online {
         client_id: cid.clone(),
+        ip: String::new(),
     })
     .await;
     let (h, id) = (r.hub.clone(), cid.clone());

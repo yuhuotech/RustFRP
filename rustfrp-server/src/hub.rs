@@ -201,7 +201,7 @@ impl Hub {
     }
 
     /// 处理节点上报的设备上线 / 离线。
-    pub async fn node_client_state(&self, node_id: &str, client_id: &str, online: bool) {
+    pub async fn node_client_state(&self, node_id: &str, client_id: &str, online: bool, ip: &str) {
         {
             let mut map = self
                 .node_clients
@@ -214,10 +214,12 @@ impl Hub {
                 set.remove(client_id);
             }
         }
-        let (node, client) = (node_id.to_string(), client_id.to_string());
+        let (node, client, ip) = (node_id.to_string(), client_id.to_string(), ip.to_string());
         let _ = self
             .db
-            .call(move |c| store::touch_client_of_node(c, &node, &client, store::now_ms(), !online))
+            .call(move |c| {
+                store::touch_client_of_node(c, &node, &client, store::now_ms(), !online, &ip)
+            })
             .await;
     }
 
@@ -259,10 +261,10 @@ impl Hub {
             };
             let now: HashSet<&String> = online.iter().collect();
             for gone in previous.iter().filter(|c| !now.contains(c)) {
-                self.node_client_state(node_id, gone, false).await;
+                self.node_client_state(node_id, gone, false, "").await;
             }
             for id in &online {
-                self.node_client_state(node_id, id, true).await;
+                self.node_client_state(node_id, id, true, "").await;
             }
         }
         for r in proxies {
@@ -428,6 +430,11 @@ impl Drop for OnlineGuard {
     }
 }
 
+/// Edge 记在登录消息里的来源地址。
+fn remote_ip(login: &Login) -> String {
+    login.metas.get("remote_ip").cloned().unwrap_or_default()
+}
+
 /// 基于数据库的登录策略：一次性令牌接入 + Ed25519 签名登录。
 pub struct DbPolicy {
     /// Hub。
@@ -437,7 +444,12 @@ pub struct DbPolicy {
 }
 
 impl DbPolicy {
-    async fn admit(&self, client_id: String, just_enrolled: bool) -> Result<Admission, String> {
+    async fn admit(
+        &self,
+        client_id: String,
+        just_enrolled: bool,
+        ip: String,
+    ) -> Result<Admission, String> {
         let permit = self
             .hub
             .slots
@@ -459,7 +471,10 @@ impl DbPolicy {
         let id = client_id.clone();
         let _ = self
             .db
-            .call(move |c| store::touch_client(c, &id, store::now_ms()))
+            .call(move |c| {
+                store::touch_client(c, &id, store::now_ms())?;
+                store::set_client_ip(c, &id, &ip)
+            })
             .await;
         Ok(Admission::Managed(Managed {
             client_id: client_id.clone(),
@@ -523,7 +538,7 @@ impl Policy for DbPolicy {
                     })
                     .await;
                 return match created {
-                    Ok(id) => self.admit(id, true).await,
+                    Ok(id) => self.admit(id, true, remote_ip(login)).await,
                     Err(StoreError::NotFound) => {
                         Err("invalid, used, revoked or expired enroll token".into())
                     }
@@ -552,7 +567,7 @@ impl Policy for DbPolicy {
             if client.disabled_at.is_some() {
                 return Err("device is disabled".into());
             }
-            self.admit(client.id, false).await
+            self.admit(client.id, false, remote_ip(login)).await
         })
     }
 }
@@ -580,7 +595,7 @@ mod tests {
             db: hub.db.clone(),
         };
         assert!(
-            matches!(policy.admit("missing".into(), false).await, Err(e) if e == "managed session capacity reached")
+            matches!(policy.admit("missing".into(), false, String::new()).await, Err(e) if e == "managed session capacity reached")
         );
         let first = events.offline_rx.recv().await.unwrap();
         assert_eq!(first.client_id, "0");
@@ -627,7 +642,10 @@ mod tests {
             hub: hub.clone(),
             db: hub.db.clone(),
         };
-        assert!(policy.admit("missing".into(), false).await.is_err());
+        assert!(policy
+            .admit("missing".into(), false, String::new())
+            .await
+            .is_err());
         assert_eq!(hub.slots.available_permits(), MAX_SESSIONS);
     }
 }

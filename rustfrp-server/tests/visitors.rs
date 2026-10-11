@@ -153,6 +153,14 @@ async fn managed_devices_reach_each_other_privately_through_a_visitor() {
     let mut cancels = Vec::new();
     let (provider, mut prx) = enroll(&server, "provider", &mut cancels).await;
     let (consumer, mut crx) = enroll(&server, "consumer", &mut cancels).await;
+    // Edge 看到的来源地址记在设备上（不取自客户端自报）。
+    let p2 = provider.clone();
+    let ip = server
+        .db
+        .call(move |c| Ok(store::get_client(c, &p2)?.last_ip))
+        .await
+        .unwrap();
+    assert_eq!(ip, "127.0.0.1");
     let echo = echo_tcp().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let udp_port = udp.local_addr().unwrap().port();

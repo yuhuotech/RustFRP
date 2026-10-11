@@ -333,6 +333,7 @@ impl Edge {
                         groups: groups.clone(),
                         secrets: secrets.clone(),
                         user: String::new(),
+                        peer_ip: peer.ip().to_string(),
                         traffic: self.traffic.clone(),
                         limiter: None,
                         log: self.log.clone(),
@@ -360,6 +361,8 @@ struct ClientCtx {
     secrets: Arc<SecretRegistry>,
     /// 当前客户端登录时声明的用户名。
     user: String,
+    /// 客户端的来源地址（不含端口）。
+    peer_ip: String,
     traffic: Arc<pipe::Traffic>,
     /// 服务端限速（`bandwidthLimitMode = "server"`）；`None` = 不限。
     limiter: Option<Arc<pipe::Limiter>>,
@@ -406,9 +409,11 @@ async fn control_loop(
     .await?;
     let (mut rd, mut wr) = tokio::io::split(ctrl);
     let first: ClientMsg = within(ctx.cfg.handshake_timeout, "login", read_frame(&mut rd)).await?;
-    let ClientMsg::Login(login) = first else {
+    let ClientMsg::Login(mut login) = first else {
         return Err(TunnelError::Wire("expected login".into()));
     };
+    // 来源地址由 Edge 填写，覆盖客户端自报的值。
+    login.metas.insert("remote_ip".into(), ctx.peer_ip.clone());
     let admission = if login.version != PROTOCOL_VERSION {
         Err(format!("unsupported protocol version {}", login.version))
     } else {

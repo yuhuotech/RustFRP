@@ -140,6 +140,45 @@ async fn edge_requires_login_first_and_rejects_duplicates() {
 }
 
 #[tokio::test]
+async fn visitor_streams_with_bad_hellos_are_refused_without_hurting_the_session() {
+    let (port, stop) = start_edge(EdgeConfig::default()).await;
+    let mut r = raw_client(port).await;
+    expect_login_ok(&mut r).await;
+    // 未知代理：得到明确的拒绝原因。
+    let mut v = r._session.open().await.unwrap();
+    write_frame(
+        &mut v,
+        &rustfrp_core::wire::VisitorHello {
+            server_name: "nobody".into(),
+            timestamp: unix_now(),
+            sign: "x".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let resp: rustfrp_core::wire::VisitorResp =
+        timeout(T, read_frame(&mut v)).await.unwrap().unwrap();
+    assert!(!resp.ok && resp.error.contains("not found"), "{resp:?}");
+    // 乱码首帧：这条流被丢弃；控制流照常工作。
+    let mut junk = r._session.open().await.unwrap();
+    junk.write_all(&3u32.to_be_bytes()).await.unwrap();
+    junk.write_all(b"???").await.unwrap();
+    junk.flush().await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = timeout(T, junk.read(&mut buf)).await.unwrap().unwrap_or(0);
+    assert_eq!(n, 0);
+    write_frame(&mut r.ctrl, &ClientMsg::Ping).await.unwrap();
+    assert_eq!(
+        timeout(T, read_frame::<_, ServerMsg>(&mut r.ctrl))
+            .await
+            .unwrap()
+            .unwrap(),
+        ServerMsg::Pong
+    );
+    stop.cancel();
+}
+
+#[tokio::test]
 async fn edge_answers_pings_and_survives_garbage() {
     let (port, stop) = start_edge(EdgeConfig::default()).await;
     let mut r = raw_client(port).await;

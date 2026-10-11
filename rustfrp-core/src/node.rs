@@ -130,6 +130,9 @@ pub enum NodeMsg {
     Online {
         /// 设备 ID。
         client_id: String,
+        /// 节点看到的设备来源地址（不含端口）。
+        #[serde(default)]
+        ip: String,
     },
     /// 设备离线。
     Offline {
@@ -275,6 +278,7 @@ mod tests {
             }),
             NodeMsg::Online {
                 client_id: "c1".into(),
+                ip: "203.0.113.9".into(),
             },
             NodeMsg::Offline {
                 client_id: "c1".into(),
