@@ -3,10 +3,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use rustfrp_core::auth::random_id;
-use rustfrp_core::wire::{ConfigSet, ManagedProxy};
+use rustfrp_core::wire::{ConfigSet, ManagedProxy, SecretOpts, VisitorSpec};
 
 use crate::db::StoreError;
-use crate::models::{Admin, AuditEntry, Client, EnrollToken, Node, Role, Tunnel};
+use crate::models::{Admin, AuditEntry, Client, EnrollToken, Node, Role, Tunnel, Visitor};
 use rustfrp_core::node::{NodeDevice, NodeInfo};
 use rustfrp_core::wire::{HealthSpec, HttpOpts, LbOpts};
 
@@ -664,6 +664,7 @@ pub fn delete_client(c: &Connection, id: &str, now: i64) -> Res<()> {
         return Err(StoreError::NotFound);
     }
     c.execute("UPDATE tunnels SET deleted_at = ?2, enabled = 0 WHERE client_id = ?1 AND deleted_at IS NULL", params![id, now])?;
+    c.execute("UPDATE visitors SET deleted_at = ?2, enabled = 0 WHERE client_id = ?1 AND deleted_at IS NULL", params![id, now])?;
     Ok(())
 }
 
@@ -900,7 +901,11 @@ fn check_host(h: &str) -> Res<()> {
     Ok(())
 }
 
-const KINDS: &[&str] = &["tcp", "udp", "http", "https"];
+const KINDS: &[&str] = &["tcp", "udp", "http", "https", "stcp", "sudp"];
+
+fn is_secret(kind: &str) -> bool {
+    kind == "stcp" || kind == "sudp"
+}
 
 fn is_web(kind: &str) -> bool {
     kind == "http" || kind == "https"
@@ -1081,8 +1086,10 @@ fn check_lb(kind: &str, lb: LbOpts) -> Res<LbOpts> {
     if lb.is_default() {
         return Ok(lb);
     }
-    if kind == "udp" {
-        return bad("load balancer groups and health checks do not apply to udp tunnels");
+    if kind == "udp" || is_secret(kind) {
+        return bad(
+            "load balancer groups and health checks do not apply to udp, stcp and sudp tunnels",
+        );
     }
     let printable = |v: &str| v.len() <= 64 && !v.chars().any(char::is_control);
     if !printable(&lb.group) || !printable(&lb.group_key) {
@@ -1214,7 +1221,7 @@ fn check_tunnel(
     check_name(&t.name, "name")?;
     if !KINDS.contains(&t.kind.as_str()) {
         return Err(StoreError::Invalid(format!(
-            "tunnel type \"{}\" is not supported yet, supported: tcp, udp, http, https",
+            "tunnel type \"{}\" is not supported yet, supported: tcp, udp, http, https, stcp, sudp",
             t.kind
         )));
     }
@@ -1225,14 +1232,22 @@ fn check_tunnel(
     check_subdomain(&t.subdomain)?;
     check_rewrite(&t.rewrite)?;
     let http = check_http_opts(&t.kind, t.http.clone())?;
-    if t.bandwidth_bps > MAX_BANDWIDTH || (t.bandwidth_bps != 0 && t.kind == "udp") {
+    if t.bandwidth_bps > MAX_BANDWIDTH
+        || (t.bandwidth_bps != 0 && (t.kind == "udp" || t.kind == "sudp"))
+    {
         return Err(StoreError::Invalid(
             "bandwidth limit must be 0..=1 TiB/s and does not apply to udp tunnels".into(),
         ));
     }
-    if t.proxy_protocol > 2 || (t.proxy_protocol != 0 && t.kind == "udp") {
+    if t.proxy_protocol > 2 || (t.proxy_protocol != 0 && (t.kind == "udp" || is_secret(&t.kind))) {
         return Err(StoreError::Invalid(
-            "proxy_protocol must be 0, 1 or 2 and does not apply to udp tunnels".into(),
+            "proxy_protocol must be 0, 1 or 2 and does not apply to udp, stcp and sudp tunnels"
+                .into(),
+        ));
+    }
+    if is_secret(&t.kind) && t.remote_port != 0 {
+        return Err(StoreError::Invalid(
+            "stcp / sudp tunnels have no public port; remote_port must be 0".into(),
         ));
     }
     if is_web(&t.kind) {
@@ -1305,9 +1320,9 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
     )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb)],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, secret_key)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), if is_secret(&k.kind) { random_id() } else { String::new() }],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
@@ -1443,6 +1458,12 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
         params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb)],
     )?;
     bump_revision(c, &cur.client_id)?;
+    // 访问者只在目标隧道启用时才下发：启停会改变它们所在设备的配置。
+    if enabled != cur.enabled {
+        for client in visitor_clients(c, "tunnel_id", id)? {
+            bump_revision(c, &client)?;
+        }
+    }
     get_tunnel(c, id)
 }
 
@@ -1474,7 +1495,31 @@ pub fn delete_tunnel(c: &Connection, id: &str, now: i64) -> Res<()> {
         params![id, now],
     )?;
     bump_revision(c, &t.client_id)?;
+    // 指向这条隧道的访问者也一并移除，并让它们所在的设备更新配置。
+    for client in visitor_clients(c, "tunnel_id", id)? {
+        bump_revision(c, &client)?;
+    }
+    c.execute(
+        "UPDATE visitors SET deleted_at = ?2, enabled = 0 WHERE tunnel_id = ?1 AND deleted_at IS NULL",
+        params![id, now],
+    )?;
     Ok(())
+}
+
+/// 指向某条隧道的访问者所在的设备（隧道启停 / 删除后需要重新下发它们的配置）。
+pub fn tunnel_visitor_clients(c: &Connection, tunnel_id: &str) -> Res<Vec<String>> {
+    visitor_clients(c, "tunnel_id", tunnel_id)
+}
+
+/// 受影响设备：按 `column`（`tunnel_id` / `client_id`）取未删除访问者所在的设备。
+fn visitor_clients(c: &Connection, column: &str, value: &str) -> Res<Vec<String>> {
+    let mut st = c.prepare(&format!(
+        "SELECT DISTINCT client_id FROM visitors WHERE {column} = ?1 AND deleted_at IS NULL"
+    ))?;
+    let rows = st
+        .query_map([value], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// 记录 Edge 回报的运行状态（`state`：running / error / stopped）。
@@ -1591,6 +1636,31 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
             ))
         })?
         .collect::<Result<_, _>>()?;
+    let mut secrets: std::collections::HashMap<String, String> = {
+        let mut st = c.prepare(
+            "SELECT id, secret_key FROM tunnels WHERE deleted_at IS NULL AND secret_key <> ''",
+        )?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    let visitors = list_visitors(c, Some(client_id))?
+        .into_iter()
+        .filter(|v| v.enabled)
+        .filter_map(|v| {
+            let t = get_tunnel(c, &v.tunnel_id).ok().filter(|t| t.enabled)?;
+            Some(VisitorSpec {
+                name: v.name,
+                kind: t.kind,
+                server_user: String::new(),
+                server_name: t.id.clone(),
+                sk: secrets.get(&t.id).cloned().unwrap_or_default(),
+                bind_addr: v.bind_addr,
+                bind_port: v.bind_port,
+            })
+        })
+        .collect();
     let proxies = list_tunnels(c, Some(client_id))?
         .into_iter()
         .filter(|t| t.enabled)
@@ -1599,6 +1669,10 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
             ManagedProxy {
                 http,
                 lb,
+                secret: SecretOpts {
+                    sk: secrets.remove(&t.id).unwrap_or_default(),
+                    allow_users: vec![],
+                },
                 proxy_protocol: t.proxy_protocol,
                 bandwidth_bps: t.bandwidth_bps,
                 bandwidth_server: t.bandwidth_server,
@@ -1622,7 +1696,171 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
         restart_seq: u64::try_from(restart_seq).unwrap_or(0),
         revision: client.revision as u64,
         proxies,
+        visitors,
     })
+}
+
+// ───────────── 访问者 ─────────────
+
+const VISITOR_COLS: &str =
+    "id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at";
+
+fn visitor_from(r: &Row<'_>) -> rusqlite::Result<Visitor> {
+    Ok(Visitor {
+        id: r.get(0)?,
+        client_id: r.get(1)?,
+        name: r.get(2)?,
+        tunnel_id: r.get(3)?,
+        bind_addr: r.get(4)?,
+        bind_port: u16::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
+        enabled: r.get::<_, i64>(6)? != 0,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+    })
+}
+
+/// 新建访问者的参数。
+#[derive(Debug, Clone, Default)]
+pub struct NewVisitor {
+    /// 所属设备。
+    pub client_id: String,
+    /// 名称。
+    pub name: String,
+    /// 目标隧道。
+    pub tunnel_id: String,
+    /// 本机监听地址（空 = 127.0.0.1）。
+    pub bind_addr: String,
+    /// 本机监听端口。
+    pub bind_port: i64,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
+/// 修改访问者的参数（`None` 表示不改）。
+#[derive(Debug, Clone, Default)]
+pub struct VisitorPatch {
+    /// 名称。
+    pub name: Option<String>,
+    /// 目标隧道。
+    pub tunnel_id: Option<String>,
+    /// 本机监听地址。
+    pub bind_addr: Option<String>,
+    /// 本机监听端口。
+    pub bind_port: Option<i64>,
+    /// 是否启用。
+    pub enabled: Option<bool>,
+}
+
+/// 取访问者。
+pub fn get_visitor(c: &Connection, id: &str) -> Res<Visitor> {
+    Ok(c.query_row(
+        &format!("SELECT {VISITOR_COLS} FROM visitors WHERE id = ?1 AND deleted_at IS NULL"),
+        [id],
+        visitor_from,
+    )?)
+}
+
+/// 访问者列表（可按设备过滤）。
+pub fn list_visitors(c: &Connection, client_id: Option<&str>) -> Res<Vec<Visitor>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {VISITOR_COLS} FROM visitors WHERE deleted_at IS NULL AND (?1 IS NULL OR client_id = ?1) ORDER BY created_at, name"
+    ))?;
+    let rows = st
+        .query_map([client_id], visitor_from)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 校验访问者：目标必须是同一节点上的启用中的 stcp / sudp 隧道，名称与监听端口在设备内不冲突。
+fn check_visitor(
+    c: &Connection,
+    client_id: &str,
+    v: &NewVisitor,
+    except_id: Option<&str>,
+) -> Res<String> {
+    check_name(&v.name, "name")?;
+    let bind_addr = if v.bind_addr.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        v.bind_addr.trim().to_string()
+    };
+    check_host(&bind_addr)?;
+    check_port(v.bind_port, "bind_port", true)?;
+    let tunnel = get_tunnel(c, &v.tunnel_id).map_err(|e| match e {
+        StoreError::NotFound => StoreError::Invalid("target tunnel does not exist".into()),
+        other => other,
+    })?;
+    if !is_secret(&tunnel.kind) {
+        return Err(StoreError::Invalid(
+            "visitors can only target stcp or sudp tunnels".into(),
+        ));
+    }
+    let here = get_client(c, client_id)?;
+    let there = get_client(c, &tunnel.client_id)?;
+    if here.node_id != there.node_id {
+        return Err(StoreError::Invalid(
+            "the visitor and the target tunnel must be served by the same node".into(),
+        ));
+    }
+    let clash: Option<(String, i64)> = c
+        .query_row(
+            "SELECT name, bind_port FROM visitors WHERE client_id = ?1 AND deleted_at IS NULL AND (?4 IS NULL OR id <> ?4)
+               AND (name = ?2 OR (bind_addr = ?5 AND ?3 <> 0 AND bind_port = ?3))",
+            params![client_id, v.name.trim(), v.bind_port, except_id, bind_addr],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((name, _)) = clash {
+        return Err(StoreError::Conflict(format!(
+            "visitor \"{name}\" already uses this name or listening port on the client"
+        )));
+    }
+    Ok(bind_addr)
+}
+
+/// 创建访问者。
+pub fn create_visitor(c: &Connection, v: &NewVisitor, now: i64) -> Res<Visitor> {
+    get_client(c, &v.client_id)?;
+    let bind_addr = check_visitor(c, &v.client_id, v, None)?;
+    let id = new_id();
+    c.execute(
+        "INSERT INTO visitors (id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+        params![id, v.client_id, v.name.trim(), v.tunnel_id, bind_addr, v.bind_port, i64::from(v.enabled), now],
+    )?;
+    bump_revision(c, &v.client_id)?;
+    get_visitor(c, &id)
+}
+
+/// 修改访问者。
+pub fn update_visitor(c: &Connection, id: &str, p: &VisitorPatch, now: i64) -> Res<Visitor> {
+    let cur = get_visitor(c, id)?;
+    let next = NewVisitor {
+        client_id: cur.client_id.clone(),
+        name: p.name.clone().unwrap_or_else(|| cur.name.clone()),
+        tunnel_id: p.tunnel_id.clone().unwrap_or_else(|| cur.tunnel_id.clone()),
+        bind_addr: p.bind_addr.clone().unwrap_or_else(|| cur.bind_addr.clone()),
+        bind_port: p.bind_port.unwrap_or(i64::from(cur.bind_port)),
+        enabled: p.enabled.unwrap_or(cur.enabled),
+    };
+    let bind_addr = check_visitor(c, &cur.client_id, &next, Some(id))?;
+    c.execute(
+        "UPDATE visitors SET name=?2, tunnel_id=?3, bind_addr=?4, bind_port=?5, enabled=?6, updated_at=?7 WHERE id=?1",
+        params![id, next.name.trim(), next.tunnel_id, bind_addr, next.bind_port, i64::from(next.enabled), now],
+    )?;
+    bump_revision(c, &cur.client_id)?;
+    get_visitor(c, id)
+}
+
+/// 软删除访问者。
+pub fn delete_visitor(c: &Connection, id: &str, now: i64) -> Res<()> {
+    let v = get_visitor(c, id)?;
+    c.execute(
+        "UPDATE visitors SET deleted_at = ?2, enabled = 0 WHERE id = ?1",
+        params![id, now],
+    )?;
+    bump_revision(c, &v.client_id)?;
+    Ok(())
 }
 
 // ───────────── 审计与统计 ─────────────
@@ -2895,7 +3133,7 @@ mod tests {
         create_tunnel(&c, &nt(&b.id, "auto2", 0), 12).unwrap();
 
         let mut bad = nt(&a.id, "x", 1);
-        bad.kind = "stcp".into();
+        bad.kind = "xtcp".into();
         assert!(
             matches!(create_tunnel(&c, &bad, 1), Err(StoreError::Invalid(m)) if m.contains("not supported yet"))
         );

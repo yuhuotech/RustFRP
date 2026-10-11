@@ -21,8 +21,8 @@ use rustfrp_core::pipe;
 use rustfrp_core::tls::{self, Identity};
 use rustfrp_core::vhost::proxy_hosts;
 use rustfrp_core::wire::{
-    read_frame, write_frame, ClientMsg, ConfigSet, Login, ManagedProxy, ProxySpec, ServerMsg,
-    StartWork, PROTOCOL_VERSION,
+    read_frame, write_frame, ClientMsg, ConfigSet, Login, ManagedProxy, ProxySpec, SecretOpts,
+    ServerMsg, StartWork, VisitorHello, VisitorResp, PROTOCOL_VERSION,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -301,6 +301,7 @@ impl Edge {
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let routes = Arc::new(Routes::default());
         let groups = Arc::new(TcpGroups::new(shutdown.clone()));
+        let secrets = Arc::new(SecretRegistry::default());
         let vopts = VhostOpts {
             head_timeout: self.cfg.vhost_head_timeout,
             open_timeout: self.cfg.user_conn_timeout,
@@ -330,6 +331,8 @@ impl Edge {
                         names: names.clone(),
                         routes: routes.clone(),
                         groups: groups.clone(),
+                        secrets: secrets.clone(),
+                        user: String::new(),
                         traffic: self.traffic.clone(),
                         limiter: None,
                         log: self.log.clone(),
@@ -354,6 +357,9 @@ struct ClientCtx {
     names: Arc<crate::metrics::Metrics>,
     routes: Arc<Routes>,
     groups: Arc<TcpGroups>,
+    secrets: Arc<SecretRegistry>,
+    /// 当前客户端登录时声明的用户名。
+    user: String,
     traffic: Arc<pipe::Traffic>,
     /// 服务端限速（`bandwidthLimitMode = "server"`）；`None` = 不限。
     limiter: Option<Arc<pipe::Limiter>>,
@@ -377,12 +383,11 @@ async fn handle_client(tcp: TcpStream, ctx: ClientCtx) -> Result<(), TunnelError
         Ok(ctx.acceptor.accept(tcp).await?)
     })
     .await?;
-    let (session, mut inbound, driver) = mux::spawn(tls, true, ctx.cfg.mux);
-    let result = control_loop(&session, &mut inbound, &ctx).await;
+    let (session, inbound, driver) = mux::spawn(tls, true, ctx.cfg.mux);
+    let result = control_loop(&session, inbound, &ctx).await;
     ctx.cancel.cancel();
     // 先让驱动把已排队的帧（例如登录失败的原因）发完再关闭，超时才强制终止。
     drop(session);
-    drop(inbound);
     let mut driver = driver;
     if timeout(Duration::from_secs(2), &mut driver).await.is_err() {
         driver.abort();
@@ -392,7 +397,7 @@ async fn handle_client(tcp: TcpStream, ctx: ClientCtx) -> Result<(), TunnelError
 
 async fn control_loop(
     session: &Session,
-    inbound: &mut mpsc::Receiver<Stream>,
+    mut inbound: mpsc::Receiver<Stream>,
     ctx: &ClientCtx,
 ) -> Result<(), TunnelError> {
     let ctrl = within(ctx.cfg.handshake_timeout, "control stream", async {
@@ -452,6 +457,12 @@ async fn control_loop(
     ));
 
     let reader = spawn_reader(rd);
+    // 此后客户端主动打开的流都是访问者连接。
+    let ctx = &ClientCtx {
+        user: login.user.clone(),
+        ..ctx.clone()
+    };
+    tokio::spawn(serve_visitor_streams(inbound, ctx.clone()));
     match admission {
         Admission::Standalone => serve_standalone(session, reader, &mut wr, ctx).await,
         Admission::Managed(m) => serve_managed(session, reader, &mut wr, ctx, m).await,
@@ -506,7 +517,7 @@ async fn serve_standalone(
                     {
                         Err("exceed the max_ports_per_client".to_string())
                     } else {
-                        activate(session, &ProxyDef::from(&spec), ctx)
+                        activate(session, &ProxyDef::from(&*spec), ctx)
                             .await
                             .map(|s| {
                                 ups.insert(spec.name.clone(), s.up);
@@ -710,6 +721,7 @@ struct ProxyDef {
     bandwidth_bps: u64,
     bandwidth_server: bool,
     lb: rustfrp_core::wire::LbOpts,
+    secret: SecretOpts,
 }
 
 impl From<&ProxySpec> for ProxyDef {
@@ -725,6 +737,7 @@ impl From<&ProxySpec> for ProxyDef {
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
             lb: p.lb.clone(),
+            secret: p.secret.clone(),
         }
     }
 }
@@ -742,6 +755,7 @@ impl From<&ManagedProxy> for ProxyDef {
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
             lb: p.lb.clone(),
+            secret: p.secret.clone(),
         }
     }
 }
@@ -758,12 +772,13 @@ fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
         && a.lb.group == b.lb.group
         && a.lb.group_key == b.lb.group_key
         && a.lb.health.is_some() == b.lb.health.is_some()
+        && a.secret == b.secret
         && (!a.bandwidth_server || a.bandwidth_bps == b.bandwidth_bps)
 }
 
 /// 启动一个代理（tcp / udp / http / https）。成功返回（对外端口, 停止令牌），失败返回给客户端看的原因。
 async fn activate(session: &Session, def: &ProxyDef, ctx: &ClientCtx) -> Result<Started, String> {
-    if !["tcp", "udp", "http", "https"].contains(&def.kind.as_str()) {
+    if !["tcp", "udp", "http", "https", "stcp", "sudp"].contains(&def.kind.as_str()) {
         return Err(format!("proxy type [{}] is not supported yet", def.kind));
     }
     if !ctx.names.claim(&def.name) {
@@ -852,6 +867,32 @@ async fn launch(
             tokio::spawn(accept_visitors(listener, member, sub));
             Ok(port)
         }
+        "stcp" | "sudp" => {
+            if def.secret.sk.is_empty() {
+                return Err("secretKey must not be empty".into());
+            }
+            if !def.lb.group.is_empty() || def.lb.health.is_some() {
+                return Err("secret proxies don't support load balancer groups".into());
+            }
+            let id = ctx.secrets.register(
+                &def.name,
+                SecretProxy {
+                    id: 0,
+                    session: session.clone(),
+                    sk: def.secret.sk.clone(),
+                    allow_users: def.secret.allow_users.clone(),
+                    owner: ctx.user.clone(),
+                    traffic: sub.traffic.clone(),
+                    limiter: sub.limiter.clone(),
+                },
+            );
+            let (secrets, name, stop) = (ctx.secrets.clone(), def.name.clone(), stop.clone());
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                secrets.remove(&name, id);
+            });
+            Ok(0)
+        }
         "udp" => {
             let sock = bind_udp_port(def.remote_port, &ctx.cfg).await?;
             let port = sock.local_addr().map_or(def.remote_port, |a| a.port());
@@ -861,6 +902,7 @@ async fn launch(
                 packet_size: ctx.cfg.udp_packet_size,
                 open_timeout: ctx.cfg.user_conn_timeout,
                 traffic: sub.traffic.clone(),
+                visitor: None,
             };
             tokio::spawn(udp_proxy(
                 sock,
@@ -1168,6 +1210,149 @@ async fn forward(
         }
         None => {
             pipe::relay_counted(&mut visitor, &mut stream, &m.traffic).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 一个可被访问者连接的 stcp / sudp 代理。
+#[derive(Clone)]
+struct SecretProxy {
+    id: u64,
+    session: Session,
+    sk: String,
+    allow_users: Vec<String>,
+    /// 代理所属用户（登录时声明）。
+    owner: String,
+    traffic: Arc<pipe::Traffic>,
+    limiter: Option<Arc<pipe::Limiter>>,
+}
+
+/// Edge 上全部 stcp / sudp 代理（按完整名索引）。
+#[derive(Default)]
+struct SecretRegistry {
+    map: std::sync::Mutex<HashMap<String, SecretProxy>>,
+    next_id: AtomicU64,
+}
+
+impl SecretRegistry {
+    fn register(&self, name: &str, mut p: SecretProxy) -> u64 {
+        p.id = self.next_id.fetch_add(1, Relaxed) + 1;
+        let id = p.id;
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string(), p);
+        id
+    }
+
+    /// 只移除同一次登记（同名代理重启后不会被旧任务误删）。
+    fn remove(&self, name: &str, id: u64) {
+        let mut m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if m.get(name).is_some_and(|p| p.id == id) {
+            m.remove(name);
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<SecretProxy> {
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
+}
+
+/// 处理访问者客户端主动打开的流：校验密钥与权限后，把它接到目标代理所在会话上。
+async fn serve_visitor_streams(mut inbound: mpsc::Receiver<Stream>, ctx: ClientCtx) {
+    loop {
+        let stream = tokio::select! {
+            _ = ctx.cancel.cancelled() => return,
+            s = inbound.recv() => match s { Some(s) => s, None => return },
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = visitor_conn(stream, &ctx).await {
+                ctx.log.debug(&format!("visitor connection: {e}"));
+            }
+        });
+    }
+}
+
+async fn visitor_conn(mut stream: Stream, ctx: &ClientCtx) -> Result<(), TunnelError> {
+    let hello: VisitorHello = within(
+        ctx.cfg.handshake_timeout,
+        "visitor hello",
+        read_frame(&mut stream),
+    )
+    .await?;
+    let refuse = |why: &str| VisitorResp {
+        ok: false,
+        error: why.to_string(),
+    };
+    let Some(target) = ctx.secrets.get(&hello.server_name) else {
+        write_frame(
+            &mut stream,
+            &refuse(&format!("proxy [{}] not found", hello.server_name)),
+        )
+        .await?;
+        return Ok(());
+    };
+    if !auth::verify(&target.sk, hello.timestamp, &hello.sign, auth::unix_now()) {
+        ctx.log.warn(&format!(
+            "visitor [{}] refused for proxy [{}]: bad secret key",
+            ctx.user, hello.server_name
+        ));
+        write_frame(&mut stream, &refuse("invalid secret key")).await?;
+        return Ok(());
+    }
+    let allowed = ctx.user == target.owner
+        || target
+            .allow_users
+            .iter()
+            .any(|u| u == "*" || *u == ctx.user);
+    if !allowed {
+        write_frame(
+            &mut stream,
+            &refuse("user is not allowed to visit this proxy"),
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut work = within(
+        ctx.cfg.user_conn_timeout,
+        "open work stream",
+        target.session.open(),
+    )
+    .await?;
+    write_frame(
+        &mut work,
+        &StartWork {
+            proxy: hello.server_name.clone(),
+            src: format!("visitor:{}", ctx.user),
+            dst: String::new(),
+        },
+    )
+    .await?;
+    write_frame(
+        &mut stream,
+        &VisitorResp {
+            ok: true,
+            error: String::new(),
+        },
+    )
+    .await?;
+    match &target.limiter {
+        Some(l) => {
+            let mut v = pipe::Limited::new(stream, l.clone());
+            let mut w = pipe::Limited::new(work, l.clone());
+            pipe::relay_counted(&mut v, &mut w, &target.traffic).await?;
+        }
+        None => {
+            pipe::relay_counted(&mut stream, &mut work, &target.traffic).await?;
         }
     }
     Ok(())

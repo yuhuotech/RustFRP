@@ -251,7 +251,7 @@ async fn unsupported_type_duplicate_names_and_port_cap() {
     .await;
     let echo = start_echo().await;
     let mut udp = tcp_proxy("u", echo, 0);
-    udp.kind = "stcp".into();
+    udp.kind = "xtcp".into();
     let proxies = vec![
         udp,
         tcp_proxy("a", echo, 0),

@@ -707,7 +707,7 @@ async fn tunnel_crud_and_validation() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(v["error"]["message"].as_str().unwrap().contains("outside"));
     let mut udp = mk("u", 0);
-    udp["kind"] = json!("stcp");
+    udp["kind"] = json!("xtcp");
     assert_eq!(
         r.send(Method::POST, "/api/v1/tunnels", &op, udp).await.0,
         StatusCode::BAD_REQUEST
@@ -2408,4 +2408,226 @@ async fn a_disabled_builtin_node_is_hidden_and_refuses_builtin_tokens() {
         )
         .await;
     assert_eq!(st, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn visitors_target_stcp_tunnels_and_follow_their_lifecycle() {
+    let r = rig().await;
+    let op = r.admin("vis-op", Role::Operator).await;
+    let viewer = r.admin("vis-viewer", Role::Viewer).await;
+    let provider = r.client("provider").await;
+    let consumer = r.client("consumer").await;
+    // 私密隧道没有公网端口，也不会通过 API 泄露密钥。
+    let (st, stcp) = r
+        .send(
+            Method::POST,
+            "/api/v1/tunnels",
+            &op,
+            json!({"client_id": provider, "name": "ssh", "kind": "stcp", "local_port": 22, "reason": "x"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{stcp}");
+    assert!(!stcp.to_string().contains("secret"), "{stcp}");
+    let tid = stcp["id"].as_str().unwrap().to_string();
+    for (body, want) in [
+        (
+            json!({"client_id": provider, "name": "p", "kind": "stcp", "local_port": 22, "remote_port": 6000, "reason": "x"}),
+            "no public port",
+        ),
+        (
+            json!({"client_id": provider, "name": "g", "kind": "sudp", "local_port": 22, "lb_group": "g", "reason": "x"}),
+            "do not apply",
+        ),
+    ] {
+        let (st, v) = r.send(Method::POST, "/api/v1/tunnels", &op, body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains(want),
+            "{v}"
+        );
+    }
+    let plain = r
+        .send(
+            Method::POST,
+            "/api/v1/tunnels",
+            &op,
+            json!({"client_id": provider, "name": "plain", "local_port": 1, "reason": "x"}),
+        )
+        .await
+        .1;
+
+    // 创建访问者：只能指向 stcp / sudp 隧道。
+    let body = json!({"client_id": consumer, "name": "to-ssh", "tunnel_id": tid, "bind_port": 2222, "reason": "x"});
+    let (st, v) = r
+        .send(Method::POST, "/api/v1/visitors", &op, body.clone())
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(
+        (v["bind_addr"].as_str(), v["bind_port"].as_u64()),
+        (Some("127.0.0.1"), Some(2222))
+    );
+    let vid = v["id"].as_str().unwrap().to_string();
+    for (patch, want, code) in [
+        (
+            json!({"tunnel_id": plain["id"], "name": "x", "reason": "x"}),
+            "stcp or sudp",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"tunnel_id": "nope", "name": "x", "reason": "x"}),
+            "does not exist",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"name": "dup-port", "tunnel_id": tid, "bind_port": 2222, "reason": "x"}),
+            "already uses",
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"name": "to-ssh", "tunnel_id": tid, "reason": "x"}),
+            "already uses",
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"name": "bad", "tunnel_id": tid, "bind_port": 70000, "reason": "x"}),
+            "bind_port",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let mut b = body.clone();
+        for (k, val) in patch.as_object().unwrap() {
+            b[k] = val.clone();
+        }
+        let (st, v) = r.send(Method::POST, "/api/v1/visitors", &op, b).await;
+        assert_eq!(st, code, "{v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains(want),
+            "{v}"
+        );
+    }
+    // 列表；Viewer 可读不可写。
+    let (_, list) = r
+        .get(&format!("/api/v1/visitors?client_id={consumer}"), &viewer)
+        .await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (st, _) = r
+        .send(Method::POST, "/api/v1/visitors", &viewer, body.clone())
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // 下发给访问者所在设备的配置带上目标隧道 ID 与密钥；提供方拿到同一个密钥。
+    let (c1, p1) = (consumer.clone(), provider.clone());
+    let (cfg, provider_cfg) =
+        r.db.call(move |c| {
+            Ok((
+                store::managed_config(c, &c1)?,
+                store::managed_config(c, &p1)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(cfg.visitors.len(), 1);
+    let spec = &cfg.visitors[0];
+    assert_eq!(
+        (
+            spec.server_name.as_str(),
+            spec.kind.as_str(),
+            spec.bind_port
+        ),
+        (tid.as_str(), "stcp", 2222)
+    );
+    assert_eq!(spec.sk.len(), 32);
+    let proxy = provider_cfg.proxies.iter().find(|p| p.name == tid).unwrap();
+    assert_eq!(proxy.secret.sk, spec.sk);
+
+    // 修改与停用；目标隧道停用后访问者不再下发；删除隧道会连带移除访问者。
+    let path = format!("/api/v1/visitors/{vid}");
+    let (st, v) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &op,
+            json!({"bind_port": 0, "bind_addr": "0.0.0.0", "reason": "x"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["bind_addr"].as_str()),
+        (StatusCode::OK, Some("0.0.0.0"))
+    );
+    let tpath = format!("/api/v1/tunnels/{tid}");
+    r.send(
+        Method::PATCH,
+        &tpath,
+        &op,
+        json!({"enabled": false, "reason": "x"}),
+    )
+    .await;
+    let c2 = consumer.clone();
+    let cfg =
+        r.db.call(move |c| store::managed_config(c, &c2))
+            .await
+            .unwrap();
+    assert!(cfg.visitors.is_empty());
+    r.send(
+        Method::PATCH,
+        &tpath,
+        &op,
+        json!({"enabled": true, "reason": "x"}),
+    )
+    .await;
+    let (st, _) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &op,
+            json!({"enabled": false, "reason": "x"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &op,
+            json!({"enabled": true, "reason": "x"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        r.req(
+            Method::DELETE,
+            &format!("{tpath}?reason=bye"),
+            Some(&op),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, list) = r.get("/api/v1/visitors", &viewer).await;
+    assert!(list.as_array().unwrap().is_empty(), "{list}");
+    // 单独删除访问者、不存在的访问者。
+    let (st, v2) = r.send(Method::POST, "/api/v1/tunnels", &op, json!({"client_id": provider, "name": "s2", "kind": "sudp", "local_port": 53, "reason": "x"})).await;
+    assert_eq!(st, StatusCode::CREATED, "{v2}");
+    let (_, v3) = r
+        .send(
+            Method::POST,
+            "/api/v1/visitors",
+            &op,
+            json!({"client_id": consumer, "name": "again", "tunnel_id": v2["id"], "reason": "x"}),
+        )
+        .await;
+    let del = format!("/api/v1/visitors/{}?reason=bye", v3["id"].as_str().unwrap());
+    assert_eq!(
+        r.req(Method::DELETE, &del, Some(&op), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.req(Method::DELETE, &del, Some(&op), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let actions = r.audit_actions().await;
+    for a in ["visitor.create", "visitor.update", "visitor.delete"] {
+        assert!(actions.iter().any(|x| x == a), "{a}: {actions:?}");
+    }
 }

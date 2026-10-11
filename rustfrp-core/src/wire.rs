@@ -116,6 +116,66 @@ impl LbOpts {
     }
 }
 
+/// stcp / sudp 代理的访问控制（frp 的 `secretKey` / `allowUsers`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SecretOpts {
+    /// 访问密钥：访问者必须持有同一个密钥。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sk: String,
+    /// 允许访问的用户：空 = 仅同一用户，`*` = 任何用户。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_users: Vec<String>,
+}
+
+impl SecretOpts {
+    /// 全部为默认值（序列化时整体省略）。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 访问者（stcp / sudp）在本机监听，把连接经 Edge 送到对端的同名代理。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VisitorSpec {
+    /// 名称。
+    pub name: String,
+    /// `stcp` / `sudp`。
+    pub kind: String,
+    /// 目标代理所属用户；空 = 与本客户端同一用户。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_user: String,
+    /// 目标代理名。
+    pub server_name: String,
+    /// 访问密钥。
+    pub sk: String,
+    /// 本机监听地址。
+    #[serde(default)]
+    pub bind_addr: String,
+    /// 本机监听端口，0 = 自动分配。
+    pub bind_port: u16,
+}
+
+/// 访问者在新流上发给 Edge 的第一帧。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisitorHello {
+    /// 目标代理的完整名。
+    pub server_name: String,
+    /// 签名时间戳（秒）。
+    pub timestamp: i64,
+    /// `auth_key(sk, timestamp)`。
+    pub sign: String,
+}
+
+/// Edge 对访问者的应答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisitorResp {
+    /// 是否放行（放行后流即成为到对端的透明通道）。
+    pub ok: bool,
+    /// 拒绝原因。
+    #[serde(default)]
+    pub error: String,
+}
+
 impl HttpOpts {
     /// 全部为默认值（序列化时整体省略，保持旧线格式不变）。
     pub fn is_default(&self) -> bool {
@@ -160,6 +220,9 @@ pub struct ManagedProxy {
     /// 负载均衡组与健康检查。
     #[serde(default, skip_serializing_if = "LbOpts::is_default")]
     pub lb: LbOpts,
+    /// stcp / sudp 的访问控制。
+    #[serde(default, skip_serializing_if = "SecretOpts::is_default")]
+    pub secret: SecretOpts,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -177,6 +240,9 @@ pub struct ConfigSet {
     pub revision: u64,
     /// 全部代理。
     pub proxies: Vec<ManagedProxy>,
+    /// 这台设备上运行的访问者（stcp / sudp）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visitors: Vec<VisitorSpec>,
     /// 远程重启计数：值比会话开始时大，说明管理员要求重启这台设备上的 agent。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub restart_seq: u64,
@@ -216,16 +282,20 @@ pub struct ProxySpec {
     /// 负载均衡组与健康检查。
     #[serde(default, skip_serializing_if = "LbOpts::is_default")]
     pub lb: LbOpts,
+    /// stcp / sudp 的访问控制。
+    #[serde(default, skip_serializing_if = "SecretOpts::is_default")]
+    pub secret: SecretOpts,
 }
 
 /// Client → Edge。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // 消息逐条收发，不在集合里长期存放
 pub enum ClientMsg {
     /// 登录。
     Login(Login),
     /// 注册代理。
-    NewProxy(ProxySpec),
+    NewProxy(Box<ProxySpec>),
     /// 心跳。
     Ping,
     /// 已应用某版受管配置。
@@ -347,12 +417,12 @@ mod tests {
         let (mut a, mut b) = duplex(4096);
         let c = [
             ClientMsg::Login(login()),
-            ClientMsg::NewProxy(ProxySpec {
+            ClientMsg::NewProxy(Box::new(ProxySpec {
                 name: "n".into(),
                 kind: "tcp".into(),
                 remote_port: 6000,
                 ..Default::default()
-            }),
+            })),
             ClientMsg::Ping,
             ClientMsg::Applied { revision: 7 },
             ClientMsg::Login(Login {

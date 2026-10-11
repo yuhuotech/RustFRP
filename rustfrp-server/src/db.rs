@@ -52,6 +52,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (10, include_str!("../migrations/0010_proxy_protocol.sql")),
     (11, include_str!("../migrations/0011_bandwidth.sql")),
     (12, include_str!("../migrations/0012_load_balancer.sql")),
+    (13, include_str!("../migrations/0013_visitors.sql")),
 ];
 
 /// 执行未应用的迁移（以 `PRAGMA user_version` 记录进度）。
@@ -190,7 +191,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
         for t in [
             "admins",
             "admin_sessions",

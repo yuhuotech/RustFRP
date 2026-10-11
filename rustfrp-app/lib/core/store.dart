@@ -265,6 +265,7 @@ final nodeProvider = _live((a) => a.node());
 final nodesProvider = _live((a) => a.nodes());
 final clientsProvider = _live((a) => a.clients());
 final tunnelsProvider = _live((a) => a.tunnels());
+final visitorsProvider = _live((a) => a.visitors());
 final tokensProvider = _live((a) => a.enrollTokens());
 final auditProvider = _live((a) => a.audit());
 final controllerLogsProvider = _live((a) => a.controllerLogs());
@@ -284,6 +285,7 @@ class Actions {
       nodesProvider,
       clientsProvider,
       tunnelsProvider,
+      visitorsProvider,
       tokensProvider,
       auditProvider,
     ]) {
@@ -415,6 +417,47 @@ class Actions {
       reason: reason,
     ),
   );
+
+  Future<Visitor> createVisitor({
+    required String clientId,
+    required String name,
+    required String tunnelId,
+    String bindAddr = '127.0.0.1',
+    int bindPort = 0,
+    required String reason,
+  }) => _do(
+    () => _api.createVisitor(
+      clientId: clientId,
+      name: name,
+      tunnelId: tunnelId,
+      bindAddr: bindAddr,
+      bindPort: bindPort,
+      reason: reason,
+    ),
+  );
+
+  Future<Visitor> updateVisitor(
+    String id, {
+    String? name,
+    String? tunnelId,
+    String? bindAddr,
+    int? bindPort,
+    bool? enabled,
+    required String reason,
+  }) => _do(
+    () => _api.patchVisitor(
+      id,
+      name: name,
+      tunnelId: tunnelId,
+      bindAddr: bindAddr,
+      bindPort: bindPort,
+      enabled: enabled,
+      reason: reason,
+    ),
+  );
+
+  Future<void> deleteVisitor(String id, String reason) =>
+      _do(() => _api.deleteVisitor(id, reason: reason));
 
   Future<void> batchTunnels(List<String> ids, bool enabled, String reason) =>
       _do(() => _api.batchTunnels(ids, enabled, reason));

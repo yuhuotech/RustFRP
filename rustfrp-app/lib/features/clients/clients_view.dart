@@ -11,6 +11,7 @@ import '../../theme/tokens.dart';
 import '../shell/shell.dart';
 import '../tunnels/tunnels_view.dart';
 import 'enroll_dialog.dart';
+import 'visitors_section.dart';
 
 class ClientsList extends ConsumerWidget {
   const ClientsList({super.key, this.narrow = false, this.showHeader = false});
@@ -476,6 +477,8 @@ class ClientDetail extends ConsumerWidget {
                     padding: const EdgeInsets.only(bottom: 8),
                     child: TunnelCard(tunnel: t, showClient: false),
                   ),
+              const SizedBox(height: 24),
+              VisitorsSection(clientId: d.id),
             ],
           ),
         ),

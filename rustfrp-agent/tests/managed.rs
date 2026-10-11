@@ -433,12 +433,12 @@ async fn managed_edge_rejects_clients_that_register_proxies_themselves() {
     ));
     write_frame(
         &mut ctrl,
-        &ClientMsg::NewProxy(ProxySpec {
+        &ClientMsg::NewProxy(Box::new(ProxySpec {
             name: "x".into(),
             kind: "tcp".into(),
             remote_port: 0,
             ..Default::default()
-        }),
+        })),
     )
     .await
     .unwrap();

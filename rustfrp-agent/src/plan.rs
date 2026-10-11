@@ -186,7 +186,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
     let mut notes = Vec::new();
     let mut proxies = Vec::new();
     for p in &l.proxies {
-        if !["tcp", "udp", "http", "https"].contains(&p.kind.as_str()) {
+        if !["tcp", "udp", "http", "https", "stcp", "sudp"].contains(&p.kind.as_str()) {
             notes.push(format!(
                 "proxy [{}]: type \"{}\" is not supported yet, skipped",
                 p.name, p.kind
@@ -231,6 +231,10 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
                     .map_err(|e| format!("proxy [{}]: {e}", p.name))?
             },
             lb: lb_opts(p),
+            secret: rustfrp_core::wire::SecretOpts {
+                sk: p.secret_key.clone(),
+                allow_users: p.allow_users.clone(),
+            },
             plugin,
             http: if p.kind == "http" {
                 rustfrp_core::wire::HttpOpts {
@@ -252,11 +256,33 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             ));
         }
     }
+    let mut visitors = Vec::new();
     for v in &l.visitors {
-        notes.push(format!(
-            "visitor [{}]: visitors are not supported yet, skipped",
-            v.name
-        ));
+        if !["stcp", "sudp"].contains(&v.kind.as_str()) {
+            notes.push(format!(
+                "visitor [{}]: type \"{}\" is not supported yet, skipped",
+                v.name, v.kind
+            ));
+            continue;
+        }
+        if v.enabled == Some(false) {
+            continue;
+        }
+        visitors.push(rustfrp_core::wire::VisitorSpec {
+            name: v.name.clone(),
+            kind: v.kind.clone(),
+            server_user: v.server_user.clone(),
+            server_name: v.server_name.clone(),
+            sk: v.secret_key.clone(),
+            bind_addr: v.bind_addr.clone(),
+            bind_port: port(v.bind_port, &format!("visitor [{}] bindPort", v.name))?,
+        });
+        if v.transport.use_encryption || v.transport.use_compression {
+            notes.push(format!(
+                "visitor [{}]: option transport.useEncryption / useCompression is not supported yet and is ignored",
+                v.name
+            ));
+        }
     }
     let trusted_ca_pem = if c.transport.tls.trusted_ca_file.is_empty() {
         None
@@ -282,6 +308,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
         trusted_ca_pem,
         login_fail_exit: c.login_fail_exit.unwrap_or(true),
         proxies,
+        visitors,
         dial_timeout: secs(c.transport.dial_server_timeout, 10),
         heartbeat_interval: secs(hb_interval, 30),
         heartbeat_timeout: secs(c.transport.heartbeat_timeout, 90),
@@ -561,7 +588,6 @@ bindPort = 1
             ("10.0.0.1", 7100)
         );
         assert_eq!(p.cfg.token, "tk");
-        assert_eq!(p.cfg.proxies.len(), 4);
         assert_eq!(
             (p.cfg.proxies[0].name.as_str(), p.cfg.proxies[0].remote_port),
             ("alice.ssh", 6000)
@@ -584,13 +610,18 @@ bindPort = 1
             ("./frpc.log", "debug")
         );
         assert_eq!(
-            p.cfg.proxies[3].plugin.as_ref().map(|x| x.kind.as_str()),
+            p.cfg.proxies[4].plugin.as_ref().map(|x| x.kind.as_str()),
             Some("socks5")
         );
-        assert_eq!(p.notes.len(), 3);
+        // sudp 代理现在已支持（没有 secretKey 时由 Edge 在运行期拒绝）；stcp 访问者被接受。
+        assert_eq!(p.cfg.proxies.len(), 5);
+        assert_eq!(p.cfg.visitors.len(), 1);
+        assert_eq!(
+            (p.cfg.visitors[0].name.as_str(), p.cfg.visitors[0].bind_port),
+            ("v", 1)
+        );
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
         assert!(p.notes[0].contains("transport.useEncryption"));
-        assert!(p.notes[1].contains("type \"sudp\""));
-        assert!(p.notes[2].contains("visitor [v]"));
     }
 
     #[test]

@@ -161,6 +161,29 @@ pub struct Tunnel {
     pub health_check: Option<rustfrp_core::wire::HealthSpec>,
 }
 
+/// 访问者：在设备上监听本机端口，把连接送到一条 stcp / sudp 隧道。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Visitor {
+    /// ID。
+    pub id: String,
+    /// 所属设备。
+    pub client_id: String,
+    /// 名称。
+    pub name: String,
+    /// 目标隧道 ID。
+    pub tunnel_id: String,
+    /// 本机监听地址。
+    pub bind_addr: String,
+    /// 本机监听端口，0 = 自动分配。
+    pub bind_port: u16,
+    /// 是否启用。
+    pub enabled: bool,
+    /// 创建时间。
+    pub created_at: i64,
+    /// 更新时间。
+    pub updated_at: i64,
+}
+
 /// 接入令牌（不含明文）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollToken {

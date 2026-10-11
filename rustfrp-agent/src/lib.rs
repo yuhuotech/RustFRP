@@ -22,6 +22,7 @@ pub mod plan;
 pub mod plugin;
 pub mod proxy_rt;
 pub mod service;
+pub mod visitor;
 
 pub mod metrics;
 pub mod node;

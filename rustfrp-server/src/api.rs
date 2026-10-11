@@ -1274,6 +1274,7 @@ async fn batch_tunnels(
                     now,
                 )?;
                 clients.insert(t.client_id);
+                clients.extend(store::tunnel_visitor_clients(&tx, &id)?);
             }
             tx.commit()?;
             Ok(clients)
@@ -1363,11 +1364,16 @@ async fn patch_tunnel(
                 &ip,
                 now,
             )?;
+            let visitors = store::tunnel_visitor_clients(&tx, &t.id)?;
             tx.commit()?;
-            Ok(t)
+            Ok((t, visitors))
         })
         .await?;
+    let (t, visitors) = t;
     st.hub.refresh(&t.client_id).await?;
+    for client in visitors {
+        st.hub.refresh(&client).await?;
+    }
     Ok(Json(t))
 }
 
@@ -1386,6 +1392,7 @@ async fn delete_tunnel(
             let tx = c.transaction()?;
             let now = store::now_ms();
             let t = store::get_tunnel(&tx, &id)?;
+            let visitors = store::tunnel_visitor_clients(&tx, &id)?;
             store::delete_tunnel(&tx, &id, now)?;
             store::audit(
                 &tx,
@@ -1399,7 +1406,168 @@ async fn delete_tunnel(
                 now,
             )?;
             tx.commit()?;
-            Ok(t.client_id)
+            Ok((t.client_id, visitors))
+        })
+        .await?;
+    let (client_id, visitors) = client_id;
+    st.hub.refresh(&client_id).await?;
+    for client in visitors {
+        st.hub.refresh(&client).await?;
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+// ───────────── 访问者 ─────────────
+
+async fn list_visitors(
+    State(st): State<AppState>,
+    _a: Auth,
+    Query(q): Query<TunnelFilter>,
+) -> ApiResult<Vec<crate::models::Visitor>> {
+    Ok(Json(
+        st.db
+            .call(move |c| store::list_visitors(c, q.client_id.as_deref()))
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateVisitor {
+    client_id: String,
+    name: String,
+    tunnel_id: String,
+    #[serde(default)]
+    bind_addr: String,
+    #[serde(default)]
+    bind_port: i64,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn create_visitor(
+    State(st): State<AppState>,
+    a: Auth,
+    Json(b): Json<CreateVisitor>,
+) -> Result<(StatusCode, Json<crate::models::Visitor>), ApiError> {
+    a.require(&st, Role::Operator).await?;
+    let why = reason(&b.reason)?;
+    let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
+    let new = store::NewVisitor {
+        client_id: b.client_id,
+        name: b.name,
+        tunnel_id: b.tunnel_id,
+        bind_addr: b.bind_addr,
+        bind_port: b.bind_port,
+        enabled: b.enabled,
+    };
+    let v = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let v = store::create_visitor(&tx, &new, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "visitor.create",
+                "visitor",
+                &v.id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(v)
+        })
+        .await?;
+    st.hub.refresh(&v.client_id).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+#[derive(Deserialize)]
+struct PatchVisitor {
+    name: Option<String>,
+    tunnel_id: Option<String>,
+    bind_addr: Option<String>,
+    bind_port: Option<i64>,
+    enabled: Option<bool>,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn patch_visitor(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<PatchVisitor>,
+) -> ApiResult<crate::models::Visitor> {
+    a.require(&st, Role::Operator).await?;
+    let why = reason(&b.reason)?;
+    let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
+    let patch = store::VisitorPatch {
+        name: b.name,
+        tunnel_id: b.tunnel_id,
+        bind_addr: b.bind_addr,
+        bind_port: b.bind_port,
+        enabled: b.enabled,
+    };
+    let v = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let v = store::update_visitor(&tx, &id, &patch, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "visitor.update",
+                "visitor",
+                &v.id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(v)
+        })
+        .await?;
+    st.hub.refresh(&v.client_id).await?;
+    Ok(Json(v))
+}
+
+async fn delete_visitor(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Query(q): Query<ReasonQuery>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Operator).await?;
+    let why = reason(&q.reason)?;
+    let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
+    let client_id = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let v = store::get_visitor(&tx, &id)?;
+            store::delete_visitor(&tx, &id, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "visitor.delete",
+                "visitor",
+                &id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(v.client_id)
         })
         .await?;
     st.hub.refresh(&client_id).await?;
@@ -1987,6 +2155,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/tunnels/{id}",
             get(get_tunnel).patch(patch_tunnel).delete(delete_tunnel),
+        )
+        .route("/visitors", get(list_visitors).post(create_visitor))
+        .route(
+            "/visitors/{id}",
+            patch(patch_visitor).delete(delete_visitor),
         )
         .route("/enroll-tokens", get(list_tokens).post(create_token))
         .route("/enroll-tokens/{id}", delete(revoke_token))

@@ -232,6 +232,7 @@ String publicAddress(Tunnel t, NodeInfo? node) {
     final suffix = port == null || standard ? '' : ':$port';
     return '${t.kind}://${hosts.first}$suffix${hosts.length > 1 ? '  (+${hosts.length - 1})' : ''}';
   }
+  if (t.isSecret) return '私密（经访问者）';
   if (t.publicPort == 0) return '自动分配';
   return host.isEmpty ? ':${t.publicPort}' : hostPort(host, t.publicPort);
 }
@@ -562,6 +563,15 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       ? 0
       : int.tryParse(_remotePort.text.trim());
   bool get _web => _kind == 'http' || _kind == 'https';
+
+  /// stcp / sudp：没有公网端口，由其他客户端上的访问者连接。
+  bool get _secret => _kind == 'stcp' || _kind == 'sudp';
+
+  /// 数据报类型（udp / sudp）：没有限速、PROXY protocol。
+  bool get _datagram => _kind == 'udp' || _kind == 'sudp';
+
+  /// 能做负载均衡组和健康检查的类型。
+  bool get _balanced => _kind == 'tcp' || _kind == 'http' || _kind == 'https';
   List<String> get _domainList => _domains.text
       .split(RegExp(r'[,\s]+'))
       .where((d) => d.isNotEmpty)
@@ -594,14 +604,15 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
   bool get _valid =>
       _client != null &&
       _httpValid &&
-      (_kind == 'udp' || (_bandwidthBps != null && _health != _badHealth)) &&
+      (_datagram ||
+          (_bandwidthBps != null && (!_balanced || _health != _badHealth))) &&
       _name.text.trim().isNotEmpty &&
       _localIp.text.trim().isNotEmpty &&
       (_lp ?? 0) >= 1 &&
       (_lp ?? 0) <= 65535 &&
       (_web
           ? (_domainList.isNotEmpty || _sub.text.trim().isNotEmpty)
-          : (_rp != null && _rp! >= 0 && _rp! <= 65535));
+          : _secret || (_rp != null && _rp! >= 0 && _rp! <= 65535));
 
   Future<void> _save() async {
     setState(() => _busy = true);
@@ -614,7 +625,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           name: _name.text.trim(),
           localPort: _lp!,
           localIp: _localIp.text.trim(),
-          remotePort: _web ? 0 : _rp!,
+          remotePort: _web || _secret ? 0 : _rp!,
           kind: _kind,
           customDomains: _web ? _domainList : const [],
           subdomain: _web ? _sub.text.trim() : '',
@@ -625,12 +636,12 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           routeByHttpUser: _kind == 'http' ? _routeUser.text.trim() : '',
           requestHeaders: _kind == 'http' ? _headerMap! : const {},
           responseHeaders: _kind == 'http' ? _respHeaderMap! : const {},
-          proxyProtocol: _kind == 'udp' ? 0 : _proxyProtocol,
-          bandwidthBps: _kind == 'udp' ? 0 : _bandwidthBps!,
-          bandwidthServer: _kind != 'udp' && _bandwidthServer,
-          lbGroup: _kind == 'udp' ? '' : _lbGroup.text.trim(),
-          lbGroupKey: _kind == 'udp' ? '' : _lbKey.text,
-          healthCheck: _kind == 'udp' ? null : _health,
+          proxyProtocol: _balanced ? _proxyProtocol : 0,
+          bandwidthBps: _datagram ? 0 : _bandwidthBps!,
+          bandwidthServer: !_datagram && _bandwidthServer,
+          lbGroup: _balanced ? _lbGroup.text.trim() : '',
+          lbGroupKey: _balanced ? _lbKey.text : '',
+          healthCheck: _balanced ? _health : null,
           reason: '通过面板创建隧道',
         );
       } else {
@@ -639,7 +650,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           name: _name.text.trim(),
           localIp: _localIp.text.trim(),
           localPort: _lp,
-          remotePort: _web ? null : _rp,
+          remotePort: _web || _secret ? null : _rp,
           customDomains: _web ? _domainList : null,
           subdomain: _web ? _sub.text.trim() : null,
           hostHeaderRewrite: _kind == 'http' ? _rewrite.text.trim() : null,
@@ -654,17 +665,17 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           routeByHttpUser: _kind == 'http' ? _routeUser.text.trim() : null,
           requestHeaders: _kind == 'http' ? _headerMap : null,
           responseHeaders: _kind == 'http' ? _respHeaderMap : null,
-          proxyProtocol: _kind == 'udp' ? null : _proxyProtocol,
-          bandwidthBps: _kind == 'udp' ? null : _bandwidthBps,
-          bandwidthServer: _kind == 'udp' ? null : _bandwidthServer,
-          lbGroup: _kind == 'udp' ? null : _lbGroup.text.trim(),
+          proxyProtocol: _balanced ? _proxyProtocol : null,
+          bandwidthBps: _datagram ? null : _bandwidthBps,
+          bandwidthServer: _datagram ? null : _bandwidthServer,
+          lbGroup: _balanced ? _lbGroup.text.trim() : null,
           // 留空 = 保持原密钥；退出组时一并清掉。
-          lbGroupKey: _kind == 'udp'
+          lbGroupKey: !_balanced
               ? null
               : _lbGroup.text.trim().isEmpty
               ? ''
               : (_lbKey.text.isEmpty ? null : _lbKey.text),
-          healthCheck: _kind == 'udp'
+          healthCheck: !_balanced
               ? null
               : (_health ?? const HealthCheck(kind: '')),
           reason: '通过面板修改隧道',
@@ -738,6 +749,8 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
                 LSelectOption('udp', 'UDP'),
                 LSelectOption('http', 'HTTP（按域名）'),
                 LSelectOption('https', 'HTTPS（按域名，TLS 透传）'),
+                LSelectOption('stcp', 'STCP（私密 TCP，需访问者）'),
+                LSelectOption('sudp', 'SUDP（私密 UDP，需访问者）'),
               ],
               onChanged: (v) => setState(() => _kind = v ?? 'tcp'),
             ),
@@ -785,7 +798,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               ),
             ],
           ),
-          if (_kind != 'udp') ...[
+          if (_balanced) ...[
             const SizedBox(height: 12),
             label('PROXY protocol（把访问者真实地址告诉内网服务，服务端需支持）'),
             LSelect<int>(
@@ -798,6 +811,8 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               ],
               onChanged: (v) => setState(() => _proxyProtocol = v ?? 0),
             ),
+          ],
+          if (!_datagram) ...[
             const SizedBox(height: 12),
             label('限速（KB/s，留空 = 不限；上下行共用）'),
             Row(
@@ -825,6 +840,8 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
                 ),
               ],
             ),
+          ],
+          if (_balanced) ...[
             const SizedBox(height: 12),
             label('负载均衡组（可选；同组隧道共用端口 / 域名，连接在健康成员间轮转）'),
             Row(
@@ -896,7 +913,12 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
             ],
           ],
           const SizedBox(height: 12),
-          if (!_web) ...[
+          if (_secret)
+            Text(
+              '私密隧道没有公网端口：在同一节点的其他客户端上添加「访问者」后，才能从那台设备的本机端口访问它。',
+              style: Type.caption.copyWith(color: c.text3),
+            )
+          else if (!_web) ...[
             label('公网端口（留空 = 自动分配）'),
             LTextField(
               key: const Key('tunnel-remote-port'),

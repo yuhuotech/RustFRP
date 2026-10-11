@@ -46,7 +46,7 @@ async fn wal_snapshot_is_consistent_private_and_never_overwrites() {
     assert_eq!(names, ["root"]);
     assert_eq!(audits, 1);
     assert_eq!(integrity, "ok");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

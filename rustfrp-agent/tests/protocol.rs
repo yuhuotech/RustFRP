@@ -173,12 +173,12 @@ async fn edge_survives_a_client_that_vanishes_with_visitors_waiting() {
     expect_login_ok(&mut r).await;
     write_frame(
         &mut r.ctrl,
-        &ClientMsg::NewProxy(ProxySpec {
+        &ClientMsg::NewProxy(Box::new(ProxySpec {
             name: "gone".into(),
             kind: "tcp".into(),
             remote_port: 0,
             ..Default::default()
-        }),
+        })),
     )
     .await
     .unwrap();
@@ -211,12 +211,12 @@ async fn proxy_names_are_released_when_a_client_disconnects() {
         expect_login_ok(&mut r).await;
         write_frame(
             &mut r.ctrl,
-            &ClientMsg::NewProxy(ProxySpec {
+            &ClientMsg::NewProxy(Box::new(ProxySpec {
                 name: "same".into(),
                 kind: "tcp".into(),
                 remote_port: 0,
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();

@@ -111,6 +111,31 @@ class FakeServer {
     return n;
   }
 
+  final visitors = <Map<String, Object?>>[];
+
+  Map<String, Object?> addVisitor(
+    String clientId,
+    String name,
+    String tunnelId, {
+    String addr = '127.0.0.1',
+    int port = 0,
+    bool enabled = true,
+  }) {
+    final v = <String, Object?>{
+      'id': _id(),
+      'client_id': clientId,
+      'name': name,
+      'tunnel_id': tunnelId,
+      'bind_addr': addr,
+      'bind_port': port,
+      'enabled': enabled,
+      'created_at': 1,
+      'updated_at': 1,
+    };
+    visitors.add(v);
+    return v;
+  }
+
   Map<String, Object?> addTunnel(
     String clientId,
     String name, {
@@ -502,6 +527,50 @@ class FakeServer {
           }
         }
         return _json(t);
+      case ('GET', ['visitors']):
+        final cid = r.url.queryParameters['client_id'];
+        return _json([
+          for (final v in visitors)
+            if (cid == null || v['client_id'] == cid) v,
+        ]);
+      case ('POST', ['visitors']):
+        final e = guard('operator');
+        if (e != null) return e;
+        if (visitors.any(
+          (v) =>
+              v['client_id'] == body['client_id'] && v['name'] == body['name'],
+        )) {
+          return _err(409, 'conflict', 'visitor name already used');
+        }
+        final v = addVisitor(
+          body['client_id']! as String,
+          body['name']! as String,
+          body['tunnel_id']! as String,
+          addr: (body['bind_addr'] as String?) ?? '127.0.0.1',
+          port: (body['bind_port'] as int?) ?? 0,
+          enabled: (body['enabled'] as bool?) ?? true,
+        );
+        return _json(v, 201);
+      case ('PATCH', ['visitors', final id]):
+        final e = guard('operator');
+        if (e != null) return e;
+        final v = visitors.where((x) => x['id'] == id).firstOrNull;
+        if (v == null) return _err(404, 'not_found', 'not found');
+        for (final k in [
+          'name',
+          'tunnel_id',
+          'bind_addr',
+          'bind_port',
+          'enabled',
+        ]) {
+          if (body.containsKey(k)) v[k] = body[k];
+        }
+        return _json(v);
+      case ('DELETE', ['visitors', final id]):
+        final e = guard('operator');
+        if (e != null) return e;
+        visitors.removeWhere((x) => x['id'] == id);
+        return _json({'ok': true});
       case ('DELETE', ['tunnels', final id]):
         final e = guard('operator');
         if (e != null) return e;

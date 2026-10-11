@@ -55,6 +55,8 @@ pub struct ProxyCfg {
     pub lb: rustfrp_core::wire::LbOpts,
     /// 本地插件（代替连接本地端口）。
     pub plugin: Option<crate::plugin::PluginCfg>,
+    /// stcp / sudp 的访问控制。
+    pub secret: rustfrp_core::wire::SecretOpts,
 }
 
 /// 首次接入所需信息。
@@ -102,6 +104,8 @@ pub struct ClientConfig {
     pub login_fail_exit: bool,
     /// 代理列表。
     pub proxies: Vec<ProxyCfg>,
+    /// 访问者（stcp / sudp）；受管模式下由 Controller 下发。
+    pub visitors: Vec<rustfrp_core::wire::VisitorSpec>,
     /// 连接超时。
     pub dial_timeout: Duration,
     /// 握手类步骤超时。
@@ -141,6 +145,7 @@ impl Default for ClientConfig {
             trusted_ca_pem: None,
             login_fail_exit: true,
             proxies: Vec::new(),
+            visitors: Vec::new(),
             dial_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(30),
@@ -169,6 +174,20 @@ pub enum Event {
         name: String,
         /// 实际远程端口。
         remote_port: u16,
+    },
+    /// 某访问者开始监听。
+    VisitorStarted {
+        /// 访问者名。
+        name: String,
+        /// 实际监听端口。
+        port: u16,
+    },
+    /// 某访问者启动失败。
+    VisitorFailed {
+        /// 访问者名。
+        name: String,
+        /// 原因。
+        error: String,
     },
     /// 某代理启动失败。
     ProxyFailed {
@@ -506,8 +525,9 @@ async fn talk(
             bandwidth_bps: p.bandwidth_bps,
             bandwidth_server: p.bandwidth_server,
             lb: p.lb.clone(),
+            secret: p.secret.clone(),
         };
-        if let Err(e) = write_frame(&mut wr, &ClientMsg::NewProxy(spec)).await {
+        if let Err(e) = write_frame(&mut wr, &ClientMsg::NewProxy(Box::new(spec))).await {
             return lost(e.to_string(), true);
         }
         match within(
@@ -528,7 +548,7 @@ async fn talk(
                     .insert(
                         name.clone(),
                         Local {
-                            kind: p.kind.clone(),
+                            kind: local_kind(&p.kind),
                             host: p.local_ip.clone(),
                             port: p.local_port,
                             proxy_protocol: p.proxy_protocol,
@@ -558,6 +578,22 @@ async fn talk(
         parent: mon_cancel.clone(),
     };
     monitors.sync(watches);
+    let mut visitors = crate::visitor::Visitors::new(
+        session.clone(),
+        crate::visitor::VisitorEnv {
+            user: cfg.user.clone(),
+            open_timeout: cfg.handshake_timeout,
+            udp_packet_size: cfg.udp_packet_size,
+            udp_idle: cfg.udp_idle,
+            traffic: cfg.traffic.clone(),
+            log: log.clone(),
+            events: events.clone(),
+        },
+        mon_cancel.clone(),
+    );
+    if !managed {
+        visitors.sync(&cfg.visitors);
+    }
     // 控制流读取放到独立任务（读帧不是取消安全的），主循环只看通道。
     let (pong_tx, mut pong_rx) = mpsc::channel::<Result<ServerMsg, TunnelError>>(4);
     let reader = tokio::spawn(async move {
@@ -596,8 +632,9 @@ async fn talk(
                         Some(_) => {}
                     }
                     if let Err(e) = crate::local_control::update_tunnels(&cfg.local_tunnels,&set) { break lost(e.into(),true); }
-                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: p.kind.clone(), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server), plugin: None })).collect();
+                    let map = set.proxies.iter().map(|p| (p.name.clone(), Local { kind: local_kind(&p.kind), host: p.local_ip.clone(), port: p.local_port, proxy_protocol: p.proxy_protocol, limiter: client_limiter(p.bandwidth_bps, p.bandwidth_server), plugin: None })).collect();
                     *locals.lock().unwrap_or_else(PoisonError::into_inner) = map;
+                    visitors.sync(&set.visitors);
                     monitors.sync(
                         set.proxies
                             .iter()
@@ -716,6 +753,15 @@ async fn handle_work(
         }
     }
     Ok(())
+}
+
+/// 本地转发的类型：sudp 的数据在流上就是 udp 帧，和 udp 代理一样处理。
+fn local_kind(kind: &str) -> String {
+    if kind == "sudp" {
+        "udp".into()
+    } else {
+        kind.into()
+    }
 }
 
 /// 客户端侧限速器：服务端限速的代理不在这里限。

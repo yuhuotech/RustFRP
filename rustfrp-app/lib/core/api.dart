@@ -166,6 +166,61 @@ class ApiClient {
     await _send('GET', '/tunnels', query: {'client_id': ?clientId}),
     Tunnel.fromJson,
   );
+  Future<List<Visitor>> visitors({String? clientId}) async => _items(
+    await _send('GET', '/visitors', query: {'client_id': ?clientId}),
+    Visitor.fromJson,
+  );
+
+  Future<Visitor> createVisitor({
+    required String clientId,
+    required String name,
+    required String tunnelId,
+    String bindAddr = '127.0.0.1',
+    int bindPort = 0,
+    bool enabled = true,
+    required String reason,
+  }) async => Visitor.fromJson(
+    await _send(
+      'POST',
+      '/visitors',
+      body: {
+        'client_id': clientId,
+        'name': name,
+        'tunnel_id': tunnelId,
+        'bind_addr': bindAddr,
+        'bind_port': bindPort,
+        'enabled': enabled,
+        'reason': reason,
+      },
+    ),
+  );
+
+  Future<Visitor> patchVisitor(
+    String id, {
+    String? name,
+    String? tunnelId,
+    String? bindAddr,
+    int? bindPort,
+    bool? enabled,
+    required String reason,
+  }) async => Visitor.fromJson(
+    await _send(
+      'PATCH',
+      '/visitors/$id',
+      body: {
+        'name': ?name,
+        'tunnel_id': ?tunnelId,
+        'bind_addr': ?bindAddr,
+        'bind_port': ?bindPort,
+        'enabled': ?enabled,
+        'reason': reason,
+      },
+    ),
+  );
+
+  Future<void> deleteVisitor(String id, {required String reason}) async =>
+      _send('DELETE', '/visitors/$id', query: {'reason': reason});
+
   Future<List<String>> controllerLogs() async =>
       ((await _send('GET', '/logs') as Map)['items'] as List).cast<String>();
 

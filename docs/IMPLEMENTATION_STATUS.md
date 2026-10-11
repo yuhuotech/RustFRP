@@ -38,7 +38,7 @@
 | SV-11 数据保留 | 部分完成 | 审计保留天数、会话/接入令牌到期、有索引的有界清理、事务审计/回滚/错误日志/取消已实现；流量分钟桶与采样游标已补 7 天保留、每轮每表最多 2048 行和事务审计；配置化与最终整体验收待补 |
 | TCP / UDP / HTTPS SNI | 已实现 | 独立与受管实际链路已测；进一步容量、性能和平台验收仍需完成 |
 | HTTP | 已实现待整体验收 | 逐请求（保持连接上每个请求）按域名/通配/子域 + 路径前缀（locations）+ routeByHTTPUser 选路，Basic Auth（Edge 校验，密码永不经 REST 返回）、Host 改写、requestHeaders.set、responseHeaders.set（逐响应改写，禁止改 Content-Length / Transfer-Encoding / Connection / Upgrade）、Upgrade 透传、请求走私防护、流水线响应保序；独立模式与受管模式（Controller 存储/下发/热更新/导入导出/面板表单）均已支持，真实全栈测试通过；PROXY protocol、限速、responseHeaders、健康检查与负载均衡组已实现并在兼容报告中列出 |
-| STCP / SUDP / visitors / TCPMUX | 未实现 | 配置识别/报告不等于能力，尚缺运行时与端到端验收 |
+| STCP / SUDP / visitors | 已实现 | 提供方注册 stcp / sudp 代理（不占公网端口，`secretKey` + `allowUsers`）；访问者开新流向 Edge 出示 `auth_key(sk, ts)` 签名，Edge 校验密钥与用户后把流接到提供方会话，之后是透明通道（sudp 复用 UDP 帧）；独立模式用 `[[visitors]]`，受管模式在面板「客户端详情 → 访问者」创建（目标隧道必须与访问者在同一节点，密钥由 Controller 生成并代为下发）；端到端测试覆盖独立、受管（全栈）两种路径。xtcp（P2P 打洞）与 TCPMUX 未实现并在兼容报告中列出 |
 | 本地插件 | 独立模式已实现 | `socks5`（可选 RFC 1929 认证）、`http_proxy`（CONNECT + 绝对形式明文请求，Proxy-Authorization Basic）、`static_file`（只读，拒绝路径穿越与符号链接逃逸，目录索引 / 前缀剥离 / Basic）、`unix_domain_socket`、`http2https` / `https2http` / `https2https`（按请求改写 Host 与请求头，仅 HTTP/1.1，证书缺省生成自签名）、`tls2raw`；`virtual_net` 等未实现并在兼容报告中列出。受管模式（Controller 存储 / 下发 / 面板）尚未接入 |
 | 通用加密/压缩 | 未实现（PROXY protocol 已实现） | 逐代理有提示；需对照上游字段与行为完成、加入兼容样例和内存基准 |
 | G8 配置兼容 / 导入导出 | 部分完成 | TOML/YAML/JSON、includes、环境模板、默认/校验/导出已有；INI convert 已接入 CLI、环境模板、includes 展开与兼容报告，正在做覆盖率/语法边界验收；reload、受管配置导入预览/摘要确认/事务应用和 TOML 导出 API 已接入并测试；仍缺面板导入向导与完整运行选项编辑；OIDC、webServer、httpPlugins 等配置的运行能力须逐字段补齐或明确报告 |
@@ -56,7 +56,7 @@ XTCP / P2P 打洞、KCP/QUIC、frp 线协议互通、移动端、多租户计费
 2. 数据面可观测性：计数 → 聚合 / 保留 → REST → 实际图表和本机信息；同时补有界日志与诊断。
 3. HTTP P0 完整能力、配置导入导出 / INI 转换 / reload、证书固定及限额。
 4. 桌面系统服务、内置 agent、托盘与开机启动、本机隧道列表 / 编辑、三平台构建。
-5. 外置 Edge / 多节点与离线缓存，再补 STCP/SUDP/TCPMUX、visitors、传输通用选项和插件。
+5. 外置 Edge / 多节点与离线缓存，再补 TCPMUX、xtcp、传输通用选项和受管模式的插件。
 6. 部署与官网、签名发布、安装 / 更新闭环、安全与完整 AT-xx 验收。
 
 每步：协议先行，带断言的失败测试先行，fmt/clippy/analyze 全绿；每 crate 行/函数/分支 ≥90% 且不低于既有基线；Flutter 不低于基线；运行时改动复测内存。不可用降低基线或未实现的空壳来凑完成率。

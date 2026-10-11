@@ -892,6 +892,44 @@ pub struct UdpOpts {
     pub open_timeout: Duration,
     /// Edge 实时计数。
     pub traffic: Arc<pipe::Traffic>,
+    /// 作为访问者（sudp）转发时的目标：打开的流先通过 Edge 的访问者握手，而不是 `StartWork`。
+    pub visitor: Option<VisitorTarget>,
+}
+
+/// sudp 访问者要连接的代理及密钥。
+#[derive(Clone)]
+pub struct VisitorTarget {
+    /// 目标代理的完整名。
+    pub server_name: String,
+    /// 访问密钥。
+    pub sk: String,
+}
+
+/// 访问者握手：向 Edge 出示签名，得到放行后流就成为通往目标代理的透明通道。
+pub async fn visitor_handshake(
+    stream: &mut rustfrp_core::mux::Stream,
+    target: &VisitorTarget,
+    limit: Duration,
+) -> Result<(), TunnelError> {
+    let timestamp = rustfrp_core::auth::unix_now();
+    write_frame(
+        stream,
+        &rustfrp_core::wire::VisitorHello {
+            server_name: target.server_name.clone(),
+            timestamp,
+            sign: rustfrp_core::auth::auth_key(&target.sk, timestamp),
+        },
+    )
+    .await?;
+    let resp: rustfrp_core::wire::VisitorResp =
+        timeout(limit, rustfrp_core::wire::read_frame(stream))
+            .await
+            .map_err(|_| TunnelError::Timeout("visitor response"))??;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(TunnelError::Auth(resp.error))
+    }
 }
 
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
@@ -968,15 +1006,19 @@ async fn udp_peer(
     let mut stream = timeout(opts.open_timeout, session.open())
         .await
         .map_err(|_| TunnelError::Timeout("open work stream"))??;
-    write_frame(
-        &mut stream,
-        &StartWork {
-            proxy: name.to_string(),
-            src: peer.to_string(),
-            dst: String::new(),
-        },
-    )
-    .await?;
+    if let Some(v) = &opts.visitor {
+        visitor_handshake(&mut stream, v, opts.open_timeout).await?;
+    } else {
+        write_frame(
+            &mut stream,
+            &StartWork {
+                proxy: name.to_string(),
+                src: peer.to_string(),
+                dst: String::new(),
+            },
+        )
+        .await?;
+    }
     let _connection = opts.traffic.connection();
     let traffic = opts.traffic.clone();
     let (mut rd, mut wr) = tokio::io::split(stream);

@@ -191,6 +191,50 @@ enum TunnelState {
 }
 
 @immutable
+/// 访问者：在设备上监听本机端口，把连接送到一条 stcp / sudp 隧道。
+class Visitor {
+  const Visitor({
+    required this.id,
+    required this.clientId,
+    required this.name,
+    required this.tunnelId,
+    this.bindAddr = '127.0.0.1',
+    this.bindPort = 0,
+    this.enabled = true,
+  });
+  final String id, clientId, name, tunnelId, bindAddr;
+  final int bindPort;
+  final bool enabled;
+
+  factory Visitor.fromJson(Object? j) {
+    final m = _map(j);
+    if (m['id'] is! String) throw ProtocolException('visitor without id');
+    return Visitor(
+      id: _str(m['id']),
+      clientId: _str(m['client_id']),
+      name: _str(m['name']),
+      tunnelId: _str(m['tunnel_id']),
+      bindAddr: _str(m['bind_addr']),
+      bindPort: _int(m['bind_port']),
+      enabled: m['enabled'] != false,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is Visitor &&
+      other.id == id &&
+      other.clientId == clientId &&
+      other.name == name &&
+      other.tunnelId == tunnelId &&
+      other.bindAddr == bindAddr &&
+      other.bindPort == bindPort &&
+      other.enabled == enabled;
+  @override
+  int get hashCode =>
+      Object.hash(id, clientId, name, tunnelId, bindAddr, bindPort, enabled);
+}
+
 /// 对本地服务的健康检查。
 class HealthCheck {
   const HealthCheck({
@@ -315,6 +359,9 @@ class Tunnel {
   final Map<String, String> responseHeaders;
 
   bool get isWeb => kind == 'http' || kind == 'https';
+
+  /// 私密隧道（stcp / sudp）：没有公网端口，只能经访问者连接。
+  bool get isSecret => kind == 'stcp' || kind == 'sudp';
   final int localPort, remotePort, statusPort, createdAt, updatedAt;
   final bool enabled;
   final TunnelState state;
