@@ -147,6 +147,20 @@ async fn read_to_end<S: AsyncReadExt + Unpin>(s: &mut S) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+async fn shutdown_allow_peer_close<S: AsyncWriteExt + Unpin>(s: &mut S) {
+    if let Err(error) = s.shutdown().await {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            "unexpected shutdown error: {error}"
+        );
+    }
+}
+
 async fn connect(port: u16) -> TcpStream {
     timeout(T, TcpStream::connect(("127.0.0.1", port)))
         .await
@@ -864,7 +878,7 @@ async fn https2http_connection_edge_cases() {
         let mut s = tls_visitor(port).await;
         s.write_all(&payload).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        s.shutdown().await.unwrap();
+        shutdown_allow_peer_close(&mut s).await;
         // 本地服务拿到完整请求头后就会应答；这里只要求连接最终被关闭、插件不崩溃。
         let _ = read_to_end(&mut s).await;
     }
@@ -895,7 +909,7 @@ async fn https2http_connection_edge_cases() {
         s.write_all(payload).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         s.write_all(b"").await.unwrap();
-        s.shutdown().await.unwrap();
+        shutdown_allow_peer_close(&mut s).await;
         let _ = read_to_end(&mut s).await;
     }
 }
