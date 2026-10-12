@@ -26,6 +26,7 @@ make e2e           # 全栈冒烟
 ```
 
 Flutter 测试偶尔超过 2 分钟，可在 `rustfrp-app/` 下直接 `flutter test`。
+CI 将 Rust crates 与 Flutter 的覆盖率校验放在各自的 Job；`make cov` 在本地依次覆盖 Rust crates 和 Flutter。
 
 ## 4. 架构速览
 

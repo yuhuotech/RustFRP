@@ -49,7 +49,7 @@ bench-mem:
 	python3 tools/bench/mem.py --tunnels 10 --conns 100 --max-edge-mb 10 --max-client-mb 10
 
 # ───────── Flutter（rustfrp-app）─────────
-FLUTTER ?= $(HOME)/development/flutter/bin/flutter
+FLUTTER ?= flutter
 .PHONY: app-test app-cov web-build web-run e2e app-shots
 app-test:
 	cd rustfrp-app && $(FLUTTER) analyze && $(FLUTTER) test
