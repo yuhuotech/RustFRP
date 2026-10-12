@@ -293,6 +293,9 @@ mod tests {
             ]
         )
         .is_err());
+        assert!(p("x", &["convert", "-c", "x", "--local-control", "p"]).is_err());
+        assert!(p("x", &["status", "-c", "x", "--local-control", "p"]).is_err());
+        assert!(p("x", &["status", "--mode", "edge", "-c", "x"]).is_err());
         assert!(p("x", &["--local-control"]).is_err());
     }
 
@@ -336,6 +339,7 @@ mod tests {
             p("C:\\bin\\frps.exe", &["-c", "a.toml"]),
             Ok(Command::Run(opts(Mode::Edge, true, &[])))
         );
+        assert!(p("frpc", &["unexpected=value"]).is_err());
     }
 
     #[test]

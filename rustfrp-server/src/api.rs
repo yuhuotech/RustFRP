@@ -520,6 +520,7 @@ async fn node(State(st): State<AppState>, _a: Auth) -> Json<serde_json::Value> {
         "allow_ports": st.cfg.allow_ports,
         "vhost_http_port": st.cfg.vhost_http,
         "vhost_https_port": st.cfg.vhost_https,
+        "tcpmux_http_connect_port": st.cfg.tcpmux_http_connect_port,
         "subdomain_host": st.cfg.subdomain_host,
         "version": env!("CARGO_PKG_VERSION"),
         "clients_online": st.hub.online_ids().len(),
@@ -642,6 +643,24 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
         "gauge",
         day.1.to_string(),
     );
+    out.push_str(&process_metric_lines(&process));
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+fn process_metric_lines(process: &crate::process::ProcessStats) -> String {
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, kind: &str, value: String| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
     gauge(
         "rustfrp_process_uptime_seconds",
         "Controller uptime.",
@@ -664,14 +683,7 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
             format!("{cpu:.2}"),
         );
     }
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        out,
-    )
-        .into_response()
+    out
 }
 
 // ───────────── 节点 ─────────────
@@ -687,6 +699,7 @@ fn builtin_node(cfg: &Config, clients: i64) -> crate::models::Node {
         tls_fingerprint: cfg.edge_tls_fingerprint.clone(),
         vhost_http: cfg.vhost_http,
         vhost_https: cfg.vhost_https,
+        tcpmux_http_connect_port: cfg.tcpmux_http_connect_port,
         subdomain_host: cfg.subdomain_host.clone(),
         allow_ports: cfg.allow_ports.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -828,6 +841,7 @@ struct PatchClient {
     name: Option<String>,
     disabled: Option<bool>,
     tags: Option<Vec<String>>,
+    max_connections: Option<usize>,
     #[serde(default)]
     reason: String,
 }
@@ -850,6 +864,9 @@ async fn patch_client(
             if let Some(tags) = &b.tags {
                 cl = store::set_client_tags(&tx, &id2, tags)?;
             }
+            if let Some(max) = b.max_connections {
+                cl = store::set_client_max_connections(&tx, &id2, max)?;
+            }
             store::audit(
                 &tx,
                 &actor,
@@ -866,13 +883,183 @@ async fn patch_client(
         })
         .await?;
     // 外置节点上的设备：停用 / 启用要推给节点，节点才会真正拒绝或放行它。
-    st.hub.sync_device(&id).await;
+    st.hub.refresh(&id).await?;
     if client.disabled_at.is_some() {
         st.hub.kick(&id);
     }
     let mut c = client;
     c.online = st.hub.is_online(&c.id);
     Ok(Json(c))
+}
+
+#[derive(Deserialize)]
+struct MoveClient {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn move_client(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<MoveClient>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Admin).await?;
+    let why = reason(&b.reason)?;
+    let (target, node_caps) = if b.node_id.is_empty() {
+        if !st.cfg.builtin_edge {
+            return Err(ApiError::bad("the built-in edge is disabled"));
+        }
+        (
+            rustfrp_core::wire::EdgeRedirect {
+                address: st.cfg.public_host.clone(),
+                port: st.cfg.edge_port(),
+                tls_fingerprint: st.cfg.edge_tls_fingerprint.clone(),
+            },
+            (
+                st.cfg.vhost_http,
+                st.cfg.vhost_https,
+                st.cfg.tcpmux_http_connect_port,
+                st.cfg.subdomain_host.clone(),
+                st.cfg.allow_ports.clone(),
+            ),
+        )
+    } else {
+        let node_id = b.node_id.clone();
+        let node = st.db.call(move |c| store::get_node(c, &node_id)).await?;
+        if node.disabled_at.is_some() {
+            return Err(ApiError::bad("destination node is disabled"));
+        }
+        (
+            rustfrp_core::wire::EdgeRedirect {
+                address: node.public_host,
+                port: node.edge_port,
+                tls_fingerprint: node.tls_fingerprint,
+            },
+            (
+                node.vhost_http,
+                node.vhost_https,
+                node.tcpmux_http_connect_port,
+                node.subdomain_host,
+                node.allow_ports,
+            ),
+        )
+    };
+    let client_for_tunnels = id.clone();
+    let tunnels = st
+        .db
+        .call(move |c| store::list_tunnels(c, Some(&client_for_tunnels)))
+        .await?;
+    for tunnel in &tunnels {
+        if (tunnel.kind == "http" && node_caps.0.is_none())
+            || (tunnel.kind == "https" && node_caps.1.is_none())
+            || (tunnel.kind == "tcpmux" && node_caps.2.is_none())
+            || (!tunnel.subdomain.is_empty() && node_caps.3.is_empty())
+        {
+            return Err(ApiError::bad(format!(
+                "destination node does not support the existing {} tunnel",
+                tunnel.kind
+            )));
+        }
+        if tunnel.remote_port > 0
+            && !node_caps.4.is_empty()
+            && !node_caps
+                .4
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&tunnel.remote_port))
+        {
+            return Err(ApiError::bad(format!(
+                "destination node does not allow existing port {}",
+                tunnel.remote_port
+            )));
+        }
+    }
+    let (actor, ip, client_id, destination) = (
+        a.admin.name.clone(),
+        a.ip.clone(),
+        id.clone(),
+        b.node_id.clone(),
+    );
+    let target_for_db = target.clone();
+    let old_node = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let old =
+                store::move_client_to_node(&tx, &client_id, &destination, &target_for_db, now)?;
+            store::audit(
+                &tx,
+                &actor,
+                "client.move_node",
+                "client",
+                &client_id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(old)
+        })
+        .await?;
+    st.hub.redirect_device(&id, &old_node, target.clone()).await;
+    Ok(Json(json!({"ok":true,"node_id":b.node_id,"target":target})))
+}
+
+#[derive(Deserialize)]
+struct UpdateClient {
+    version: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn update_client(
+    State(st): State<AppState>,
+    a: Auth,
+    Path(id): Path<String>,
+    Json(b): Json<UpdateClient>,
+) -> ApiResult<serde_json::Value> {
+    a.require(&st, Role::Admin).await?;
+    let why = reason(&b.reason)?;
+    if !st.hub.is_online(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "the device must be online to receive an update",
+        ));
+    }
+    let (actor, ip, client_id, version) = (
+        a.admin.name.clone(),
+        a.ip.clone(),
+        id.clone(),
+        b.version.clone(),
+    );
+    let (seq, version) = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = store::now_ms();
+            let command = store::request_client_update(&tx, &client_id, &version)?;
+            store::audit(
+                &tx,
+                &actor,
+                "client.update_agent",
+                "client",
+                &client_id,
+                &why,
+                "ok",
+                &ip,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(command)
+        })
+        .await?;
+    st.hub.refresh(&id).await?;
+    Ok(Json(json!({"ok":true,"seq":seq,"version":version})))
 }
 
 async fn delete_client(
@@ -1124,6 +1311,14 @@ struct CreateTunnel {
     #[serde(default)]
     bandwidth_server: bool,
     #[serde(default)]
+    max_connections: usize,
+    #[serde(default)]
+    multiplexer: String,
+    #[serde(default)]
+    use_encryption: bool,
+    #[serde(default)]
+    use_compression: bool,
+    #[serde(default)]
     lb_group: String,
     #[serde(default)]
     lb_group_key: String,
@@ -1140,6 +1335,71 @@ fn port_policy(cfg: &Config, remote_port: i64) -> Result<(), ApiError> {
 }
 
 /// 该服务器是否开启了对应的虚拟主机端口 / 子域名后缀。
+async fn tunnel_node_policy(
+    st: &AppState,
+    client_id: &str,
+    kind: &str,
+    subdomain: &str,
+) -> Result<(), ApiError> {
+    let id = client_id.to_string();
+    let node_id = st
+        .db
+        .call(move |c| {
+            let client = store::get_client(c, &id)?;
+            Ok(client.node_id)
+        })
+        .await?;
+    if node_id.is_empty() {
+        vhost_policy(&st.cfg, kind, subdomain)?;
+    }
+    let (vhost_http, vhost_https, tcpmux, suffix) = if node_id.is_empty() {
+        if !st.cfg.builtin_edge {
+            return Err(ApiError::bad(
+                "the built-in edge is disabled; move the client to an external node",
+            ));
+        }
+        (
+            st.cfg.vhost_http,
+            st.cfg.vhost_https,
+            st.cfg.tcpmux_http_connect_port,
+            st.cfg.subdomain_host.clone(),
+        )
+    } else {
+        let id = node_id.clone();
+        let node = st.db.call(move |c| store::get_node(c, &id)).await?;
+        if node.disabled_at.is_some() {
+            return Err(ApiError::bad("the client's node is disabled"));
+        }
+        (
+            node.vhost_http,
+            node.vhost_https,
+            node.tcpmux_http_connect_port,
+            node.subdomain_host,
+        )
+    };
+    if kind == "http" && vhost_http.is_none() {
+        return Err(ApiError::bad(
+            "http tunnels need the vhost HTTP port (set RUSTFRP_VHOST_HTTP on the server)",
+        ));
+    }
+    if kind == "https" && vhost_https.is_none() {
+        return Err(ApiError::bad(
+            "https tunnels need the vhost HTTPS port (set RUSTFRP_VHOST_HTTPS on the server)",
+        ));
+    }
+    if kind == "tcpmux" && tcpmux.is_none() {
+        return Err(ApiError::bad(
+            "tcpmux needs tcpmuxHTTPConnectPort on the selected node",
+        ));
+    }
+    if !subdomain.is_empty() && suffix.is_empty() {
+        return Err(ApiError::bad(
+            "subdomains need RUSTFRP_SUBDOMAIN_HOST on the server",
+        ));
+    }
+    Ok(())
+}
+
 fn vhost_policy(cfg: &Config, kind: &str, subdomain: &str) -> Result<(), ApiError> {
     if kind == "http" && cfg.vhost_http.is_none() {
         return Err(ApiError::bad(
@@ -1151,10 +1411,11 @@ fn vhost_policy(cfg: &Config, kind: &str, subdomain: &str) -> Result<(), ApiErro
             "https tunnels need the vhost HTTPS port (set RUSTFRP_VHOST_HTTPS on the server)",
         ));
     }
+    if kind == "tcpmux" && cfg.tcpmux_http_connect_port.is_none() {
+        return Err(ApiError::bad("tcpmux needs tcpmuxHTTPConnectPort"));
+    }
     if !subdomain.is_empty() && cfg.subdomain_host.is_empty() {
-        return Err(ApiError::bad(
-            "subdomains need RUSTFRP_SUBDOMAIN_HOST on the server",
-        ));
+        return Err(ApiError::bad("subdomains need RUSTFRP_SUBDOMAIN_HOST"));
     }
     Ok(())
 }
@@ -1167,7 +1428,7 @@ async fn create_tunnel(
     a.require(&st, Role::Operator).await?;
     let why = reason(&b.reason)?;
     port_policy(&st.cfg, b.remote_port)?;
-    vhost_policy(&st.cfg, &b.kind, &b.subdomain)?;
+    tunnel_node_policy(&st, &b.client_id, &b.kind, &b.subdomain).await?;
     let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
     let quota = st.cfg.max_tunnels_per_client;
     let new = NewTunnel {
@@ -1192,6 +1453,10 @@ async fn create_tunnel(
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
         bandwidth_server: b.bandwidth_server,
+        max_connections: b.max_connections,
+        multiplexer: b.multiplexer,
+        use_encryption: b.use_encryption,
+        use_compression: b.use_compression,
         lb: rustfrp_core::wire::LbOpts {
             group: b.lb_group,
             group_key: b.lb_group_key,
@@ -1309,6 +1574,10 @@ struct PatchTunnel {
     proxy_protocol: Option<u8>,
     bandwidth_bps: Option<u64>,
     bandwidth_server: Option<bool>,
+    max_connections: Option<usize>,
+    multiplexer: Option<String>,
+    use_encryption: Option<bool>,
+    use_compression: Option<bool>,
     lb_group: Option<String>,
     lb_group_key: Option<String>,
     health_check: Option<rustfrp_core::wire::HealthSpec>,
@@ -1329,6 +1598,21 @@ async fn patch_tunnel(
     if let Some(p) = b.remote_port {
         port_policy(&st.cfg, p)?;
     }
+    let tunnel_id = id.clone();
+    let client_id = st
+        .db
+        .call(move |c| Ok(store::get_tunnel(c, &tunnel_id)?.client_id))
+        .await?;
+    if let Some(subdomain) = &b.subdomain {
+        let kind = st
+            .db
+            .call({
+                let id = id.clone();
+                move |c| Ok(store::get_tunnel(c, &id)?.kind)
+            })
+            .await?;
+        tunnel_node_policy(&st, &client_id, &kind, subdomain).await?;
+    }
     let (actor, ip) = (a.admin.name.clone(), a.ip.clone());
     let patch = TunnelPatch {
         name: b.name,
@@ -1348,6 +1632,10 @@ async fn patch_tunnel(
         proxy_protocol: b.proxy_protocol,
         bandwidth_bps: b.bandwidth_bps,
         bandwidth_server: b.bandwidth_server,
+        max_connections: b.max_connections,
+        multiplexer: b.multiplexer,
+        use_encryption: b.use_encryption,
+        use_compression: b.use_compression,
         lb_group: b.lb_group,
         lb_group_key: b.lb_group_key,
         health_check: b.health_check,
@@ -1449,6 +1737,10 @@ struct CreateVisitor {
     #[serde(default = "yes")]
     enabled: bool,
     #[serde(default)]
+    use_encryption: bool,
+    #[serde(default)]
+    use_compression: bool,
+    #[serde(default)]
     reason: String,
 }
 
@@ -1467,6 +1759,8 @@ async fn create_visitor(
         bind_addr: b.bind_addr,
         bind_port: b.bind_port,
         enabled: b.enabled,
+        use_encryption: b.use_encryption,
+        use_compression: b.use_compression,
     };
     let v = st
         .db
@@ -1500,6 +1794,8 @@ struct PatchVisitor {
     bind_addr: Option<String>,
     bind_port: Option<i64>,
     enabled: Option<bool>,
+    use_encryption: Option<bool>,
+    use_compression: Option<bool>,
     #[serde(default)]
     reason: String,
 }
@@ -1519,6 +1815,8 @@ async fn patch_visitor(
         bind_addr: b.bind_addr,
         bind_port: b.bind_port,
         enabled: b.enabled,
+        use_encryption: b.use_encryption,
+        use_compression: b.use_compression,
     };
     let v = st
         .db
@@ -2166,6 +2464,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/clients/{id}/kick", post(kick_client))
         .route("/clients/{id}/restart", post(restart_client))
+        .route("/clients/{id}/migrate", post(move_client))
+        .route("/clients/{id}/update", post(update_client))
         .route("/tunnels", get(list_tunnels).post(create_tunnel))
         .route("/tunnels/batch", post(batch_tunnels))
         .route(
@@ -2217,6 +2517,27 @@ pub struct Empty {}
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_metric_lines_include_optional_linux_measurements_only_when_present() {
+        let linux = process_metric_lines(&crate::process::ProcessStats {
+            uptime_seconds: 17,
+            rss_bytes: Some(4096),
+            cpu_seconds: Some(2.5),
+        });
+        assert!(linux.contains("rustfrp_process_uptime_seconds 17"));
+        assert!(linux.contains("rustfrp_process_resident_memory_bytes 4096"));
+        assert!(linux.contains("rustfrp_process_cpu_seconds_total 2.50"));
+
+        let other_platform = process_metric_lines(&crate::process::ProcessStats {
+            uptime_seconds: 8,
+            rss_bytes: None,
+            cpu_seconds: None,
+        });
+        assert!(other_platform.contains("rustfrp_process_uptime_seconds 8"));
+        assert!(!other_platform.contains("resident_memory"));
+        assert!(!other_platform.contains("cpu_seconds_total"));
+    }
 
     #[test]
     fn limiter_blocks_after_max_failures_and_recovers() {
@@ -2428,5 +2749,695 @@ mod tests {
         assert!(v["direct"].as_str().unwrap().contains("--tls-pin"));
         assert!(v["linux_macos"].as_str().unwrap().contains("--tls-pin"));
         assert!(v["windows"].as_str().unwrap().contains("-TlsPin"));
+    }
+}
+
+#[cfg(test)]
+mod feature_route_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use rustfrp_core::node::NodeInfo;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    const PUBLIC_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct Rig {
+        app: Router,
+        db: Db,
+        cookie: String,
+        csrf: String,
+    }
+
+    impl Rig {
+        async fn new() -> Self {
+            let cfg = Config {
+                vhost_http: Some(8080),
+                vhost_https: Some(8443),
+                tcpmux_http_connect_port: Some(7443),
+                subdomain_host: "tunnel.example.test".into(),
+                edge_tls_fingerprint: "ab".repeat(32),
+                ..Config::default()
+            };
+            Self::with_config(cfg).await
+        }
+
+        async fn with_config(cfg: Config) -> Self {
+            let db = Db::open_memory().unwrap();
+            let (hub, events) = Hub::new(db.clone());
+            drop(events);
+            let state = AppState {
+                db: db.clone(),
+                hub,
+                cfg: Arc::new(cfg),
+                limiter: Arc::new(LoginLimiter::new(5, 60_000)),
+                metrics: Arc::default(),
+                logs: Arc::default(),
+            };
+            let admin = db
+                .call(|c| store::create_admin(c, "owner", "hash", Role::Owner, 1))
+                .await
+                .unwrap();
+            let token = "feature-route-session".to_string();
+            let csrf = "feature-route-csrf".to_string();
+            let token_digest = token_hash(&token);
+            let csrf_digest = csrf.clone();
+            let admin_id = admin.id;
+            db.call(move |c| {
+                store::create_session(
+                    c,
+                    &token_digest,
+                    &admin_id,
+                    &csrf_digest,
+                    store::now_ms(),
+                    60_000,
+                )
+            })
+            .await
+            .unwrap();
+            Self {
+                app: router(state),
+                db,
+                cookie: format!("{COOKIE}={token}"),
+                csrf,
+            }
+        }
+
+        async fn client(&self, name: &str) -> String {
+            let name = name.to_string();
+            self.db
+                .call(move |c| {
+                    Ok(store::create_client(
+                        c,
+                        &store::new_id(),
+                        &name,
+                        PUBLIC_KEY,
+                        "linux",
+                        "x86_64",
+                        "0.1.0",
+                        store::now_ms(),
+                    )?
+                    .id)
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn add_node(&self, id: &str, info: NodeInfo, disabled: bool) {
+            let id = id.to_string();
+            self.db
+                .call(move |c| {
+                    store::create_node(c, &id, &id, &"cd".repeat(32), &info, store::now_ms())?;
+                    if disabled {
+                        store::update_node(c, &id, None, Some(true), store::now_ms())?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn assign(&self, client: &str, node: &str) {
+            let (client, node) = (client.to_string(), node.to_string());
+            self.db
+                .call(move |c| store::set_client_node(c, &client, &node))
+                .await
+                .unwrap();
+        }
+
+        async fn create_tunnel(
+            &self,
+            client: &str,
+            name: &str,
+            kind: &str,
+            extra: Value,
+        ) -> (StatusCode, Value) {
+            let mut body = json!({
+                "client_id": client,
+                "name": name,
+                "kind": kind,
+                "local_port": 8080,
+                "reason": "node policy test"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            self.request(Method::POST, "/api/v1/tunnels", body).await
+        }
+
+        async fn request(&self, method: Method, path: &str, body: Value) -> (StatusCode, Value) {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "panel.test")
+                .header(header::COOKIE, &self.cookie)
+                .header(header::ORIGIN, "http://panel.test")
+                .header("x-csrf-token", &self.csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = self.app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, value)
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_visitor_limit_and_migration_routes_preserve_runtime_settings() {
+        let rig = Rig::new().await;
+        let provider = rig.client("provider").await;
+        let visitor_client = rig.client("visitor").await;
+
+        let (status, tcpmux) = rig
+            .request(
+                Method::POST,
+                "/api/v1/tunnels",
+                json!({
+                    "client_id": provider,
+                    "name": "mux",
+                    "kind": "tcpmux",
+                    "local_port": 22,
+                    "remote_port": 0,
+                    "custom_domains": ["mux.example.test"],
+                    "multiplexer": "httpconnect",
+                    "max_connections": 12,
+                    "use_encryption": true,
+                    "use_compression": true,
+                    "reason": "coverage setup"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{tcpmux}");
+        assert_eq!(tcpmux["max_connections"], 12);
+        assert_eq!(tcpmux["multiplexer"], "httpconnect");
+        assert!(tcpmux["use_encryption"].as_bool().unwrap_or(false));
+        let provider = tcpmux["client_id"].as_str().unwrap().to_string();
+
+        let (status, udp) = rig
+            .request(
+                Method::POST,
+                "/api/v1/tunnels",
+                json!({
+                    "client_id": provider,
+                    "name": "dns",
+                    "kind": "udp",
+                    "local_port": 53,
+                    "max_connections": 4,
+                    "reason": "coverage setup"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{udp}");
+        assert_eq!(udp["max_connections"], 4);
+
+        let (status, secret) = rig
+            .request(
+                Method::POST,
+                "/api/v1/tunnels",
+                json!({
+                    "client_id": provider,
+                    "name": "private",
+                    "kind": "stcp",
+                    "local_port": 22,
+                    "max_connections": 3,
+                    "reason": "coverage setup"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{secret}");
+        assert_eq!(secret["max_connections"], 3);
+
+        let visitor_body = json!({
+            "client_id": visitor_client,
+            "name": "private-ssh",
+            "tunnel_id": secret["id"],
+            "bind_port": 0,
+            "use_encryption": true,
+            "use_compression": true,
+            "reason": "coverage setup"
+        });
+        let (status, visitor) = rig
+            .request(Method::POST, "/api/v1/visitors", visitor_body)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{visitor}");
+        assert!(visitor["use_encryption"].as_bool().unwrap_or(false));
+        assert!(visitor["use_compression"].as_bool().unwrap_or(false));
+        let visitor_id = visitor["id"].as_str().unwrap().to_string();
+        let (status, visitor) = rig
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/visitors/{visitor_id}"),
+                json!({
+                    "use_encryption": false,
+                    "use_compression": false,
+                    "reason": "coverage update"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{visitor}");
+        assert_eq!(visitor["use_encryption"], false);
+
+        let (status, client) = rig
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/clients/{provider}"),
+                json!({"max_connections": 21, "reason": "coverage limit"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{client}");
+        assert_eq!(client["max_connections"], 21);
+        let (status, update) = rig
+            .request(
+                Method::POST,
+                &format!("/api/v1/clients/{provider}/update"),
+                json!({"version": "v9.9.9", "reason": "coverage update"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{update}");
+
+        let target_id = "coverage-target-node";
+        let key = "cd".repeat(32);
+        rig.db
+            .call(move |c| {
+                store::create_node(
+                    c,
+                    target_id,
+                    "target",
+                    &key,
+                    &NodeInfo {
+                        public_host: "edge.example.test".into(),
+                        edge_port: 7443,
+                        tls_fingerprint: "ab".repeat(32),
+                        tcpmux_http_connect_port: Some(7443),
+                        ..Default::default()
+                    },
+                    store::now_ms(),
+                )
+            })
+            .await
+            .unwrap();
+        let (status, blocked) = rig
+            .request(
+                Method::POST,
+                &format!("/api/v1/clients/{provider}/migrate"),
+                json!({"node_id": target_id, "reason": "coverage migration"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{blocked}");
+        assert!(blocked["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("visitor"));
+        let (status, _) = rig
+            .request(
+                Method::DELETE,
+                &format!("/api/v1/visitors/{visitor_id}?reason=coverage"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, moved) = rig
+            .request(
+                Method::POST,
+                &format!("/api/v1/clients/{provider}/migrate"),
+                json!({"node_id": target_id, "reason": "coverage migration"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+        assert_eq!(moved["node_id"], target_id);
+    }
+
+    #[tokio::test]
+    async fn node_capabilities_gate_tunnel_creation_and_client_migration() {
+        let rig = Rig::new().await;
+        let caps = [
+            (
+                "http",
+                json!({"custom_domains": ["http-move.test"]}),
+                None,
+                "does not support the existing http",
+            ),
+            (
+                "https",
+                json!({"custom_domains": ["https-move.test"]}),
+                None,
+                "does not support the existing https",
+            ),
+            (
+                "tcpmux",
+                json!({"custom_domains": ["mux-move.test"], "multiplexer": "httpconnect"}),
+                None,
+                "does not support the existing tcpmux",
+            ),
+            (
+                "tcp",
+                json!({"remote_port": 6500}),
+                Some(("port", "6000")),
+                "does not allow existing port",
+            ),
+            (
+                "http",
+                json!({"subdomain": "api"}),
+                Some(("subdomain", "")),
+                "does not support the existing http",
+            ),
+        ];
+        for (index, (kind, extra, capability, expected)) in caps.into_iter().enumerate() {
+            let client = rig.client(&format!("cap-client-{index}")).await;
+            let mut tunnel = json!({
+                "client_id": client,
+                "name": format!("cap-tunnel-{index}"),
+                "kind": kind,
+                "local_port": 80,
+                "reason": "capability test"
+            });
+            if let Some(fields) = extra.as_object() {
+                tunnel.as_object_mut().unwrap().extend(fields.clone());
+            }
+            if kind == "tcp" {
+                tunnel["remote_port"] = json!(6500);
+            }
+            let (status, created) = rig.request(Method::POST, "/api/v1/tunnels", tunnel).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+
+            let node_id = format!("cap-node-{index}");
+            let node_id_for_db = node_id.clone();
+            let info = match capability {
+                Some(("subdomain", _)) => NodeInfo {
+                    public_host: format!("edge-{index}.example.test"),
+                    edge_port: 7443,
+                    tls_fingerprint: "ab".repeat(32),
+                    vhost_http: Some(8080),
+                    ..Default::default()
+                },
+                Some(("port", _)) => NodeInfo {
+                    public_host: format!("edge-{index}.example.test"),
+                    edge_port: 7443,
+                    tls_fingerprint: "ab".repeat(32),
+                    allow_ports: vec![(6000, 6100)],
+                    ..Default::default()
+                },
+                _ => NodeInfo {
+                    public_host: format!("edge-{index}.example.test"),
+                    edge_port: 7443,
+                    tls_fingerprint: "ab".repeat(32),
+                    ..Default::default()
+                },
+            };
+            let expected_http = info.vhost_http;
+            rig.db
+                .call(move |c| {
+                    store::create_node(
+                        c,
+                        &node_id_for_db,
+                        &node_id_for_db,
+                        &"cd".repeat(32),
+                        &info,
+                        store::now_ms(),
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let stored_node = rig
+                .db
+                .call({
+                    let node_id = node_id.clone();
+                    move |c| store::get_node(c, &node_id)
+                })
+                .await
+                .unwrap();
+            assert_eq!(stored_node.vhost_http, expected_http, "{node_id}");
+            let (status, result) = rig
+                .request(
+                    Method::POST,
+                    &format!("/api/v1/clients/{client}/migrate"),
+                    json!({"node_id": node_id, "reason": "capability test"}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "expected {expected:?}, got {result}"
+            );
+        }
+
+        let offline_config = Config {
+            builtin_edge: false,
+            vhost_http: Some(8080),
+            ..Config::default()
+        };
+        let no_builtin = Rig::with_config(offline_config).await;
+        let client = no_builtin.client("no-builtin").await;
+        let (status, result) = no_builtin
+            .request(
+                Method::POST,
+                "/api/v1/tunnels",
+                json!({
+                    "client_id": client,
+                    "name": "http",
+                    "kind": "http",
+                    "local_port": 8080,
+                    "custom_domains": ["no-builtin.test"],
+                    "reason": "node capability test"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert!(result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("built-in edge is disabled"));
+
+        let empty_policy = Config::default();
+        assert!(vhost_policy(&empty_policy, "http", "").is_err());
+        assert!(vhost_policy(&empty_policy, "https", "").is_err());
+        assert!(vhost_policy(&empty_policy, "tcpmux", "").is_err());
+        assert!(vhost_policy(&empty_policy, "tcp", "api").is_err());
+    }
+
+    #[tokio::test]
+    async fn external_node_policy_checks_vhost_and_disabled_capabilities() {
+        let rig = Rig::new().await;
+        let info = |index: u16| NodeInfo {
+            public_host: format!("edge-{index}.example.test"),
+            edge_port: 7443,
+            tls_fingerprint: "ab".repeat(32),
+            ..Default::default()
+        };
+
+        for (suffix, kind, extra, expected) in [
+            (
+                "http-port",
+                "http",
+                json!({"custom_domains": ["missing-http.example.test"]}),
+                "vhost HTTP port",
+            ),
+            (
+                "https-port",
+                "https",
+                json!({"custom_domains": ["missing-https.example.test"]}),
+                "vhost HTTPS port",
+            ),
+            (
+                "mux-port",
+                "tcpmux",
+                json!({"custom_domains": ["missing-mux.example.test"], "multiplexer": "httpconnect"}),
+                "tcpmuxHTTPConnectPort",
+            ),
+            (
+                "subdomain",
+                "http",
+                json!({"subdomain": "api"}),
+                "subdomains need",
+            ),
+        ] {
+            let node_id = format!("node-{suffix}");
+            let mut capabilities = info(7000 + suffix.len() as u16);
+            if suffix == "https-port" || suffix == "mux-port" || suffix == "subdomain" {
+                capabilities.vhost_http = Some(8080);
+            }
+            if suffix == "mux-port" {
+                capabilities.vhost_https = Some(8443);
+            }
+            rig.add_node(&node_id, capabilities, false).await;
+            let client = rig.client(&format!("client-{suffix}")).await;
+            rig.assign(&client, &node_id).await;
+            let (status, result) = rig
+                .create_tunnel(&client, &format!("tunnel-{suffix}"), kind, extra)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{result}"
+            );
+        }
+
+        let disabled_id = "node-disabled-policy";
+        rig.add_node(disabled_id, info(7443), true).await;
+        let disabled_client = rig.client("disabled-policy-client").await;
+        rig.assign(&disabled_client, disabled_id).await;
+        let (status, result) = rig
+            .create_tunnel(&disabled_client, "disabled-policy-tunnel", "tcp", json!({}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert!(result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("client's node is disabled"));
+
+        let active_id = "node-active-policy";
+        rig.add_node(
+            active_id,
+            NodeInfo {
+                vhost_http: Some(8080),
+                vhost_https: Some(8443),
+                tcpmux_http_connect_port: Some(7443),
+                subdomain_host: "node.example.test".into(),
+                ..info(7555)
+            },
+            false,
+        )
+        .await;
+        let active_client = rig.client("active-policy-client").await;
+        rig.assign(&active_client, active_id).await;
+        let (status, created) = rig
+            .create_tunnel(
+                &active_client,
+                "active-policy-mux",
+                "tcpmux",
+                json!({"custom_domains": ["active-mux.example.test"], "multiplexer": "httpconnect"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (status, returned) = rig
+            .request(
+                Method::POST,
+                &format!("/api/v1/clients/{active_client}/migrate"),
+                json!({"node_id": "", "reason": "return to builtin"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(returned["node_id"], "");
+
+        let no_builtin = Rig::with_config(Config {
+            builtin_edge: false,
+            ..Config::default()
+        })
+        .await;
+        let disabled_client = no_builtin.client("disabled-migration-client").await;
+        let (status, disabled_move) = no_builtin
+            .request(
+                Method::POST,
+                &format!("/api/v1/clients/{disabled_client}/migrate"),
+                json!({"node_id": "", "reason": "disabled built-in edge"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{disabled_move}");
+        assert!(disabled_move["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("built-in edge is disabled"));
+    }
+
+    #[tokio::test]
+    async fn node_tunnel_and_owner_routes_reject_noop_or_unsafe_changes() {
+        let rig = Rig::new().await;
+        rig.add_node("patch-node", NodeInfo::default(), false).await;
+        let (status, no_node_change) = rig
+            .request(
+                Method::PATCH,
+                "/api/v1/nodes/patch-node",
+                json!({"reason": "no changes"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{no_node_change}");
+        assert!(no_node_change["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to change"));
+        let (status, disabled) = rig
+            .request(
+                Method::PATCH,
+                "/api/v1/nodes/patch-node",
+                json!({"disabled": true, "reason": "maintenance"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{disabled}");
+        assert!(disabled["disabled_at"].is_i64());
+        let (status, enabled) = rig
+            .request(
+                Method::PATCH,
+                "/api/v1/nodes/patch-node",
+                json!({"disabled": false, "reason": "maintenance complete"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{enabled}");
+        assert!(enabled["disabled_at"].is_null());
+
+        let client = rig.client("patch-tunnel-client").await;
+        let (status, tunnel) = rig
+            .create_tunnel(
+                &client,
+                "patch-subdomain",
+                "http",
+                json!({"custom_domains": ["patch.example.test"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{tunnel}");
+        let tunnel_id = tunnel["id"].as_str().unwrap();
+        let (status, patched) = rig
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/tunnels/{tunnel_id}"),
+                json!({"subdomain": "patch", "reason": "add subdomain"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{patched}");
+        assert_eq!(patched["subdomain"], "patch");
+
+        let owner_id = rig
+            .db
+            .call(|c| Ok(store::list_admins(c)?.remove(0).id))
+            .await
+            .unwrap();
+        let (status, no_admin_change) = rig
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/admins/{owner_id}"),
+                json!({"reason": "no changes"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{no_admin_change}");
+        let (status, self_change) = rig
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/admins/{owner_id}"),
+                json!({"role": "viewer", "reason": "self change"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{self_change}");
+
+        let (status, unready) = rig
+            .request(
+                Method::POST,
+                "/api/v1/enroll-tokens",
+                json!({"name": "unready client", "node_id": "patch-node", "reason": "setup"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{unready}");
+        assert!(unready["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has not reported its public host"));
     }
 }

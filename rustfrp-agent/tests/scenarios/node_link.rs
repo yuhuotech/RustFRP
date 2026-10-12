@@ -303,6 +303,8 @@ pub async fn start(
             ..Default::default()
         },
         identity: None,
+        dashboard_identity: None,
+        tcpmux_passthrough: false,
         link: LinkCtx {
             host: "127.0.0.1".into(),
             port: ctl_port,

@@ -227,6 +227,119 @@ class ClientDetail extends ConsumerWidget {
     );
   }
 
+  Future<void> _editConnectionLimit(
+    BuildContext context,
+    WidgetRef ref,
+    ClientDevice device,
+  ) async {
+    final text = await showDialog<String>(
+      context: context,
+      builder: (_) => _ClientTextDialog(
+        fieldKey: 'client-max-connections',
+        title: '客户端连接数上限',
+        hint: '例如 500',
+        initialValue: device.maxConnections == 0
+            ? ''
+            : '${device.maxConnections}',
+        description: '所有隧道共用此上限；UDP 按活跃源地址计数，SUDP 按访问者工作流计数。留空或填 0 表示不限。',
+        confirmLabel: '保存',
+      ),
+    );
+    if (text == null || !context.mounted) return;
+    final max = text.isEmpty ? 0 : int.tryParse(text);
+    if (max == null || max < 0 || max > 1000000) {
+      showToast(context, '连接上限须为 0 到 1000000 的整数');
+      return;
+    }
+    await guarded(
+      context,
+      () => ref
+          .read(actionsProvider)
+          .setClientMaxConnections(device.id, max, '通过面板设置客户端连接数上限'),
+    );
+  }
+
+  Future<void> _moveNode(
+    BuildContext context,
+    WidgetRef ref,
+    ClientDevice device,
+  ) async {
+    final nodes = await guarded(context, () => ref.read(apiProvider).nodes());
+    if (nodes == null || !context.mounted) return;
+    final choices = nodes.where((node) => node.id != device.nodeId).toList();
+    if (choices.isEmpty) {
+      showToast(context, '没有可迁移的目标节点');
+      return;
+    }
+    final nodeId = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => DialogShell(
+        title: '迁移到其他节点',
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final node in choices)
+              ListTile(
+                key: Key('move-node-${node.id.isEmpty ? 'builtin' : node.id}'),
+                title: Text(node.name),
+                subtitle: Text(
+                  '${node.publicHost}:${node.edgePort} · ${node.online ? '在线' : '离线'}',
+                ),
+                onTap: () => Navigator.pop(dialogContext, node.id),
+              ),
+          ],
+        ),
+        actions: [
+          LButton(label: '取消', onPressed: () => Navigator.pop(dialogContext)),
+        ],
+      ),
+    );
+    if (nodeId == null || !context.mounted) return;
+    final reason = await askReason(
+      context,
+      title: '迁移客户端',
+      message: '设备收到迁移指令后会自动连接目标 Edge；现有隧道会短暂中断。',
+      confirm: '迁移',
+    );
+    if (reason == null || !context.mounted) return;
+    final ok = await guarded(context, () async {
+      await ref.read(actionsProvider).moveClient(device.id, nodeId, reason);
+      return true;
+    });
+    if (ok == true && context.mounted) showToast(context, '已发送迁移指令');
+  }
+
+  Future<void> _updateAgent(
+    BuildContext context,
+    WidgetRef ref,
+    ClientDevice device,
+  ) async {
+    final version = await showDialog<String>(
+      context: context,
+      builder: (_) => const _ClientTextDialog(
+        fieldKey: 'agent-update-version',
+        title: '更新 Agent',
+        hint: 'Release tag，例如 v1.2.3',
+        confirmLabel: '下一步',
+      ),
+    );
+    if (version == null || version.isEmpty || !context.mounted) return;
+    final reason = await askReason(
+      context,
+      title: '下发 Agent 更新',
+      message: 'Agent 会从签名 Release 下载并校验新版本，替换后退出，由服务管理器重新拉起。',
+      confirm: '下发更新',
+    );
+    if (reason == null || !context.mounted) return;
+    final ok = await guarded(context, () async {
+      await ref
+          .read(actionsProvider)
+          .updateClientAgent(device.id, version, reason);
+      return true;
+    });
+    if (ok == true && context.mounted) showToast(context, '已发送更新指令');
+  }
+
   Future<void> _restart(
     BuildContext context,
     WidgetRef ref,
@@ -456,7 +569,34 @@ class ClientDetail extends ConsumerWidget {
                 iconSize: 16,
                 onPressed: () => _editTags(context, ref, d),
               ),
+              if (!isNarrow(context)) ...[
+                LIconButton(
+                  key: const Key('client-connection-limit'),
+                  icon: LucideIcons.gauge,
+                  tooltip: '连接数上限',
+                  size: 32,
+                  iconSize: 16,
+                  onPressed: () => _editConnectionLimit(context, ref, d),
+                ),
+                LIconButton(
+                  key: const Key('client-migrate-node'),
+                  icon: LucideIcons.moveRight,
+                  tooltip: '迁移节点',
+                  size: 32,
+                  iconSize: 16,
+                  onPressed: () => _moveNode(context, ref, d),
+                ),
+              ],
               if (d.online) ...[
+                if (!isNarrow(context))
+                  LIconButton(
+                    key: const Key('client-update-agent'),
+                    icon: LucideIcons.download,
+                    tooltip: '更新 Agent',
+                    size: 32,
+                    iconSize: 16,
+                    onPressed: () => _updateAgent(context, ref, d),
+                  ),
                 LIconButton(
                   icon: LucideIcons.rotateCw,
                   tooltip: '重启 agent',
@@ -519,6 +659,44 @@ class ClientDetail extends ConsumerWidget {
                       mono: true,
                     ),
                     InfoRow('配置版本', '${d.revision}'),
+                    InfoRow(
+                      '连接数上限',
+                      d.maxConnections == 0 ? '不限' : '${d.maxConnections}',
+                    ),
+                    InfoRow(
+                      '所属节点',
+                      d.nodeId.isEmpty ? '内置节点' : d.nodeId,
+                      mono: d.nodeId.isNotEmpty,
+                    ),
+                    if (isNarrow(context) && canAdmin) ...[
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          LButton(
+                            key: const Key('client-connection-limit'),
+                            label: '连接数上限',
+                            compact: true,
+                            onPressed: () =>
+                                _editConnectionLimit(context, ref, d),
+                          ),
+                          LButton(
+                            key: const Key('client-migrate-node'),
+                            label: '迁移节点',
+                            compact: true,
+                            onPressed: () => _moveNode(context, ref, d),
+                          ),
+                          if (d.online)
+                            LButton(
+                              key: const Key('client-update-agent'),
+                              label: '更新 Agent',
+                              compact: true,
+                              onPressed: () => _updateAgent(context, ref, d),
+                            ),
+                        ],
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -580,6 +758,64 @@ class ClientDetail extends ConsumerWidget {
       ],
     );
   }
+}
+
+class _ClientTextDialog extends StatefulWidget {
+  const _ClientTextDialog({
+    required this.fieldKey,
+    required this.title,
+    required this.hint,
+    required this.confirmLabel,
+    this.initialValue = '',
+    this.description,
+  });
+  final String fieldKey, title, hint, confirmLabel, initialValue;
+  final String? description;
+
+  @override
+  State<_ClientTextDialog> createState() => _ClientTextDialogState();
+}
+
+class _ClientTextDialogState extends State<_ClientTextDialog> {
+  late final _controller = TextEditingController(text: widget.initialValue);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => DialogShell(
+    title: widget.title,
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (widget.description != null) ...[
+          Text(
+            widget.description!,
+            style: Type.caption.copyWith(color: context.c.text2),
+          ),
+          const SizedBox(height: 8),
+        ],
+        LTextField(
+          key: Key(widget.fieldKey),
+          controller: _controller,
+          hint: widget.hint,
+          autofocus: true,
+        ),
+      ],
+    ),
+    actions: [
+      LButton(label: '取消', onPressed: () => Navigator.pop(context)),
+      LButton(
+        label: widget.confirmLabel,
+        variant: BtnVariant.solid,
+        onPressed: () => Navigator.pop(context, _controller.text.trim()),
+      ),
+    ],
+  );
 }
 
 class ConfigImportDialog extends ConsumerStatefulWidget {

@@ -190,17 +190,8 @@ async fn status_reload_and_stop_through_the_admin_interface_and_cli() {
             .await
             .1
             .contains("\"second\""));
-        fs.write_private(
-            "frpc.toml",
-            &config(
-                edge_port,
-                web,
-                echo_port,
-                "",
-                "webServer.tls.certFile = \"x\"\nwebServer.tls.keyFile = \"y\"\n",
-            ),
-        )
-        .unwrap();
+        fs.write_private("frpc.toml", &config(edge_port, web, echo_port, "", ""))
+            .unwrap();
 
         // 命令行：status / reload / stop 都经管理接口。
         let admin_cmd = |action: AdminAction| {
@@ -303,6 +294,54 @@ async fn status_reload_and_stop_through_the_admin_interface_and_cli() {
     );
     stop_edge.cancel();
     let _ = cancel;
+}
+
+#[tokio::test]
+async fn webserver_tls_pins_certificate_and_serves_assets_after_basic_auth() {
+    let root = std::env::temp_dir().join(format!("rustfrp-admin-assets-{}", std::process::id()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::write(root.join("index.html"), "<h1>dashboard</h1>")
+        .await
+        .unwrap();
+    let (cert, key) = rustfrp_core::tls::self_signed_pem(vec!["localhost".into()]).unwrap();
+    let identity = rustfrp_core::tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let fingerprint = rustfrp_core::tls::certificate_fingerprint(identity.certs.first().unwrap());
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(rustfrp_core::tls::app_server_config(identity).unwrap());
+    let connector = tokio_rustls::TlsConnector::from(
+        rustfrp_core::tls::app_client_config_pinned(None, Some(&fingerprint)).unwrap(),
+    );
+    let (reload, _rx) = tokio::sync::mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let admin = Arc::new(admin::Admin {
+        user: "admin".into(),
+        password: "secret".into(),
+        assets_dir: Some(root.clone()),
+        status: Arc::default(),
+        config_text: Arc::default(),
+        reload,
+        stop: cancel.clone(),
+    });
+    tokio::spawn(admin::serve(
+        listener,
+        admin,
+        Some(acceptor),
+        cancel.clone(),
+    ));
+    let addr = format!("127.0.0.1:{port}");
+    let (code, body) = admin::request_tls(&addr, "/", "admin", "secret", connector.clone())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    assert!(body.contains("dashboard"));
+    let (code, _) = admin::request_tls(&addr, "/", "admin", "wrong", connector)
+        .await
+        .unwrap();
+    assert_eq!(code, 401);
+    cancel.cancel();
+    tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
 #[tokio::test]
@@ -449,12 +488,13 @@ async fn reload_is_refused_when_the_client_loop_is_gone() {
     let a = Arc::new(admin::Admin {
         user: String::new(),
         password: String::new(),
+        assets_dir: None,
         status: Arc::default(),
         config_text: Arc::default(),
         reload: tx,
         stop: cancel.clone(),
     });
-    tokio::spawn(admin::serve(l, a, cancel.clone()));
+    tokio::spawn(admin::serve(l, a, None, cancel.clone()));
     let mut incomplete = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     incomplete
         .write_all(b"GET /api/status HTTP/1.1\r\nHost:")
@@ -478,11 +518,13 @@ async fn reload_is_refused_when_the_client_loop_is_gone() {
         Arc::new(admin::Admin {
             user: String::new(),
             password: String::new(),
+            assets_dir: None,
             status: Arc::default(),
             config_text: Arc::default(),
             reload: tx2,
             stop: cancel.clone(),
         }),
+        None,
         cancel.clone(),
     ));
     let (code, body) = admin::request(&format!("127.0.0.1:{port2}"), "/api/reload", "", "")

@@ -394,6 +394,9 @@ pub fn validate_proxy_for_client(p: &Proxy) -> Result<(), String> {
         return Err("name should not be empty".to_string());
     }
     validate_annotations(p)?;
+    if !(0..=1_000_000).contains(&p.max_connections) {
+        return Err("maxConnections must be in 0..=1000000".into());
+    }
     if !["", "v1", "v2"].contains(&p.transport.proxy_protocol_version.as_str()) {
         return Err(format!(
             "not support proxy protocol version: {}",
@@ -501,6 +504,9 @@ pub fn validate_server(c: &ServerConfig, allowed_unsafe: &[String]) -> Result<()
     }
     if c.transport.max_pool_count < 0 {
         errs.push("invalid transport.maxPoolCount, must be non-negative".to_string());
+    }
+    if !(0..=1_000_000).contains(&c.max_connections_per_client) {
+        errs.push("invalid maxConnectionsPerClient, must be in 0..=1000000".to_string());
     }
     for p in &c.http_plugins {
         if !p.ops.iter().all(|o| HTTP_PLUGIN_OPS.contains(&o.as_str())) {
@@ -908,6 +914,14 @@ mod tests {
         );
 
         let mut p = proxy("tcp");
+        p.max_connections = 1_000_001;
+        assert!(validate_proxy_for_client(&p)
+            .unwrap_err()
+            .contains("maxConnections must be in 0..=1000000"));
+        p.max_connections = 0;
+        assert!(validate_proxy_for_client(&p).is_ok());
+
+        let mut p = proxy("tcp");
         p.transport.proxy_protocol_version = "v3".into();
         assert!(validate_proxy_for_client(&p)
             .unwrap_err()
@@ -1150,6 +1164,7 @@ mod tests {
         s.vhost_https_port = 70000;
         s.tcpmux_http_connect_port = 70000;
         s.transport.max_pool_count = -1;
+        s.max_connections_per_client = 1_000_001;
         s.http_plugins = vec![HttpPluginOptions {
             ops: vec!["Bad".into()],
             ..Default::default()
@@ -1169,6 +1184,7 @@ mod tests {
             "vhostHTTPSPort",
             "tcpMuxHTTPConnectPort",
             "maxPoolCount",
+            "maxConnectionsPerClient",
             "http plugin ops",
         ] {
             assert!(e.contains(want), "{want} in {e}");

@@ -34,6 +34,8 @@ class FakeServer {
 
   /// 收到重启请求的设备。
   final List<String> restarts = [];
+  final List<Map<String, Object?>> migrations = [];
+  final List<Map<String, Object?>> agentUpdates = [];
 
   /// 外置节点（`/nodes` 里排在内置节点之后）。
   final List<Map<String, Object?>> extraNodes = [];
@@ -64,6 +66,7 @@ class FakeServer {
     String os = 'linux',
     bool isOnline = false,
     bool disabled = false,
+    int maxConnections = 0,
   }) {
     final c = {
       'id': _id(),
@@ -76,6 +79,8 @@ class FakeServer {
       'last_seen_at': 1700000100000,
       'disabled_at': disabled ? 1700000200000 : null,
       'last_ip': isOnline ? '203.0.113.7' : '',
+      'node_id': '',
+      'max_connections': maxConnections,
     };
     clients.add(c);
     if (isOnline) online.add(c['id']! as String);
@@ -98,6 +103,7 @@ class FakeServer {
       'tls_fingerprint': 'f' * 64,
       'vhost_http': 80,
       'vhost_https': 443,
+      'tcpmux_http_connect_port': 7443,
       'subdomain_host': 'n.example.com',
       'allow_ports': [
         [20000, 20100],
@@ -123,6 +129,8 @@ class FakeServer {
     String addr = '127.0.0.1',
     int port = 0,
     bool enabled = true,
+    bool useEncryption = false,
+    bool useCompression = false,
   }) {
     final v = <String, Object?>{
       'id': _id(),
@@ -132,6 +140,8 @@ class FakeServer {
       'bind_addr': addr,
       'bind_port': port,
       'enabled': enabled,
+      'use_encryption': useEncryption,
+      'use_compression': useCompression,
       'created_at': 1,
       'updated_at': 1,
     };
@@ -348,6 +358,7 @@ class FakeServer {
           ],
           'vhost_http_port': 8080,
           'vhost_https_port': null,
+          'tcpmux_http_connect_port': 7443,
           'subdomain_host': 't.example.com',
           'version': '0.1.0',
           'clients_online': online.length,
@@ -364,6 +375,7 @@ class FakeServer {
               'tls_fingerprint': '',
               'vhost_http': 8080,
               'vhost_https': null,
+              'tcpmux_http_connect_port': 7443,
               'subdomain_host': 't.example.com',
               'allow_ports': [
                 [6000, 6100],
@@ -411,6 +423,9 @@ class FakeServer {
         if (c == null) return _err(404, 'not_found', 'not found');
         if (body.containsKey('name')) c['name'] = body['name'];
         if (body.containsKey('tags')) c['tags'] = body['tags'];
+        if (body.containsKey('max_connections')) {
+          c['max_connections'] = body['max_connections'];
+        }
         if (body.containsKey('disabled')) {
           c['disabled_at'] = body['disabled'] == true ? 1700000300000 : null;
         }
@@ -423,6 +438,20 @@ class FakeServer {
         }
         restarts.add(id);
         return _json({'ok': true});
+      case ('POST', ['clients', final id, 'migrate']):
+        final e = guard('admin');
+        if (e != null) return e;
+        migrations.add({'client_id': id, ...body});
+        final c = clients.where((x) => x['id'] == id).firstOrNull;
+        if (c == null) return _err(404, 'not_found', 'not found');
+        c['node_id'] = body['node_id'];
+        return _json({'ok': true, 'node_id': body['node_id']});
+      case ('POST', ['clients', final id, 'update']):
+        final e = guard('admin');
+        if (e != null) return e;
+        if (!online.contains(id)) return _err(409, 'conflict', 'offline');
+        agentUpdates.add({'client_id': id, ...body});
+        return _json({'ok': true, 'seq': 1, 'version': body['version']});
       case ('POST', ['clients', final id, 'kick']):
         final e = guard('admin');
         if (e != null) return e;
@@ -513,6 +542,10 @@ class FakeServer {
         t['proxy_protocol'] = body['proxy_protocol'] ?? 0;
         t['bandwidth_bps'] = body['bandwidth_bps'] ?? 0;
         t['bandwidth_server'] = body['bandwidth_server'] ?? false;
+        t['max_connections'] = body['max_connections'] ?? 0;
+        t['multiplexer'] = body['multiplexer'] ?? '';
+        t['use_encryption'] = body['use_encryption'] ?? false;
+        t['use_compression'] = body['use_compression'] ?? false;
         t['lb_group'] = body['lb_group'] ?? '';
         t['lb_group_key_set'] =
             ((body['lb_group_key'] as String?) ?? '').isNotEmpty;
@@ -545,6 +578,10 @@ class FakeServer {
           'proxy_protocol',
           'bandwidth_bps',
           'bandwidth_server',
+          'max_connections',
+          'multiplexer',
+          'use_encryption',
+          'use_compression',
           'lb_group',
         ]) {
           if (body.containsKey(k)) t[k] = body[k];
@@ -593,6 +630,8 @@ class FakeServer {
           addr: (body['bind_addr'] as String?) ?? '127.0.0.1',
           port: (body['bind_port'] as int?) ?? 0,
           enabled: (body['enabled'] as bool?) ?? true,
+          useEncryption: (body['use_encryption'] as bool?) ?? false,
+          useCompression: (body['use_compression'] as bool?) ?? false,
         );
         return _json(v, 201);
       case ('PATCH', ['visitors', final id]):
@@ -606,6 +645,8 @@ class FakeServer {
           'bind_addr',
           'bind_port',
           'enabled',
+          'use_encryption',
+          'use_compression',
         ]) {
           if (body.containsKey(k)) v[k] = body[k];
         }

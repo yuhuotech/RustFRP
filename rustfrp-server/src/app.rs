@@ -140,6 +140,8 @@ pub async fn start(mut cfg: Config, log: Logger) -> Result<Server, String> {
         allow_ports: cfg.allow_ports.clone(),
         vhost_http_port: cfg.vhost_http,
         vhost_https_port: cfg.vhost_https,
+        tcpmux_http_connect_port: cfg.tcpmux_http_connect_port,
+        max_connections_per_client: cfg.max_connections_per_client,
         sub_domain_host: cfg.subdomain_host.clone(),
         ..Default::default()
     };
@@ -157,6 +159,7 @@ pub async fn start(mut cfg: Config, log: Logger) -> Result<Server, String> {
         let edge = Edge::bind_with_policy(edge_cfg, identity, policy, log.clone())
             .await
             .map_err(|e| format!("start edge: {e}"))?;
+        let edge = edge.with_tcpmux_passthrough(cfg.tcpmux_passthrough);
         cfg.edge_tls_fingerprint = edge.certificate_fingerprint().into();
         Some(edge)
     } else {

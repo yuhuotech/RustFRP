@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::edge::{ConnectionLease, ConnectionLimits};
 use crate::log::Logger;
 
 /// 一条虚拟主机路由。
@@ -48,6 +49,11 @@ pub struct Route {
     pub group_key: String,
     /// 是否健康；不健康的路由不参与选路。
     pub up: Arc<std::sync::atomic::AtomicBool>,
+    /// 两层连接预算。
+    pub limits: Option<ConnectionLimits>,
+    /// 代理工作流附加加密 / 压缩。
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 /// http 代理在 Edge 上生效的选项（已校验、已规范化）。
@@ -136,6 +142,7 @@ type Table = Mutex<Vec<(String, Route)>>;
 pub struct Routes {
     http: Table,
     https: Table,
+    tcpmux: Table,
     next_id: std::sync::atomic::AtomicU64,
     /// 组内轮转计数。
     rr: std::sync::atomic::AtomicUsize,
@@ -198,10 +205,36 @@ impl Routes {
         Ok(id)
     }
 
+    /// 为 TCPMUX CONNECT 域名登记路由；同一域名不允许产生歧义。
+    pub fn add_tcpmux(&self, hosts: &[String], route: &Route) -> Result<u64, String> {
+        let mut table = self.tcpmux.lock().unwrap_or_else(PoisonError::into_inner);
+        for host in hosts {
+            if table
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(host))
+            {
+                return Err(format!("tcpmux domain [{host}] is already used"));
+            }
+        }
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.extend(hosts.iter().map(|host| {
+            (
+                host.to_ascii_lowercase(),
+                Route {
+                    id,
+                    ..route.clone()
+                },
+            )
+        }));
+        Ok(id)
+    }
+
     /// 同步移除某个代理的全部路由（重启代理时必须先于重新登记，否则会与自己的旧路由冲突）。
     pub fn remove_proxy(&self, proxy: &str) {
-        for https in [false, true] {
-            self.table(https)
+        for table in [&self.http, &self.https, &self.tcpmux] {
+            table
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .retain(|(_, r)| r.proxy != proxy);
@@ -210,8 +243,8 @@ impl Routes {
 
     /// 移除一次登记产生的全部路由。
     pub fn remove(&self, id: u64) {
-        for https in [false, true] {
-            self.table(https)
+        for table in [&self.http, &self.https, &self.tcpmux] {
+            table
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .retain(|(_, r)| r.id != id);
@@ -244,6 +277,32 @@ impl Routes {
                 .filter(|(p, r)| p == pattern && r.up.load(std::sync::atomic::Ordering::Relaxed))
                 .map(|(_, r)| r),
         )
+    }
+
+    /// TCPMUX 域名精确匹配优先，然后按最具体通配项匹配。
+    pub fn lookup_tcpmux(&self, host: &str) -> Option<Route> {
+        let table = self.tcpmux.lock().unwrap_or_else(PoisonError::into_inner);
+        let pattern = table
+            .iter()
+            .find(|(p, r)| {
+                r.up.load(std::sync::atomic::Ordering::Relaxed) && p.eq_ignore_ascii_case(host)
+            })
+            .map(|(p, _)| p)
+            .or_else(|| {
+                table
+                    .iter()
+                    .filter(|(p, r)| {
+                        r.up.load(std::sync::atomic::Ordering::Relaxed)
+                            && p.starts_with("*.")
+                            && domain_matches(p, host)
+                    })
+                    .map(|(p, _)| p)
+                    .max_by_key(|p| p.len())
+            })?;
+        table
+            .iter()
+            .find(|(p, r)| p == pattern && r.up.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(_, r)| r.clone())
     }
 
     /// 在候选（同域名、同路径的同组成员）里轮转挑一个。
@@ -354,6 +413,88 @@ pub async fn serve_vhost(
     }
 }
 
+/// TCPMUX 共享端口：只接受带域名的 HTTP CONNECT 请求。
+pub async fn serve_tcpmux(
+    listener: TcpListener,
+    routes: Arc<Routes>,
+    opts: VhostOpts,
+    passthrough: bool,
+    log: Logger,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((tcp, peer)) = accepted else { continue };
+                let (routes, opts, log) = (routes.clone(), opts.clone(), log.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = tcpmux_conn(tcp, peer, &routes, &opts, passthrough).await {
+                        log.debug(&format!("tcpmux {peer}: {e}"));
+                    }
+                });
+            }
+        }
+    }
+}
+
+const CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+
+async fn tcpmux_conn(
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    routes: &Routes,
+    opts: &VhostOpts,
+    passthrough: bool,
+) -> Result<(), TunnelError> {
+    let _ = tcp.set_nodelay(true);
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+    let parsed = timeout(opts.head_timeout, async {
+        loop {
+            match rustfrp_core::http1::parse_connect_request(&head) {
+                Ok(Some(h)) => return Ok::<_, std::io::Error>(Some(h)),
+                Err(_) => return Ok::<_, std::io::Error>(None),
+                Ok(None) => {}
+            }
+            if head.len() >= MAX_HEAD {
+                return Ok::<_, std::io::Error>(None);
+            }
+            let n = tcp.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok::<_, std::io::Error>(None);
+            }
+            head.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+        }
+    })
+    .await
+    .map_err(|_| TunnelError::Timeout("read CONNECT request"))??;
+    let Some(request) = parsed else {
+        let _ = tcp.write_all(BAD_REQUEST).await;
+        return Ok(());
+    };
+    let Some(route) = routes.lookup_tcpmux(&request.host) else {
+        let _ = tcp.write_all(NOT_FOUND).await;
+        return Ok(());
+    };
+    let dst = tcp.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let (mut upstream, _lease) = match open_upstream(&route, peer, &dst, opts.open_timeout).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            return Err(error);
+        }
+    };
+    if passthrough {
+        pipe::relay_counted_prefix(&mut tcp, &mut upstream, &route.traffic, &head).await?;
+    } else {
+        tcp.write_all(CONNECT_ESTABLISHED).await?;
+        let prefix = head.get(request.head_len..).unwrap_or(&[]);
+        pipe::relay_counted_prefix(&mut tcp, &mut upstream, &route.traffic, prefix).await?;
+    }
+    Ok(())
+}
+
 /// 读到足以判定 SNI 为止，返回（已读字节, 主机名）。
 async fn read_sni(tcp: &mut TcpStream) -> Result<(Vec<u8>, Option<String>), TunnelError> {
     let mut buf = Vec::with_capacity(2048);
@@ -390,7 +531,7 @@ async fn https_conn(
         return Ok(());
     };
     let dst = tcp.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let mut stream = open_upstream(&route, peer, &dst, opts.open_timeout).await?;
+    let (mut stream, _lease) = open_upstream(&route, peer, &dst, opts.open_timeout).await?;
     match &route.limiter {
         Some(l) => {
             let mut v = pipe::Limited::new(tcp, l.clone());
@@ -410,20 +551,42 @@ async fn open_upstream(
     peer: SocketAddr,
     dst: &str,
     open_timeout: Duration,
-) -> Result<rustfrp_core::mux::Stream, TunnelError> {
+) -> Result<(rustfrp_core::transform::BoxAsyncIo, ConnectionLease), TunnelError> {
+    let lease = match route.limits.as_ref() {
+        Some(limits) => limits
+            .acquire_detailed()
+            .map_err(|which| TunnelError::Wire(format!("connection limit reached ({which})")))?,
+        None => ConnectionLease::unlimited(),
+    };
     let mut stream = timeout(open_timeout, route.session.open())
         .await
         .map_err(|_| TunnelError::Timeout("open work stream"))??;
+    let encryption_key = if route.use_encryption {
+        rustfrp_core::transform::random_key_hex().map_err(TunnelError::Wire)?
+    } else {
+        String::new()
+    };
     write_frame(
         &mut stream,
         &StartWork {
             proxy: route.proxy.clone(),
             src: peer.to_string(),
             dst: dst.to_string(),
+            use_encryption: route.use_encryption,
+            use_compression: route.use_compression,
+            encryption_key: encryption_key.clone(),
         },
     )
     .await?;
-    Ok(stream)
+    let stream = rustfrp_core::transform::wrap(
+        Box::new(stream),
+        route.use_encryption,
+        route.use_compression,
+        &encryption_key,
+        true,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
+    Ok((stream, lease))
 }
 
 const UNAUTHORIZED: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nUnauthorized";
@@ -518,10 +681,11 @@ struct Upstream {
     limiter: Option<Arc<pipe::Limiter>>,
     route_id: u64,
     uid: u64,
-    write: tokio::io::WriteHalf<rustfrp_core::mux::Stream>,
+    write: tokio::io::WriteHalf<rustfrp_core::transform::BoxAsyncIo>,
     alive: Arc<std::sync::atomic::AtomicBool>,
     traffic: Arc<pipe::Traffic>,
     tracked: Arc<Tracked>,
+    _lease: ConnectionLease,
 }
 
 /// 响应泵共享的连接级状态。
@@ -541,7 +705,10 @@ struct PumpCtx {
 }
 
 /// 响应泵：后端 → 访问者。当前使用中的后端关闭时，关闭访问者连接（让「以关闭为界」的响应正常结束）。
-async fn pump_response(mut read: tokio::io::ReadHalf<rustfrp_core::mux::Stream>, c: PumpCtx) {
+async fn pump_response(
+    mut read: tokio::io::ReadHalf<rustfrp_core::transform::BoxAsyncIo>,
+    c: PumpCtx,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let _connection = c.traffic.connection();
     let mut buf = [0u8; pipe::BUF_SIZE];
@@ -786,11 +953,12 @@ async fn http_conn(
         ups.retain(|_, u| u.alive.load(Relaxed));
         // 换了后端：先等上一条后端把已发出请求的响应送完，保证响应顺序（流水线请求不会串位）。
         let prev = current.load(Relaxed);
-        if let Some(p) = ups
+        let previous = ups
             .values()
             .find(|u| u.uid == prev && u.route_id != route.id)
-        {
-            if !p.tracked.settled(&done).await {
+            .map(|upstream| upstream.tracked.clone());
+        if let Some(tracked) = previous {
+            if !tracked.settled(&done).await {
                 break 'conn false;
             }
         }
@@ -799,7 +967,9 @@ async fn http_conn(
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(_) if full => break 'conn false,
             Entry::Vacant(v) => {
-                let Ok(stream) = open_upstream(&route, peer, &dst, opts.open_timeout).await else {
+                let Ok((stream, lease)) =
+                    open_upstream(&route, peer, &dst, opts.open_timeout).await
+                else {
                     break 'conn false;
                 };
                 let (read, write) = tokio::io::split(stream);
@@ -829,6 +999,7 @@ async fn http_conn(
                     alive,
                     traffic: route.traffic.clone(),
                     tracked,
+                    _lease: lease,
                 })
             }
         };
@@ -894,6 +1065,8 @@ pub struct UdpOpts {
     pub traffic: Arc<pipe::Traffic>,
     /// 作为访问者（sudp）转发时的目标：打开的流先通过 Edge 的访问者握手，而不是 `StartWork`。
     pub visitor: Option<VisitorTarget>,
+    /// Device and tunnel peer-session limits.
+    pub limits: ConnectionLimits,
 }
 
 /// sudp 访问者要连接的代理及密钥。
@@ -903,6 +1076,10 @@ pub struct VisitorTarget {
     pub server_name: String,
     /// 访问密钥。
     pub sk: String,
+    /// 访问者到 Edge 的单工作流加密。
+    pub use_encryption: bool,
+    /// 访问者到 Edge 的单工作流压缩。
+    pub use_compression: bool,
 }
 
 /// 访问者握手：向 Edge 出示签名，得到放行后流就成为通往目标代理的透明通道。
@@ -910,7 +1087,7 @@ pub async fn visitor_handshake(
     stream: &mut rustfrp_core::mux::Stream,
     target: &VisitorTarget,
     limit: Duration,
-) -> Result<(), TunnelError> {
+) -> Result<rustfrp_core::wire::VisitorResp, TunnelError> {
     let timestamp = rustfrp_core::auth::unix_now();
     write_frame(
         stream,
@@ -918,6 +1095,8 @@ pub async fn visitor_handshake(
             server_name: target.server_name.clone(),
             timestamp,
             sign: rustfrp_core::auth::auth_key(&target.sk, timestamp),
+            use_encryption: target.use_encryption,
+            use_compression: target.use_compression,
         },
     )
     .await?;
@@ -926,7 +1105,19 @@ pub async fn visitor_handshake(
             .await
             .map_err(|_| TunnelError::Timeout("visitor response"))??;
     if resp.ok {
-        Ok(())
+        if resp.use_encryption != target.use_encryption
+            || resp.use_compression != target.use_compression
+        {
+            return Err(TunnelError::Wire(
+                "edge did not apply the requested visitor stream transforms".into(),
+            ));
+        }
+        if resp.use_encryption && resp.encryption_key.len() != 64 {
+            return Err(TunnelError::Wire(
+                "edge returned an invalid visitor stream key".into(),
+            ));
+        }
+        Ok(resp)
     } else {
         Err(TunnelError::Auth(resp.error))
     }
@@ -964,6 +1155,9 @@ pub async fn udp_proxy(
                 if map.len() >= opts.max_peers {
                     continue;
                 }
+                let Some(lease) = opts.limits.acquire() else {
+                    continue;
+                };
                 let (tx, rx) = mpsc::channel(64);
                 map.insert(peer, tx.clone());
                 drop(map);
@@ -977,6 +1171,7 @@ pub async fn udp_proxy(
                     cancel.clone(),
                 );
                 tokio::spawn(async move {
+                    let _lease = lease;
                     if let Err(e) = udp_peer(sock, peer, rx, &session, &name, &opts, &cancel).await
                     {
                         log.debug(&format!("udp proxy [{name}] peer {peer}: {e}"));
@@ -1006,8 +1201,16 @@ async fn udp_peer(
     let mut stream = timeout(opts.open_timeout, session.open())
         .await
         .map_err(|_| TunnelError::Timeout("open work stream"))??;
-    if let Some(v) = &opts.visitor {
-        visitor_handshake(&mut stream, v, opts.open_timeout).await?;
+    let stream: rustfrp_core::transform::BoxAsyncIo = if let Some(v) = &opts.visitor {
+        let transform = visitor_handshake(&mut stream, v, opts.open_timeout).await?;
+        rustfrp_core::transform::wrap(
+            Box::new(stream),
+            transform.use_encryption,
+            transform.use_compression,
+            &transform.encryption_key,
+            true,
+        )
+        .map_err(|e| TunnelError::Wire(e.to_string()))?
     } else {
         write_frame(
             &mut stream,
@@ -1015,10 +1218,14 @@ async fn udp_peer(
                 proxy: name.to_string(),
                 src: peer.to_string(),
                 dst: String::new(),
+                use_encryption: false,
+                use_compression: false,
+                encryption_key: String::new(),
             },
         )
         .await?;
-    }
+        Box::new(stream)
+    };
     let _connection = opts.traffic.connection();
     let traffic = opts.traffic.clone();
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -1075,6 +1282,9 @@ mod tests {
             group: group.into(),
             group_key: key.into(),
             up: Arc::new(AtomicBool::new(true)),
+            limits: None,
+            use_encryption: false,
+            use_compression: false,
         }
     }
 
@@ -1150,5 +1360,152 @@ mod tests {
             let err = HttpRoute::from_opts(&opts(bad)).unwrap_err();
             assert!(err.contains("invalid response header"), "{bad}: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::duplex;
+
+    fn route(name: &str) -> Route {
+        let (io, _peer) = tokio::io::duplex(64);
+        Route {
+            id: 0,
+            proxy: name.into(),
+            session: rustfrp_core::mux::spawn(io, true, Default::default()).0,
+            rewrite: String::new(),
+            traffic: Default::default(),
+            http: Arc::new(HttpRoute::default()),
+            limiter: None,
+            group: String::new(),
+            group_key: String::new(),
+            up: Arc::new(AtomicBool::new(true)),
+            limits: None,
+            use_encryption: false,
+            use_compression: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn tcpmux_route_table_matches_exact_wildcards_and_rejects_ambiguity() {
+        let routes = Routes::default();
+        let exact = route("exact");
+        let wildcard = route("wildcard");
+        routes
+            .add_tcpmux(&["api.example.test".into()], &exact)
+            .unwrap();
+        routes
+            .add_tcpmux(&["*.example.test".into()], &wildcard)
+            .unwrap();
+        assert_eq!(
+            routes.lookup_tcpmux("API.EXAMPLE.TEST").unwrap().proxy,
+            "exact"
+        );
+        assert_eq!(
+            routes.lookup_tcpmux("www.example.test").unwrap().proxy,
+            "wildcard"
+        );
+        assert!(routes.lookup_tcpmux("other.invalid").is_none());
+        assert!(routes
+            .add_tcpmux(&["API.EXAMPLE.TEST".into()], &route("duplicate"))
+            .unwrap_err()
+            .contains("already used"));
+
+        wildcard
+            .up
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(routes.lookup_tcpmux("www.example.test").is_none());
+        exact.up.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(routes.lookup_tcpmux("api.example.test").is_none());
+    }
+
+    async fn tcpmux_roundtrip(passthrough: bool) {
+        use rustfrp_core::wire::{read_frame, StartWork};
+
+        let (client_io, edge_io) = duplex(64 * 1024);
+        let (edge_session, _edge_inbound, edge_drive) =
+            rustfrp_core::mux::spawn(edge_io, true, Default::default());
+        let (_client_session, mut inbound, client_drive) =
+            rustfrp_core::mux::spawn(client_io, false, Default::default());
+        let route = Route {
+            session: edge_session,
+            ..route("tcpmux")
+        };
+        let routes = Routes::default();
+        routes
+            .add_tcpmux(&["mux.example.test".into()], &route)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = b"CONNECT mux.example.test:443 HTTP/1.1\r\nHost: mux.example.test\r\n\r\n";
+        let payload = b"application payload";
+        let mut incoming = request.to_vec();
+        incoming.extend_from_slice(payload);
+        let forwarded = incoming.clone();
+        let client = tokio::spawn(async move {
+            let mut tcp = TcpStream::connect(address).await.unwrap();
+            tcp.write_all(&incoming).await.unwrap();
+            let response_prefix = if passthrough {
+                Vec::new()
+            } else {
+                let mut status = vec![0; CONNECT_ESTABLISHED.len()];
+                tcp.read_exact(&mut status).await.unwrap();
+                assert_eq!(status, CONNECT_ESTABLISHED);
+                status
+            };
+            let response = b"backend response";
+            let mut got = vec![0; response.len()];
+            timeout(Duration::from_secs(3), tcp.read_exact(&mut got))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, response);
+            response_prefix
+        });
+        let (tcp, peer) = listener.accept().await.unwrap();
+        let opts = VhostOpts {
+            head_timeout: Duration::from_secs(2),
+            open_timeout: Duration::from_secs(2),
+        };
+        let conn =
+            tokio::spawn(async move { tcpmux_conn(tcp, peer, &routes, &opts, passthrough).await });
+        let mut work = timeout(Duration::from_secs(3), inbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let start: StartWork = read_frame(&mut work).await.unwrap();
+        assert_eq!(start.proxy, "tcpmux");
+        let expected = if passthrough {
+            forwarded
+        } else {
+            payload.to_vec()
+        };
+        let mut received = vec![0; expected.len()];
+        timeout(Duration::from_secs(3), work.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, expected);
+        work.write_all(b"backend response").await.unwrap();
+        work.shutdown().await.unwrap();
+        timeout(Duration::from_secs(3), client)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        edge_drive.abort();
+        client_drive.abort();
+    }
+
+    #[tokio::test]
+    async fn tcpmux_preserves_or_consumes_connect_headers_by_server_mode() {
+        tcpmux_roundtrip(false).await;
+        tcpmux_roundtrip(true).await;
     }
 }

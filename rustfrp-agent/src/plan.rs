@@ -30,6 +30,10 @@ pub struct EdgePlan {
     pub cfg: EdgeConfig,
     /// 服务端证书（未配置则运行时生成自签名）。
     pub identity: Option<Identity>,
+    /// dashboard 的独立 TLS 证书身份。
+    pub dashboard_identity: Option<Identity>,
+    /// frps `tcpmuxPassthrough` behavior.
+    pub tcpmux_passthrough: bool,
     /// `log.to`。
     pub log_to: String,
     /// `log.level`。
@@ -141,8 +145,6 @@ pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static s
             v.push(name);
         }
     };
-    flag(p.transport.use_encryption, "transport.useEncryption");
-    flag(p.transport.use_compression, "transport.useCompression");
     // frp 本身不支持 udp 限速；tcp / http / https 由 Limiter 实现。
     flag(
         p.kind == "udp" && !p.transport.bandwidth_limit.is_empty(),
@@ -161,6 +163,14 @@ pub(crate) fn ignored_options(p: &rustfrp_core::frpcfg::Proxy) -> Vec<&'static s
     flag(
         p.kind == "udp" && !p.load_balancer.group.is_empty(),
         "loadBalancer (udp)",
+    );
+    flag(
+        p.kind == "tcpmux" && !p.load_balancer.group.is_empty(),
+        "loadBalancer (tcpmux)",
+    );
+    flag(
+        p.kind == "tcpmux" && !p.health_check.kind.is_empty(),
+        "healthCheck (tcpmux)",
     );
     // http 代理已支持这些选项；其他类型上配置它们没有意义，按「未支持」提示。
     let other = p.kind != "http";
@@ -193,7 +203,7 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
     let mut notes = Vec::new();
     let mut proxies = Vec::new();
     for p in &l.proxies {
-        if !["tcp", "udp", "http", "https", "stcp", "sudp"].contains(&p.kind.as_str()) {
+        if !["tcp", "udp", "http", "https", "tcpmux", "stcp", "sudp"].contains(&p.kind.as_str()) {
             notes.push(format!(
                 "proxy [{}]: type \"{}\" is not supported yet, skipped",
                 p.name, p.kind
@@ -219,6 +229,10 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
         proxies.push(ProxyCfg {
             name,
             kind: p.kind.clone(),
+            multiplexer: p.multiplexer.clone(),
+            max_connections: usize::try_from(p.max_connections).unwrap_or(0),
+            use_encryption: p.transport.use_encryption,
+            use_compression: p.transport.use_compression,
             local_ip: p.local_ip.clone(),
             local_port: port(p.local_port, &format!("proxy [{}] localPort", p.name))?,
             remote_port: port(p.remote_port, &format!("proxy [{}] remotePort", p.name))?,
@@ -263,18 +277,6 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             ));
         }
     }
-    // 管理接口只提供 JSON / 文本（reload / status / stop），没有网页和 TLS。
-    if c.web_server.port > 0 {
-        if c.web_server.tls.is_some() {
-            notes.push(
-                "webServer.tls is not supported yet: the admin interface is plain HTTP".into(),
-            );
-        }
-        if !c.web_server.assets_dir.is_empty() {
-            notes
-                .push("webServer.assetsDir is not supported yet: there is no web dashboard".into());
-        }
-    }
     let mut visitors = Vec::new();
     for v in &l.visitors {
         if !["stcp", "sudp"].contains(&v.kind.as_str()) {
@@ -295,13 +297,9 @@ pub fn client_plan(l: &LoadedClient, fs: &dyn ConfigFs) -> Result<ClientPlan, St
             sk: v.secret_key.clone(),
             bind_addr: v.bind_addr.clone(),
             bind_port: port(v.bind_port, &format!("visitor [{}] bindPort", v.name))?,
+            use_encryption: v.transport.use_encryption,
+            use_compression: v.transport.use_compression,
         });
-        if v.transport.use_encryption || v.transport.use_compression {
-            notes.push(format!(
-                "visitor [{}]: option transport.useEncryption / useCompression is not supported yet and is ignored",
-                v.name
-            ));
-        }
     }
     let trusted_ca_pem = if c.transport.tls.trusted_ca_file.is_empty() {
         None
@@ -350,8 +348,8 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
         return Err("auth.method \"oidc\" is not implemented yet".into());
     }
     let mut notes = Vec::new();
-    if s.web_server.port > 0 {
-        notes.push("webServer (dashboard) is not supported yet on the edge and is ignored".into());
+    if s.web_server.pprof_enable {
+        notes.push("webServer.pprofEnable is not implemented".into());
     }
     let mut allow_ports = Vec::new();
     for r in &s.allow_ports {
@@ -374,6 +372,17 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
             .map_err(|e| format!("read keyFile {}: {e}", t.key_file))?;
         Some(tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).map_err(|e| e.to_string())?)
     };
+    let dashboard_identity = if let Some(t) = &s.web_server.tls {
+        let cert = fs
+            .read_to_string(&t.cert_file)
+            .map_err(|e| format!("read webServer.tls.certFile {}: {e}", t.cert_file))?;
+        let key = fs
+            .read_to_string(&t.key_file)
+            .map_err(|e| format!("read webServer.tls.keyFile {}: {e}", t.key_file))?;
+        Some(tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let cfg = EdgeConfig {
         bind_addr: s.bind_addr.clone(),
         bind_port: port(s.bind_port, "bindPort")?,
@@ -381,10 +390,21 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
         token: resolve_token(&s.auth.token, &s.auth.token_source, fs)?,
         allow_ports,
         max_ports_per_client: usize::try_from(s.max_ports_per_client).unwrap_or(0),
+        max_connections_per_client: usize::try_from(s.max_connections_per_client).unwrap_or(0),
         heartbeat_timeout: secs(s.transport.heartbeat_timeout, 90),
         user_conn_timeout: secs(s.user_conn_timeout, 10),
         vhost_http_port: opt_port(s.vhost_http_port, "vhostHTTPPort")?,
         vhost_https_port: opt_port(s.vhost_https_port, "vhostHTTPSPort")?,
+        tcpmux_http_connect_port: opt_port(s.tcpmux_http_connect_port, "tcpmuxHTTPConnectPort")?,
+        dashboard_addr: if s.web_server.addr.is_empty() {
+            s.bind_addr.clone()
+        } else {
+            s.web_server.addr.clone()
+        },
+        dashboard_port: port(s.web_server.port, "webServer.port")?,
+        dashboard_user: s.web_server.user.clone(),
+        dashboard_password: s.web_server.password.clone(),
+        dashboard_assets_dir: s.web_server.assets_dir.clone(),
         sub_domain_host: s.sub_domain_host.clone(),
         vhost_head_timeout: secs(s.vhost_http_timeout, 60),
         udp_packet_size: usize::try_from(s.udp_packet_size).unwrap_or(1500),
@@ -393,6 +413,8 @@ pub fn edge_plan(l: &LoadedServer, fs: &dyn ConfigFs) -> Result<EdgePlan, String
     Ok(EdgePlan {
         cfg,
         identity,
+        dashboard_identity,
+        tcpmux_passthrough: s.tcpmux_passthrough,
         log_to: s.log.to.clone(),
         log_level: s.log.level.clone(),
         notes,
@@ -564,25 +586,21 @@ mod tests {
     }
 
     #[test]
-    fn web_server_options_that_have_no_runtime_are_reported() {
-        let fs = MemFs::new();
+    fn web_server_tls_and_assets_are_built_into_runtime() {
+        let (cert, key) = rustfrp_core::tls::self_signed_pem(vec!["localhost".into()]).unwrap();
+        let fs = MemFs::new().with("cert.pem", &cert).with("key.pem", &key);
         let client_src = "serverAddr='x'\nwebServer.port=7400\nwebServer.assetsDir='/srv/ui'\nwebServer.tls.certFile='c'\nwebServer.tls.keyFile='k'\n";
         let plan = client(client_src, &fs);
         let notes = plan.map(|p| p.notes.join("\n")).unwrap_or_default();
-        assert!(
-            notes.contains("webServer.tls") && notes.contains("webServer.assetsDir"),
-            "{notes}"
-        );
+        assert!(notes.is_empty(), "{notes}");
         let quiet = client("serverAddr='x'\nwebServer.port=7400\n", &fs).unwrap();
         assert!(quiet.notes.is_empty(), "{:?}", quiet.notes);
-        let edge = server("bindPort=7000\nwebServer.port=7500\n", &fs).unwrap();
-        assert!(
-            edge.notes
-                .iter()
-                .any(|n| n.contains("webServer (dashboard)")),
-            "{:?}",
-            edge.notes
-        );
+        let edge = server("bindPort=7000\nwebServer.addr='127.0.0.1'\nwebServer.port=7500\nwebServer.assetsDir='/srv/dashboard'\nwebServer.tls.certFile='cert.pem'\nwebServer.tls.keyFile='key.pem'\n", &fs).unwrap();
+        assert_eq!(edge.cfg.dashboard_addr, "127.0.0.1");
+        assert_eq!(edge.cfg.dashboard_port, 7500);
+        assert_eq!(edge.cfg.dashboard_assets_dir, "/srv/dashboard");
+        assert!(edge.dashboard_identity.is_some());
+        assert!(edge.notes.is_empty(), "{:?}", edge.notes);
     }
 
     #[test]
@@ -608,12 +626,11 @@ mod tests {
         );
         let notes = plan.notes.join("\n");
         assert!(
-            notes.contains("proxy [p2p]")
-                && notes.contains("visitor [x]")
-                && notes.contains("visitor [enc]"),
+            notes.contains("proxy [p2p]") && notes.contains("visitor [x]"),
             "{notes}"
         );
         assert!(!notes.contains("visitor [off]"), "{notes}");
+        assert!(plan.cfg.visitors[0].use_encryption);
         // 端口越界是配置错误。
         assert!(client("serverAddr='x'\n[[visitors]]\nname='v'\ntype='stcp'\nserverName='s'\nsecretKey='k'\nbindPort=70000\n", &fs).is_err());
     }
@@ -697,8 +714,8 @@ bindPort = 1
             (p.cfg.visitors[0].name.as_str(), p.cfg.visitors[0].bind_port),
             ("v", 1)
         );
-        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
-        assert!(p.notes[0].contains("transport.useEncryption"));
+        assert!(p.cfg.proxies[1].use_encryption);
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
     }
 
     #[test]
@@ -853,5 +870,98 @@ allowPorts = [ { start = 6000, end = 6100 }, { single = 7000 } ]
             .err()
             .unwrap()
             .contains("allowPorts"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use rustfrp_core::frpcfg::{
+        load_client_str, load_server_str, Format, LoadOptions, MapEnv, MemFs,
+    };
+
+    fn client(src: &str, fs: &MemFs) -> Result<ClientPlan, String> {
+        let env = MapEnv::default();
+        let loaded = load_client_str(
+            src,
+            Format::Toml,
+            &LoadOptions {
+                strict: false,
+                fs,
+                env: &env,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        client_plan(&loaded, fs)
+    }
+
+    fn server(src: &str, fs: &MemFs) -> Result<EdgePlan, String> {
+        let env = MapEnv::default();
+        let loaded = load_server_str(
+            src,
+            Format::Toml,
+            &LoadOptions {
+                strict: true,
+                fs,
+                env: &env,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        edge_plan(&loaded, fs)
+    }
+
+    #[test]
+    fn webserver_plan_maps_limits_notes_and_dashboard_tls_failures() {
+        let (cert, key) = rustfrp_core::tls::self_signed_pem(vec!["localhost".into()]).unwrap();
+        let fs = MemFs::new().with("cert.pem", &cert).with("key.pem", &key);
+        let plan = server(
+            "bindPort=7000\nmaxConnectionsPerClient=7\ntcpmuxPassthrough=true\nwebServer.addr='127.0.0.1'\nwebServer.port=7500\nwebServer.pprofEnable=true\nwebServer.assetsDir='/srv/ui'\nwebServer.tls.certFile='cert.pem'\nwebServer.tls.keyFile='key.pem'\n",
+            &fs,
+        )
+        .unwrap();
+        assert_eq!(plan.cfg.max_connections_per_client, 7);
+        assert_eq!(plan.cfg.dashboard_addr, "127.0.0.1");
+        assert_eq!(plan.cfg.dashboard_assets_dir, "/srv/ui");
+        assert!(plan.dashboard_identity.is_some());
+        assert!(plan.tcpmux_passthrough);
+        assert!(plan.notes.iter().any(|note| note.contains("pprofEnable")));
+
+        assert!(server(
+            "bindPort=7000\nwebServer.port=7500\nwebServer.tls.certFile='missing.pem'\nwebServer.tls.keyFile='key.pem'\n",
+            &fs
+        )
+        .err()
+        .unwrap()
+        .contains("webServer.tls.certFile"));
+        assert!(server(
+            "bindPort=7000\nwebServer.port=7500\nwebServer.tls.certFile='cert.pem'\nwebServer.tls.keyFile='missing.pem'\n",
+            &fs
+        )
+        .err()
+        .unwrap()
+        .contains("webServer.tls.keyFile"));
+
+        let malformed = MemFs::new()
+            .with("bad.crt", "not a certificate")
+            .with("bad.key", "bad");
+        assert!(server(
+            "bindPort=7000\nwebServer.port=7500\nwebServer.tls.certFile='bad.crt'\nwebServer.tls.keyFile='bad.key'\n",
+            &malformed
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unsupported_tcp_mux_options_are_reported_and_visitor_transforms_are_applied() {
+        let plan = client(
+            "[[proxies]]\nname='mux'\ntype='tcpmux'\nmultiplexer='httpconnect'\nlocalPort=1\ncustomDomains=['mux.example.test']\nloadBalancer.group='g'\nhealthCheck.type='tcp'\n[[proxies]]\nname='raw'\ntype='tcp'\nlocalPort=22\nhttpUser='u'\nhttpPassword='p'\n[[visitors]]\nname='v'\ntype='stcp'\nserverName='private'\nbindPort=6001\nsecretKey='k'\ntransport.useCompression=true\n",
+            &MemFs::new(),
+        )
+        .unwrap();
+        let notes = plan.notes.join("\n");
+        assert!(notes.contains("loadBalancer (tcpmux)"), "{notes}");
+        assert!(notes.contains("healthCheck (tcpmux)"), "{notes}");
+        assert!(notes.contains("httpUser / httpPassword"), "{notes}");
+        assert!(plan.cfg.visitors[0].use_compression);
     }
 }

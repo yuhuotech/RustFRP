@@ -221,6 +221,16 @@ class _TunnelsViewState extends ConsumerState<TunnelsView> {
 /// What visitors type to reach a tunnel: `host:port` for tcp / udp, a URL for http / https.
 String publicAddress(Tunnel t, NodeInfo? node) {
   final host = node?.publicHost ?? '';
+  if (t.kind == 'tcpmux') {
+    final domain =
+        t.customDomains.firstOrNull ??
+        (t.subdomain.isNotEmpty && (node?.subdomainHost ?? '').isNotEmpty
+            ? '${t.subdomain}.${node!.subdomainHost}'
+            : null);
+    final port = node?.tcpmuxHttpConnectPort;
+    if (domain == null) return '未配置 TCPMUX 域名';
+    return port == null ? 'CONNECT $domain' : 'CONNECT $domain:$port';
+  }
   if (t.isWeb) {
     final port = t.kind == 'http' ? node?.vhostHttpPort : node?.vhostHttpsPort;
     final hosts = [
@@ -448,6 +458,14 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
         : '${(widget.existing!.bandwidthBps / 1024).ceil()}',
   );
   late bool _bandwidthServer = widget.existing?.bandwidthServer ?? false;
+  late final _maxConnections = TextEditingController(
+    text: widget.existing == null || widget.existing!.maxConnections == 0
+        ? ''
+        : '${widget.existing!.maxConnections}',
+  );
+  late String _multiplexer = widget.existing?.multiplexer ?? 'httpconnect';
+  late bool _useEncryption = widget.existing?.useEncryption ?? false;
+  late bool _useCompression = widget.existing?.useCompression ?? false;
   late final _lbGroup = TextEditingController(
     text: widget.existing?.lbGroup ?? '',
   );
@@ -507,6 +525,13 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
     return n == null || n < 0 || n > 1 << 30 ? null : n * 1024;
   }
 
+  int? get _maxConnectionCount {
+    final text = _maxConnections.text.trim();
+    if (text.isEmpty) return 0;
+    final count = int.tryParse(text);
+    return count == null || count < 0 || count > 1000000 ? null : count;
+  }
+
   bool _busy = false;
   String _template = 'custom';
   void _applyTemplate(String? value) {
@@ -550,6 +575,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       _respHeaders,
       _pluginJson,
       _bandwidth,
+      _maxConnections,
       _lbGroup,
       _lbKey,
       _hcPath,
@@ -567,6 +593,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       ? 0
       : int.tryParse(_remotePort.text.trim());
   bool get _web => _kind == 'http' || _kind == 'https';
+  bool get _domain => _web || _kind == 'tcpmux';
 
   /// stcp / sudp：没有公网端口，由其他客户端上的访问者连接。
   bool get _secret => _kind == 'stcp' || _kind == 'sudp';
@@ -625,11 +652,13 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
       _pluginValid &&
       (_datagram ||
           (_bandwidthBps != null && (!_balanced || _health != _badHealth))) &&
+      _maxConnectionCount != null &&
+      (_kind != 'tcpmux' || _multiplexer == 'httpconnect') &&
       _name.text.trim().isNotEmpty &&
       _localIp.text.trim().isNotEmpty &&
       (_lp ?? 0) >= 1 &&
       (_lp ?? 0) <= 65535 &&
-      (_web
+      (_domain
           ? (_domainList.isNotEmpty || _sub.text.trim().isNotEmpty)
           : _secret || (_rp != null && _rp! >= 0 && _rp! <= 65535));
 
@@ -644,10 +673,10 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           name: _name.text.trim(),
           localPort: _lp!,
           localIp: _localIp.text.trim(),
-          remotePort: _web || _secret ? 0 : _rp!,
+          remotePort: _domain || _secret ? 0 : _rp!,
           kind: _kind,
-          customDomains: _web ? _domainList : const [],
-          subdomain: _web ? _sub.text.trim() : '',
+          customDomains: _domain ? _domainList : const [],
+          subdomain: _domain ? _sub.text.trim() : '',
           hostHeaderRewrite: _kind == 'http' ? _rewrite.text.trim() : '',
           locations: _kind == 'http' ? _locationList : const [],
           httpUser: _kind == 'http' ? _httpUser.text.trim() : '',
@@ -658,6 +687,10 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           proxyProtocol: _balanced ? _proxyProtocol : 0,
           bandwidthBps: _datagram ? 0 : _bandwidthBps!,
           bandwidthServer: !_datagram && _bandwidthServer,
+          maxConnections: _maxConnectionCount!,
+          multiplexer: _kind == 'tcpmux' ? _multiplexer : '',
+          useEncryption: _useEncryption,
+          useCompression: _useCompression,
           lbGroup: _balanced ? _lbGroup.text.trim() : '',
           lbGroupKey: _balanced ? _lbKey.text : '',
           healthCheck: _balanced ? _health : null,
@@ -670,9 +703,9 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           name: _name.text.trim(),
           localIp: _localIp.text.trim(),
           localPort: _lp,
-          remotePort: _web || _secret ? null : _rp,
-          customDomains: _web ? _domainList : null,
-          subdomain: _web ? _sub.text.trim() : null,
+          remotePort: _domain || _secret ? null : _rp,
+          customDomains: _domain ? _domainList : null,
+          subdomain: _domain ? _sub.text.trim() : null,
           hostHeaderRewrite: _kind == 'http' ? _rewrite.text.trim() : null,
           locations: _kind == 'http' ? _locationList : null,
           httpUser: _kind == 'http' ? _httpUser.text.trim() : null,
@@ -688,6 +721,10 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
           proxyProtocol: _balanced ? _proxyProtocol : null,
           bandwidthBps: _datagram ? null : _bandwidthBps,
           bandwidthServer: _datagram ? null : _bandwidthServer,
+          maxConnections: _maxConnectionCount,
+          multiplexer: _kind == 'tcpmux' ? _multiplexer : null,
+          useEncryption: _useEncryption,
+          useCompression: _useCompression,
           lbGroup: _balanced ? _lbGroup.text.trim() : null,
           // 留空 = 保持原密钥；退出组时一并清掉。
           lbGroupKey: !_balanced
@@ -764,12 +801,14 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
             Text(_kind.toUpperCase(), style: Type.body.copyWith(color: c.text1))
           else
             LSelect<String>(
+              key: const Key('tunnel-kind'),
               value: _kind,
               options: const [
                 LSelectOption('tcp', 'TCP'),
                 LSelectOption('udp', 'UDP'),
                 LSelectOption('http', 'HTTP（按域名）'),
                 LSelectOption('https', 'HTTPS（按域名，TLS 透传）'),
+                LSelectOption('tcpmux', 'TCPMUX（CONNECT 按域名分流）'),
                 LSelectOption('stcp', 'STCP（私密 TCP，需访问者）'),
                 LSelectOption('sudp', 'SUDP（私密 UDP，需访问者）'),
               ],
@@ -889,6 +928,57 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               ],
             ),
           ],
+          const SizedBox(height: 12),
+          label('最大并发连接 / UDP 活跃源地址数（留空或 0 = 不限）'),
+          LTextField(
+            key: const Key('tunnel-max-connections'),
+            controller: _maxConnections,
+            hint: '例如 100',
+            onChanged: (_) => setState(() {}),
+          ),
+          Text(
+            'UDP 按活动源地址计数；SUDP 按访问者工作流计数，空闲回收后释放额度。',
+            style: Type.caption.copyWith(color: c.text3),
+          ),
+          if (_maxConnectionCount == null)
+            Text(
+              '请输入 0 到 1000000 的整数',
+              style: Type.caption.copyWith(color: c.dangerText),
+            ),
+          if (_kind == 'tcpmux') ...[
+            const SizedBox(height: 12),
+            label('TCPMUX 复用器'),
+            LSelect<String>(
+              key: const Key('tunnel-multiplexer'),
+              value: _multiplexer,
+              options: const [LSelectOption('httpconnect', 'HTTP CONNECT')],
+              onChanged: (value) =>
+                  setState(() => _multiplexer = value ?? 'httpconnect'),
+            ),
+          ],
+          if (['tcp', 'http', 'https', 'tcpmux', 'stcp'].contains(_kind)) ...[
+            const SizedBox(height: 8),
+            CheckboxListTile(
+              key: const Key('tunnel-use-encryption'),
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              activeColor: c.action,
+              value: _useEncryption,
+              title: Text('额外加密工作流数据', style: Type.body),
+              onChanged: (value) =>
+                  setState(() => _useEncryption = value ?? false),
+            ),
+            CheckboxListTile(
+              key: const Key('tunnel-use-compression'),
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              activeColor: c.action,
+              value: _useCompression,
+              title: Text('压缩工作流数据', style: Type.body),
+              onChanged: (value) =>
+                  setState(() => _useCompression = value ?? false),
+            ),
+          ],
           if (_balanced) ...[
             const SizedBox(height: 12),
             label('负载均衡组（可选；同组隧道共用端口 / 域名，连接在健康成员间轮转）'),
@@ -966,7 +1056,7 @@ class _TunnelEditorState extends ConsumerState<TunnelEditor> {
               '私密隧道没有公网端口：在同一节点的其他客户端上添加「访问者」后，才能从那台设备的本机端口访问它。',
               style: Type.caption.copyWith(color: c.text3),
             )
-          else if (!_web) ...[
+          else if (!_domain) ...[
             label('公网端口（留空 = 自动分配）'),
             LTextField(
               key: const Key('tunnel-remote-port'),

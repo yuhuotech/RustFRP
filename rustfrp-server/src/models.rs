@@ -86,6 +86,9 @@ pub struct Client {
     /// 最近一次登录时 Edge 看到的来源地址。
     #[serde(default)]
     pub last_ip: String,
+    /// 设备全部隧道共享的并发流 / UDP 活跃源地址上限；0 = 不限。
+    #[serde(default)]
+    pub max_connections: usize,
 }
 
 /// 隧道（spec + status）。
@@ -153,6 +156,18 @@ pub struct Tunnel {
     /// 限速由服务端执行（否则由客户端）。
     #[serde(default)]
     pub bandwidth_server: bool,
+    /// 每隧道并发流或 UDP 活跃源地址上限；0 = 不限。
+    #[serde(default)]
+    pub max_connections: usize,
+    /// TCPMUX 复用器名称。
+    #[serde(default)]
+    pub multiplexer: String,
+    /// 代理工作流附加加密开关。
+    #[serde(default)]
+    pub use_encryption: bool,
+    /// 代理工作流压缩开关。
+    #[serde(default)]
+    pub use_compression: bool,
     /// 负载均衡组名（空 = 不入组）。
     #[serde(default)]
     pub lb_group: String,
@@ -195,6 +210,12 @@ pub struct Visitor {
     pub bind_port: u16,
     /// 是否启用。
     pub enabled: bool,
+    /// 访问者工作流加密。
+    #[serde(default)]
+    pub use_encryption: bool,
+    /// 访问者工作流压缩。
+    #[serde(default)]
+    pub use_compression: bool,
     /// 创建时间。
     pub created_at: i64,
     /// 更新时间。
@@ -247,6 +268,9 @@ pub struct Node {
     pub vhost_http: Option<u16>,
     /// HTTPS 虚拟主机端口。
     pub vhost_https: Option<u16>,
+    /// TCPMUX HTTP CONNECT 共享端口。
+    #[serde(default)]
+    pub tcpmux_http_connect_port: Option<u16>,
     /// 子域名后缀。
     pub subdomain_host: String,
     /// 允许分配的端口区间。

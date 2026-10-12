@@ -180,6 +180,8 @@ class ApiClient {
     String bindAddr = '127.0.0.1',
     int bindPort = 0,
     bool enabled = true,
+    bool useEncryption = false,
+    bool useCompression = false,
     required String reason,
   }) async => Visitor.fromJson(
     await _send(
@@ -192,6 +194,8 @@ class ApiClient {
         'bind_addr': bindAddr,
         'bind_port': bindPort,
         'enabled': enabled,
+        'use_encryption': useEncryption,
+        'use_compression': useCompression,
         'reason': reason,
       },
     ),
@@ -204,6 +208,8 @@ class ApiClient {
     String? bindAddr,
     int? bindPort,
     bool? enabled,
+    bool? useEncryption,
+    bool? useCompression,
     required String reason,
   }) async => Visitor.fromJson(
     await _send(
@@ -215,6 +221,8 @@ class ApiClient {
         'bind_addr': ?bindAddr,
         'bind_port': ?bindPort,
         'enabled': ?enabled,
+        'use_encryption': ?useEncryption,
+        'use_compression': ?useCompression,
         'reason': reason,
       },
     ),
@@ -323,6 +331,7 @@ class ApiClient {
     String? name,
     bool? disabled,
     List<String>? tags,
+    int? maxConnections,
     required String reason,
   }) async => ClientDevice.fromJson(
     await _send(
@@ -332,6 +341,7 @@ class ApiClient {
         'name': ?name,
         'disabled': ?disabled,
         'tags': ?tags,
+        'max_connections': ?maxConnections,
         'reason': reason,
       },
     ),
@@ -339,6 +349,26 @@ class ApiClient {
 
   Future<void> restartClient(String id, {required String reason}) async =>
       _send('POST', '/clients/$id/restart', body: {'reason': reason});
+
+  Future<void> migrateClient(
+    String id,
+    String nodeId, {
+    required String reason,
+  }) async => _send(
+    'POST',
+    '/clients/$id/migrate',
+    body: {'node_id': nodeId, 'reason': reason},
+  );
+
+  Future<void> updateClientAgent(
+    String id,
+    String version, {
+    required String reason,
+  }) async => _send(
+    'POST',
+    '/clients/$id/update',
+    body: {'version': version, 'reason': reason},
+  );
 
   Future<void> kickClient(String id, {required String reason}) async =>
       _send('POST', '/clients/$id/kick', body: {'reason': reason});
@@ -378,6 +408,10 @@ class ApiClient {
     int proxyProtocol = 0,
     int bandwidthBps = 0,
     bool bandwidthServer = false,
+    int maxConnections = 0,
+    String multiplexer = '',
+    bool useEncryption = false,
+    bool useCompression = false,
     String lbGroup = '',
     String lbGroupKey = '',
     HealthCheck? healthCheck,
@@ -403,6 +437,10 @@ class ApiClient {
         'proxy_protocol': proxyProtocol,
         'bandwidth_bps': bandwidthBps,
         'bandwidth_server': bandwidthServer,
+        'max_connections': maxConnections,
+        'multiplexer': multiplexer,
+        'use_encryption': useEncryption,
+        'use_compression': useCompression,
         'lb_group': lbGroup,
         'lb_group_key': lbGroupKey,
         'health_check': ?healthCheck?.toJson(),
@@ -435,6 +473,10 @@ class ApiClient {
     int? proxyProtocol,
     int? bandwidthBps,
     bool? bandwidthServer,
+    int? maxConnections,
+    String? multiplexer,
+    bool? useEncryption,
+    bool? useCompression,
     String? lbGroup,
     String? lbGroupKey,
     HealthCheck? healthCheck,
@@ -462,6 +504,10 @@ class ApiClient {
         'proxy_protocol': ?proxyProtocol,
         'bandwidth_bps': ?bandwidthBps,
         'bandwidth_server': ?bandwidthServer,
+        'max_connections': ?maxConnections,
+        'multiplexer': ?multiplexer,
+        'use_encryption': ?useEncryption,
+        'use_compression': ?useCompression,
         'lb_group': ?lbGroup,
         'lb_group_key': ?lbGroupKey,
         'health_check': ?healthCheck?.toJson(),

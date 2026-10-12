@@ -306,6 +306,15 @@ class Actions {
     List<String> tags,
     String reason,
   ) => _do(() => _api.patchClient(id, tags: tags, reason: reason));
+  Future<ClientDevice> setClientMaxConnections(
+    String id,
+    int max,
+    String reason,
+  ) => _do(() => _api.patchClient(id, maxConnections: max, reason: reason));
+  Future<void> moveClient(String id, String nodeId, String reason) =>
+      _do(() => _api.migrateClient(id, nodeId, reason: reason));
+  Future<void> updateClientAgent(String id, String version, String reason) =>
+      _do(() => _api.updateClientAgent(id, version, reason: reason));
   Future<void> restartClient(String id, String reason) =>
       _do(() => _api.restartClient(id, reason: reason));
   Future<ClientDevice> setClientDisabled(
@@ -337,6 +346,10 @@ class Actions {
     int proxyProtocol = 0,
     int bandwidthBps = 0,
     bool bandwidthServer = false,
+    int maxConnections = 0,
+    String multiplexer = '',
+    bool useEncryption = false,
+    bool useCompression = false,
     String lbGroup = '',
     String lbGroupKey = '',
     HealthCheck? healthCheck,
@@ -362,6 +375,10 @@ class Actions {
       proxyProtocol: proxyProtocol,
       bandwidthBps: bandwidthBps,
       bandwidthServer: bandwidthServer,
+      maxConnections: maxConnections,
+      multiplexer: multiplexer,
+      useEncryption: useEncryption,
+      useCompression: useCompression,
       lbGroup: lbGroup,
       lbGroupKey: lbGroupKey,
       healthCheck: healthCheck,
@@ -389,6 +406,10 @@ class Actions {
     int? proxyProtocol,
     int? bandwidthBps,
     bool? bandwidthServer,
+    int? maxConnections,
+    String? multiplexer,
+    bool? useEncryption,
+    bool? useCompression,
     String? lbGroup,
     String? lbGroupKey,
     HealthCheck? healthCheck,
@@ -414,6 +435,10 @@ class Actions {
       proxyProtocol: proxyProtocol,
       bandwidthBps: bandwidthBps,
       bandwidthServer: bandwidthServer,
+      maxConnections: maxConnections,
+      multiplexer: multiplexer,
+      useEncryption: useEncryption,
+      useCompression: useCompression,
       lbGroup: lbGroup,
       lbGroupKey: lbGroupKey,
       healthCheck: healthCheck,
@@ -445,6 +470,8 @@ class Actions {
     required String tunnelId,
     String bindAddr = '127.0.0.1',
     int bindPort = 0,
+    bool useEncryption = false,
+    bool useCompression = false,
     required String reason,
   }) => _do(
     () => _api.createVisitor(
@@ -453,6 +480,8 @@ class Actions {
       tunnelId: tunnelId,
       bindAddr: bindAddr,
       bindPort: bindPort,
+      useEncryption: useEncryption,
+      useCompression: useCompression,
       reason: reason,
     ),
   );
@@ -464,6 +493,8 @@ class Actions {
     String? bindAddr,
     int? bindPort,
     bool? enabled,
+    bool? useEncryption,
+    bool? useCompression,
     required String reason,
   }) => _do(
     () => _api.patchVisitor(
@@ -473,6 +504,8 @@ class Actions {
       bindAddr: bindAddr,
       bindPort: bindPort,
       enabled: enabled,
+      useEncryption: useEncryption,
+      useCompression: useCompression,
       reason: reason,
     ),
   );

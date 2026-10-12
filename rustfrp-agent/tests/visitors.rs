@@ -133,6 +133,22 @@ fn visitor(name: &str, kind: &str, server_user: &str, server: &str, sk: &str) ->
         sk: sk.into(),
         bind_addr: "127.0.0.1".into(),
         bind_port: 0,
+        use_encryption: false,
+        use_compression: false,
+    }
+}
+
+fn transformed_visitor(
+    name: &str,
+    kind: &str,
+    server_user: &str,
+    server: &str,
+    sk: &str,
+) -> VisitorSpec {
+    VisitorSpec {
+        use_encryption: true,
+        use_compression: true,
+        ..visitor(name, kind, server_user, server, sk)
     }
 }
 
@@ -196,7 +212,7 @@ async fn stcp_visitor_reaches_the_private_service_with_the_right_secret() {
         "bob",
         vec![],
         vec![
-            visitor("good", "stcp", "alice", "ssh", "s3cret"),
+            transformed_visitor("good", "stcp", "alice", "ssh", "s3cret"),
             visitor("wrong-key", "stcp", "alice", "ssh", "nope"),
             visitor("missing", "stcp", "alice", "nothing", "s3cret"),
         ],
@@ -284,7 +300,7 @@ async fn sudp_visitor_relays_datagrams_to_the_private_udp_service() {
         &mut rig,
         "",
         vec![],
-        vec![visitor("v", "sudp", "", "dns", "k")],
+        vec![transformed_visitor("v", "sudp", "", "dns", "k")],
     );
     let port = visitor_port(&mut v).await;
     let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -349,6 +365,7 @@ async fn provider_leaving_unregisters_the_proxy_and_server_side_limits_apply() {
     let mut limited = secret_proxy("limited", "stcp", echo, "k", &[]);
     limited.bandwidth_bps = 1 << 20;
     limited.bandwidth_server = true;
+    limited.max_connections = 1;
     let provider_cancel = {
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
@@ -370,7 +387,28 @@ async fn provider_leaving_unregisters_the_proxy_and_server_side_limits_apply() {
         vec![visitor("v", "stcp", "", "limited", "k")],
     );
     let port = visitor_port(&mut v).await;
-    assert!(tcp_roundtrip(port, b"through the server-side limiter").await);
+    let mut first = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    first
+        .write_all(b"through the server-side limiter")
+        .await
+        .unwrap();
+    let mut received = vec![0u8; b"through the server-side limiter".len()];
+    timeout(T, first.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, b"through the server-side limiter");
+    assert!(!tcp_roundtrip(port, b"at the connection cap").await);
+    drop(first);
+    let mut released = false;
+    for _ in 0..50 {
+        if tcp_roundtrip(port, b"connection permit released").await {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(released);
     // 提供方断开后，Edge 摘掉登记：访问者得到「找不到代理」。
     provider_cancel.cancel();
     for _ in 0..50 {

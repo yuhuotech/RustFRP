@@ -26,6 +26,8 @@ pub struct Config {
     pub reserved_ports: Vec<(u16, u16)>,
     /// 单个客户端最多的隧道数；0 = 不限。
     pub max_tunnels_per_client: i64,
+    /// 单客户端共享并发流 / UDP 活跃源地址上限；0 = 不限。
+    pub max_connections_per_client: usize,
     /// 对外可访问的主机名（安装命令里使用）。
     pub public_host: String,
     /// 面板对外访问地址（含协议），用于生成安装脚本命令；空则不生成。
@@ -40,6 +42,10 @@ pub struct Config {
     pub vhost_http: Option<u16>,
     /// HTTPS（SNI 透传）虚拟主机端口。
     pub vhost_https: Option<u16>,
+    /// TCPMUX HTTP CONNECT 共享端口。
+    pub tcpmux_http_connect_port: Option<u16>,
+    /// Whether to forward CONNECT requests unchanged to the selected Client.
+    pub tcpmux_passthrough: bool,
     /// 子域名后缀（`*.tunnel.example.com` 的 `tunnel.example.com`）。
     pub subdomain_host: String,
     /// 审计保留天数；0 保留全部。
@@ -68,6 +74,7 @@ impl Default for Config {
             allow_ports: Vec::new(),
             reserved_ports: Vec::new(),
             max_tunnels_per_client: 0,
+            max_connections_per_client: 0,
             public_host: "127.0.0.1".into(),
             public_url: String::new(),
             panel_dir: None,
@@ -75,6 +82,8 @@ impl Default for Config {
             session_ttl_ms: 8 * 3600 * 1000,
             vhost_http: None,
             vhost_https: None,
+            tcpmux_http_connect_port: None,
+            tcpmux_passthrough: false,
             subdomain_host: String::new(),
             audit_retention_days: 90,
             traffic_retention_days: 7,
@@ -174,12 +183,31 @@ impl Config {
         for (key, slot) in [
             ("RUSTFRP_VHOST_HTTP", &mut c.vhost_http),
             ("RUSTFRP_VHOST_HTTPS", &mut c.vhost_https),
+            (
+                "RUSTFRP_TCPMUX_HTTP_CONNECT_PORT",
+                &mut c.tcpmux_http_connect_port,
+            ),
         ] {
             if let Some(v) = get(key).filter(|v| !v.is_empty()) {
                 *slot = Some(
                     v.parse::<u16>()
                         .map_err(|_| format!("invalid {key} \"{v}\""))?,
                 );
+            }
+        }
+        if let Some(v) = get("RUSTFRP_TCPMUX_PASSTHROUGH") {
+            c.tcpmux_passthrough = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => return Err("invalid RUSTFRP_TCPMUX_PASSTHROUGH".into()),
+            };
+        }
+        if let Some(v) = get("RUSTFRP_MAX_CONNECTIONS_PER_CLIENT") {
+            c.max_connections_per_client = v
+                .parse::<usize>()
+                .map_err(|_| "invalid RUSTFRP_MAX_CONNECTIONS_PER_CLIENT".to_string())?;
+            if c.max_connections_per_client > 1_000_000 {
+                return Err("RUSTFRP_MAX_CONNECTIONS_PER_CLIENT must be 0..1000000".into());
             }
         }
         if let Some(v) = get("RUSTFRP_SUBDOMAIN_HOST") {
@@ -258,6 +286,7 @@ impl Config {
             Some(self.edge_port()),
             self.vhost_http,
             self.vhost_https,
+            self.tcpmux_http_connect_port,
             self.http_addr
                 .rsplit(':')
                 .next()
@@ -336,11 +365,13 @@ mod tests {
             ("RUSTFRP_METRICS_TOKEN", "has space in it xxxxxxxxx"),
             ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "-1"),
             ("RUSTFRP_MAX_TUNNELS_PER_CLIENT", "10001"),
+            ("RUSTFRP_MAX_CONNECTIONS_PER_CLIENT", "1000001"),
             ("RUSTFRP_RESERVED_PORTS", "x"),
             ("RUSTFRP_CLEANUP_BATCH", "1001"),
             ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "bad"),
             ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "-1"),
             ("RUSTFRP_TRAFFIC_RETENTION_DAYS", "3651"),
+            ("RUSTFRP_TCPMUX_PASSTHROUGH", "maybe"),
         ] {
             assert!(cfg(&[(key, value)]).is_err());
         }
@@ -398,6 +429,9 @@ mod tests {
             ("RUSTFRP_SESSION_HOURS", "2"),
             ("RUSTFRP_VHOST_HTTP", "8080"),
             ("RUSTFRP_VHOST_HTTPS", "8443"),
+            ("RUSTFRP_TCPMUX_HTTP_CONNECT_PORT", "7443"),
+            ("RUSTFRP_TCPMUX_PASSTHROUGH", "true"),
+            ("RUSTFRP_MAX_CONNECTIONS_PER_CLIENT", "1500"),
             ("RUSTFRP_SUBDOMAIN_HOST", ".Tunnel.Example.com."),
         ])
         .unwrap();
@@ -411,6 +445,9 @@ mod tests {
             ("0.0.0.0:9000", 7100, "10.0.0.1")
         );
         assert_eq!(c.node_addr, "0.0.0.0:7200");
+        assert_eq!(c.tcpmux_http_connect_port, Some(7443));
+        assert!(c.tcpmux_passthrough);
+        assert_eq!(c.max_connections_per_client, 1500);
         assert!(!c.builtin_edge);
         assert_eq!(c.metrics_token, "0123456789abcdef0123");
         assert_eq!(c.allow_ports, vec![(6000, 6100), (7000, 7000)]);

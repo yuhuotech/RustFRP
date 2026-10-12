@@ -75,6 +75,42 @@ class Rig {
 }
 
 void main() {
+  test('standalone configuration saves only after Agent verify and atomically replaces', () async {
+    final dir = await Directory.systemTemp.createTemp('rustfrp-config-edit-');
+    addTearDown(() => dir.delete(recursive: true));
+    final binary = '${dir.path}/agent';
+    final configFile = '${dir.path}/frpc.yaml';
+    await File(binary).writeAsString('binary');
+    await File(configFile).writeAsString('old configuration');
+    final config = LocalAgentConfig(
+      binary: binary,
+      configFile: configFile,
+      stateDir: '${dir.path}/state',
+    );
+    final verified = <String>[];
+    final backend = IoLocalBackend(
+      defaults: config,
+      runCommand: (executable, arguments) async {
+        if (executable == '/bin/chmod') return ProcessResult(1, 0, '', '');
+        final stage = arguments.last;
+        verified.add(stage);
+        expect(stage.endsWith('.yaml'), isTrue);
+        final content = await File(stage).readAsString();
+        return ProcessResult(1, content.contains('bad =') ? 1 : 0, '', 'parse error');
+      },
+    );
+    await backend.saveConfig(config, 'serverAddr: example.test\n');
+    expect(await File(configFile).readAsString(), 'serverAddr: example.test\n');
+    expect(verified, hasLength(1));
+    expect(await File(verified.single).exists(), isFalse);
+    await expectLater(
+      backend.saveConfig(config, 'bad = [\n'),
+      throwsA(isA<FormatException>()),
+    );
+    expect(await File(configFile).readAsString(), 'serverAddr: example.test\n');
+    expect(verified, hasLength(2));
+  });
+
   test(
     'macOS token-free bootstrap, escaped arguments, permissions and cleanup',
     () async {
@@ -172,6 +208,37 @@ void main() {
       }
     },
   );
+  test('standalone config editor verifies before atomically replacing the file', () async {
+    final dir = await Directory.systemTemp.createTemp('rustfrp-config-edit-');
+    addTearDown(() => dir.delete(recursive: true));
+    final binary = '${dir.path}/agent';
+    final configFile = '${dir.path}/frpc.yaml';
+    await File(binary).writeAsString('agent');
+    await File(configFile).writeAsString('old config');
+    final config = LocalAgentConfig(binary: binary, configFile: configFile, stateDir: dir.path);
+    var exitCode = 0;
+    var verifyCount = 0;
+    final backend = IoLocalBackend(
+      defaults: config,
+      runCommand: (executable, arguments) async {
+        if (executable == '/bin/chmod') return ProcessResult(1, 0, '', '');
+        verifyCount++;
+        expect(arguments, containsAll(['--mode', 'client', 'verify', '-c']));
+        expect(await File(arguments.last).readAsString(), contains('serverAddr:'));
+        return ProcessResult(1, exitCode, '', 'invalid config');
+      },
+    );
+    await backend.saveConfig(config, 'serverAddr: edge.example.test\n');
+    expect(await backend.readConfig(config), 'serverAddr: edge.example.test\n');
+    expect(verifyCount, 1);
+    exitCode = 1;
+    await expectLater(
+      backend.saveConfig(config, 'serverAddr: edge.example.test\nbad = [\n'),
+      throwsA(isA<FormatException>()),
+    );
+    expect(await backend.readConfig(config), 'serverAddr: edge.example.test\n');
+    expect(verifyCount, 2);
+  });
   test(
     'first enrollment completes before token-free macOS daemon starts',
     () async {

@@ -79,6 +79,13 @@ pub enum Admission {
     Standalone,
     /// 受管模式。
     Managed(Managed),
+    /// 当前 Controller 已将设备指派给另一 Edge。
+    Redirect(rustfrp_core::wire::EdgeRedirect),
+}
+
+enum ActiveAdmission {
+    Standalone,
+    Managed(Managed),
 }
 
 /// 登录策略。
@@ -121,6 +128,8 @@ pub struct EdgeConfig {
     pub allow_ports: Vec<(u16, u16)>,
     /// 单客户端最大端口数，0 = 不限制。
     pub max_ports_per_client: usize,
+    /// 单客户端全部代理共享的并发工作流 / UDP 活跃源地址上限；0 = 不限。
+    pub max_connections_per_client: usize,
     /// 等待客户端登录等握手步骤的超时。
     pub handshake_timeout: Duration,
     /// 控制流上多久收不到消息就判定客户端失联。
@@ -133,6 +142,14 @@ pub struct EdgeConfig {
     pub vhost_http_port: Option<u16>,
     /// HTTPS（SNI 透传）虚拟主机端口。
     pub vhost_https_port: Option<u16>,
+    /// TCPMUX HTTP CONNECT 共享端口。
+    pub tcpmux_http_connect_port: Option<u16>,
+    /// 独立 frps dashboard 监听地址 / 端口；0 表示关闭。
+    pub dashboard_addr: String,
+    pub dashboard_port: u16,
+    pub dashboard_user: String,
+    pub dashboard_password: String,
+    pub dashboard_assets_dir: String,
     /// 子域名后缀（frp 的 `subDomainHost`）。
     pub sub_domain_host: String,
     /// 等待请求头的超时。
@@ -154,12 +171,19 @@ impl Default for EdgeConfig {
             token: String::new(),
             allow_ports: Vec::new(),
             max_ports_per_client: 0,
+            max_connections_per_client: 0,
             handshake_timeout: Duration::from_secs(10),
             heartbeat_timeout: Duration::from_secs(90),
             user_conn_timeout: Duration::from_secs(10),
             mux: MuxConfig::default(),
             vhost_http_port: None,
             vhost_https_port: None,
+            tcpmux_http_connect_port: None,
+            dashboard_addr: "127.0.0.1".into(),
+            dashboard_port: 0,
+            dashboard_user: String::new(),
+            dashboard_password: String::new(),
+            dashboard_assets_dir: String::new(),
             sub_domain_host: String::new(),
             vhost_head_timeout: Duration::from_secs(10),
             udp_max_peers: 1024,
@@ -179,11 +203,117 @@ impl EdgeConfig {
     }
 }
 
+/// 对单设备或单隧道并发连接数进行有界计数。
+pub struct ConnectionLimit {
+    limit: AtomicUsize,
+    active: AtomicUsize,
+}
+
+impl ConnectionLimit {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(limit),
+            active: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Relaxed);
+    }
+
+    fn state(&self) -> (usize, usize) {
+        (self.active.load(Relaxed), self.limit.load(Relaxed))
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<LimitPermit> {
+        loop {
+            let active = self.active.load(Relaxed);
+            let limit = self.limit.load(Relaxed);
+            if (limit > 0 && active >= limit) || active == usize::MAX {
+                return None;
+            }
+            let next = active.checked_add(1)?;
+            if self
+                .active
+                .compare_exchange_weak(active, next, Relaxed, Relaxed)
+                .is_ok()
+            {
+                return Some(LimitPermit(self.clone()));
+            }
+        }
+    }
+}
+
+struct LimitPermit(Arc<ConnectionLimit>);
+
+impl Drop for LimitPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Relaxed);
+    }
+}
+
+/// 两层连接预算：整个设备共享一份，每个隧道再单独设限。
+#[derive(Clone)]
+pub struct ConnectionLimits {
+    client: Arc<ConnectionLimit>,
+    tunnel: Arc<ConnectionLimit>,
+}
+
+impl ConnectionLimits {
+    pub(crate) fn new(client: Arc<ConnectionLimit>, tunnel: usize) -> Self {
+        Self {
+            client,
+            tunnel: ConnectionLimit::new(tunnel),
+        }
+    }
+
+    pub(crate) fn unlimited() -> Self {
+        Self::new(ConnectionLimit::new(0), 0)
+    }
+
+    pub fn acquire(&self) -> Option<ConnectionLease> {
+        self.acquire_detailed().ok()
+    }
+
+    pub(crate) fn acquire_detailed(&self) -> Result<ConnectionLease, String> {
+        let client = self.client.acquire().ok_or_else(|| {
+            let (active, limit) = self.client.state();
+            format!("client {active}/{limit}")
+        })?;
+        let tunnel = self.tunnel.acquire().ok_or_else(|| {
+            let (active, limit) = self.tunnel.state();
+            format!("tunnel {active}/{limit}")
+        })?;
+        Ok(ConnectionLease {
+            _client: Some(client),
+            _tunnel: Some(tunnel),
+        })
+    }
+}
+
+/// 在整个转发生命周期内持有的连接预算。
+pub struct ConnectionLease {
+    _client: Option<LimitPermit>,
+    _tunnel: Option<LimitPermit>,
+}
+
+impl ConnectionLease {
+    pub fn unlimited() -> Self {
+        Self {
+            _client: None,
+            _tunnel: None,
+        }
+    }
+}
+
 /// 已绑定、待运行的边缘节点。
 pub struct Edge {
     listener: TcpListener,
     http_listener: Option<TcpListener>,
     https_listener: Option<TcpListener>,
+    tcpmux_listener: Option<TcpListener>,
+    dashboard_listener: Option<TcpListener>,
+    dashboard_acceptor: Option<TlsAcceptor>,
     acceptor: TlsAcceptor,
     cfg: Arc<EdgeConfig>,
     policy: Arc<dyn Policy>,
@@ -192,6 +322,7 @@ pub struct Edge {
     metrics: Arc<crate::metrics::Metrics>,
     retain_metrics: bool,
     fingerprint: String,
+    tcpmux_passthrough: bool,
 }
 
 impl Edge {
@@ -209,10 +340,37 @@ impl Edge {
         Ok(edge)
     }
 
+    /// 独立 frps 模式下启用 dashboard；Dashboard 证书可与数据面证书不同。
+    pub async fn bind_with_dashboard_token(
+        cfg: EdgeConfig,
+        identity: Option<Identity>,
+        dashboard_identity: Option<Identity>,
+        log: Logger,
+    ) -> Result<Edge, TunnelError> {
+        let policy = Arc::new(TokenPolicy {
+            token: cfg.token.clone(),
+        });
+        let mut edge =
+            Self::bind_with_dashboard(cfg, identity, dashboard_identity, policy, log).await?;
+        edge.retain_metrics = false;
+        Ok(edge)
+    }
+
     /// 绑定监听端口并使用自定义登录策略。
     pub async fn bind_with_policy(
         cfg: EdgeConfig,
         identity: Option<Identity>,
+        policy: Arc<dyn Policy>,
+        log: Logger,
+    ) -> Result<Edge, TunnelError> {
+        Self::bind_with_dashboard(cfg, identity, None, policy, log).await
+    }
+
+    /// 绑定 Edge，并可选启用带 TLS 的独立 frps dashboard。
+    pub async fn bind_with_dashboard(
+        cfg: EdgeConfig,
+        identity: Option<Identity>,
+        dashboard_identity: Option<Identity>,
         policy: Arc<dyn Policy>,
         log: Logger,
     ) -> Result<Edge, TunnelError> {
@@ -238,11 +396,29 @@ impl Edge {
         };
         let http_listener = vhost(cfg.vhost_http_port).await?;
         let https_listener = vhost(cfg.vhost_https_port).await?;
+        let tcpmux_listener = vhost(cfg.tcpmux_http_connect_port).await?;
+        let dashboard_listener = if cfg.dashboard_port == 0 {
+            None
+        } else {
+            let addr = if cfg.dashboard_addr.is_empty() {
+                "127.0.0.1"
+            } else {
+                cfg.dashboard_addr.as_str()
+            };
+            Some(TcpListener::bind((addr, cfg.dashboard_port)).await?)
+        };
+        let dashboard_acceptor = dashboard_identity
+            .map(tls::app_server_config)
+            .transpose()?
+            .map(TlsAcceptor::from);
         let metrics = Arc::new(crate::metrics::Metrics::default());
         Ok(Edge {
             listener,
             http_listener,
             https_listener,
+            tcpmux_listener,
+            dashboard_listener,
+            dashboard_acceptor,
             acceptor,
             cfg: Arc::new(cfg),
             policy,
@@ -251,7 +427,14 @@ impl Edge {
             metrics,
             retain_metrics: true,
             fingerprint,
+            tcpmux_passthrough: false,
         })
+    }
+
+    /// Configure whether CONNECT requests are forwarded unchanged to the selected Client.
+    pub fn with_tcpmux_passthrough(mut self, enabled: bool) -> Self {
+        self.tcpmux_passthrough = enabled;
+        self
     }
 
     /// 是否保留已停止代理的计数条目直到被确认回收（受管 Controller 采样用）；节点本身不采样时应关闭。
@@ -294,6 +477,13 @@ impl Edge {
             .and_then(|l| l.local_addr().ok())
     }
 
+    /// TCPMUX HTTP CONNECT 共享端口的实际监听地址。
+    pub fn tcpmux_addr(&self) -> Option<SocketAddr> {
+        self.tcpmux_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+    }
+
     /// 运行直到 `shutdown` 被取消。
     pub async fn serve(self, shutdown: CancellationToken) {
         let names = self.metrics.clone();
@@ -318,6 +508,32 @@ impl Edge {
                 ));
             }
         }
+        if let Some(listener) = self.tcpmux_listener {
+            tokio::spawn(crate::proxy_rt::serve_tcpmux(
+                listener,
+                routes.clone(),
+                vopts.clone(),
+                self.tcpmux_passthrough,
+                self.log.clone(),
+                shutdown.clone(),
+            ));
+        }
+        if let Some(listener) = self.dashboard_listener {
+            tokio::spawn(crate::dashboard::serve(
+                listener,
+                self.dashboard_acceptor.clone(),
+                crate::dashboard::Dashboard {
+                    addr: self.cfg.dashboard_addr.clone(),
+                    port: self.cfg.dashboard_port,
+                    user: self.cfg.dashboard_user.clone(),
+                    password: self.cfg.dashboard_password.clone(),
+                    assets_dir: self.cfg.dashboard_assets_dir.clone(),
+                    metrics: self.metrics.clone(),
+                },
+                self.log.clone(),
+                shutdown.clone(),
+            ));
+        }
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -336,6 +552,7 @@ impl Edge {
                         peer_ip: peer.ip().to_string(),
                         traffic: self.traffic.clone(),
                         limiter: None,
+                        client_limit: ConnectionLimit::new(self.cfg.max_connections_per_client),
                         log: self.log.clone(),
                         cancel: shutdown.child_token(),
                     };
@@ -366,6 +583,7 @@ struct ClientCtx {
     traffic: Arc<pipe::Traffic>,
     /// 服务端限速（`bandwidthLimitMode = "server"`）；`None` = 不限。
     limiter: Option<Arc<pipe::Limiter>>,
+    client_limit: Arc<ConnectionLimit>,
     log: Logger,
     cancel: CancellationToken,
 }
@@ -425,6 +643,7 @@ async fn control_loop(
         run_id: String::new(),
         client_id: String::new(),
         managed: false,
+        redirect: None,
     };
     let admission = match admission {
         Ok(a) => a,
@@ -436,6 +655,7 @@ async fn control_loop(
     let run_id = random_id();
     let (client_id, managed) = match &admission {
         Admission::Standalone => (String::new(), false),
+        Admission::Redirect(_) => (String::new(), false),
         Admission::Managed(m) => (
             if m.just_enrolled {
                 m.client_id.clone()
@@ -445,6 +665,11 @@ async fn control_loop(
             true,
         ),
     };
+    let redirect = match &admission {
+        Admission::Redirect(target) => Some(target.clone()),
+        Admission::Managed(m) => m.config.borrow().redirect.clone(),
+        Admission::Standalone => None,
+    };
     write_frame(
         &mut wr,
         &ServerMsg::LoginResp {
@@ -453,9 +678,15 @@ async fn control_loop(
             run_id: run_id.clone(),
             client_id,
             managed,
+            redirect: redirect.clone(),
         },
     )
     .await?;
+    let active = match admission {
+        Admission::Redirect(_) => return Ok(()),
+        Admission::Standalone => ActiveAdmission::Standalone,
+        Admission::Managed(managed) => ActiveAdmission::Managed(managed),
+    };
     ctx.log.info(&format!(
         "client [{}] login success, run id [{run_id}]",
         login.client_id
@@ -468,9 +699,9 @@ async fn control_loop(
         ..ctx.clone()
     };
     tokio::spawn(serve_visitor_streams(inbound, ctx.clone()));
-    match admission {
-        Admission::Standalone => serve_standalone(session, reader, &mut wr, ctx).await,
-        Admission::Managed(m) => serve_managed(session, reader, &mut wr, ctx, m).await,
+    match active {
+        ActiveAdmission::Standalone => serve_standalone(session, reader, &mut wr, ctx).await,
+        ActiveAdmission::Managed(m) => serve_managed(session, reader, &mut wr, ctx, m).await,
     }
 }
 
@@ -608,6 +839,11 @@ async fn serve_managed(
         // 先应用并下发当前配置，之后每次变更都重新对账。
         let mut current = config.borrow_and_update().clone();
         loop {
+            ctx.client_limit.set_limit(if current.max_connections > 0 {
+                current.max_connections
+            } else {
+                ctx.cfg.max_connections_per_client
+            });
             reconcile(session, &current, &mut running, ctx, &emit).await;
             write_frame(wr, &ServerMsg::Config((*current).clone())).await?;
             loop {
@@ -718,6 +954,10 @@ async fn reconcile(
 struct ProxyDef {
     name: String,
     kind: String,
+    max_connections: usize,
+    multiplexer: String,
+    use_encryption: bool,
+    use_compression: bool,
     remote_port: u16,
     custom_domains: Vec<String>,
     subdomain: String,
@@ -734,6 +974,10 @@ impl From<&ProxySpec> for ProxyDef {
         Self {
             name: p.name.clone(),
             kind: p.kind.clone(),
+            max_connections: p.max_connections,
+            multiplexer: p.multiplexer.clone(),
+            use_encryption: p.use_encryption,
+            use_compression: p.use_compression,
             remote_port: p.remote_port,
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
@@ -752,6 +996,10 @@ impl From<&ManagedProxy> for ProxyDef {
         Self {
             name: p.name.clone(),
             kind: p.kind.clone(),
+            max_connections: p.max_connections,
+            multiplexer: p.multiplexer.clone(),
+            use_encryption: p.use_encryption,
+            use_compression: p.use_compression,
             remote_port: p.remote_port,
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
@@ -768,6 +1016,10 @@ impl From<&ManagedProxy> for ProxyDef {
 /// 两份受管定义在「监听 / 路由」层面是否等价（只有本地目标变了则无需重启监听）。
 fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
     a.kind == b.kind
+        && a.max_connections == b.max_connections
+        && a.multiplexer == b.multiplexer
+        && a.use_encryption == b.use_encryption
+        && a.use_compression == b.use_compression
         && a.remote_port == b.remote_port
         && a.custom_domains == b.custom_domains
         && a.subdomain == b.subdomain
@@ -783,8 +1035,16 @@ fn same_listener(a: &ManagedProxy, b: &ManagedProxy) -> bool {
 
 /// 启动一个代理（tcp / udp / http / https）。成功返回（对外端口, 停止令牌），失败返回给客户端看的原因。
 async fn activate(session: &Session, def: &ProxyDef, ctx: &ClientCtx) -> Result<Started, String> {
-    if !["tcp", "udp", "http", "https", "stcp", "sudp"].contains(&def.kind.as_str()) {
+    if !["tcp", "udp", "http", "https", "tcpmux", "stcp", "sudp"].contains(&def.kind.as_str()) {
         return Err(format!("proxy type [{}] is not supported yet", def.kind));
+    }
+    if def.kind == "tcpmux"
+        && (def.multiplexer != "httpconnect" || ctx.cfg.tcpmux_http_connect_port.is_none())
+    {
+        return Err("tcpmux requires multiplexer=httpconnect and tcpmuxHTTPConnectPort".into());
+    }
+    if def.kind == "tcpmux" && (!def.lb.group.is_empty() || def.lb.health.is_some()) {
+        return Err("tcpmux does not support load-balancer groups or health checks".into());
     }
     if !ctx.names.claim(&def.name) {
         return Err(format!(
@@ -792,6 +1052,7 @@ async fn activate(session: &Session, def: &ProxyDef, ctx: &ClientCtx) -> Result<
             def.name
         ));
     }
+    ctx.names.set_kind(&def.name, &def.kind);
     let stop = ctx.cancel.child_token();
     // 启用健康检查的代理在第一次探测成功前不接收访问者。
     let up = Arc::new(AtomicBool::new(def.lb.health.is_none()));
@@ -845,6 +1106,7 @@ async fn launch(
         },
         ..ctx.clone()
     };
+    let conn_limits = ConnectionLimits::new(ctx.client_limit.clone(), def.max_connections);
     match def.kind.as_str() {
         "tcp" => {
             let member = Member {
@@ -854,6 +1116,9 @@ async fn launch(
                 traffic: sub.traffic.clone(),
                 limiter: sub.limiter.clone(),
                 up: up.clone(),
+                limits: conn_limits.clone(),
+                use_encryption: def.use_encryption,
+                use_compression: def.use_compression,
             };
             if !def.lb.group.is_empty() {
                 return ctx
@@ -889,6 +1154,9 @@ async fn launch(
                     owner: ctx.user.clone(),
                     traffic: sub.traffic.clone(),
                     limiter: sub.limiter.clone(),
+                    limits: conn_limits.clone(),
+                    use_encryption: def.use_encryption,
+                    use_compression: def.use_compression,
                 },
             );
             let (secrets, name, stop) = (ctx.secrets.clone(), def.name.clone(), stop.clone());
@@ -908,6 +1176,7 @@ async fn launch(
                 open_timeout: ctx.cfg.user_conn_timeout,
                 traffic: sub.traffic.clone(),
                 visitor: None,
+                limits: conn_limits,
             };
             tokio::spawn(udp_proxy(
                 sock,
@@ -921,7 +1190,10 @@ async fn launch(
         }
         kind => {
             let https = kind == "https";
-            let (enabled, label) = if https {
+            let tcpmux = kind == "tcpmux";
+            let (enabled, label) = if tcpmux {
+                (ctx.cfg.tcpmux_http_connect_port.is_some(), "tcpmux")
+            } else if https {
                 (ctx.cfg.vhost_https_port.is_some(), "https")
             } else {
                 (ctx.cfg.vhost_http_port.is_some(), "http")
@@ -960,14 +1232,23 @@ async fn launch(
                 group: def.lb.group.clone(),
                 group_key: def.lb.group_key.clone(),
                 up: up.clone(),
+                limits: Some(conn_limits.clone()),
+                use_encryption: def.use_encryption,
+                use_compression: def.use_compression,
             };
-            let route_id = ctx.routes.add(https, &hosts, &route)?;
+            let route_id = if tcpmux {
+                ctx.routes.add_tcpmux(&hosts, &route)?
+            } else {
+                ctx.routes.add(https, &hosts, &route)?
+            };
             let (routes, stop) = (ctx.routes.clone(), stop.clone());
             tokio::spawn(async move {
                 stop.cancelled().await;
                 routes.remove(route_id);
             });
-            Ok(if https {
+            Ok(if tcpmux {
+                ctx.cfg.tcpmux_http_connect_port
+            } else if https {
                 ctx.cfg.vhost_https_port
             } else {
                 ctx.cfg.vhost_http_port
@@ -1039,6 +1320,9 @@ struct Member {
     session: Session,
     traffic: Arc<pipe::Traffic>,
     limiter: Option<Arc<pipe::Limiter>>,
+    limits: ConnectionLimits,
+    use_encryption: bool,
+    use_compression: bool,
     /// 健康（可接收访问者）。
     up: Arc<AtomicBool>,
 }
@@ -1194,7 +1478,15 @@ async fn forward(
     cfg: &EdgeConfig,
 ) -> Result<(), TunnelError> {
     let _ = visitor.set_nodelay(true);
+    let Some(_lease) = m.limits.acquire() else {
+        return Ok(());
+    };
     let mut stream = within(cfg.user_conn_timeout, "open work stream", m.session.open()).await?;
+    let encryption_key = if m.use_encryption {
+        rustfrp_core::transform::random_key_hex().map_err(TunnelError::Wire)?
+    } else {
+        String::new()
+    };
     write_frame(
         &mut stream,
         &StartWork {
@@ -1204,9 +1496,20 @@ async fn forward(
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
+            use_encryption: m.use_encryption,
+            use_compression: m.use_compression,
+            encryption_key: encryption_key.clone(),
         },
     )
     .await?;
+    let mut stream = rustfrp_core::transform::wrap(
+        Box::new(stream),
+        m.use_encryption,
+        m.use_compression,
+        &encryption_key,
+        true,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
     match &m.limiter {
         Some(l) => {
             let mut v = pipe::Limited::new(visitor, l.clone());
@@ -1231,6 +1534,9 @@ struct SecretProxy {
     owner: String,
     traffic: Arc<pipe::Traffic>,
     limiter: Option<Arc<pipe::Limiter>>,
+    limits: ConnectionLimits,
+    use_encryption: bool,
+    use_compression: bool,
 }
 
 /// Edge 上全部 stcp / sudp 代理（按完整名索引）。
@@ -1297,6 +1603,7 @@ async fn visitor_conn(mut stream: Stream, ctx: &ClientCtx) -> Result<(), TunnelE
     let refuse = |why: &str| VisitorResp {
         ok: false,
         error: why.to_string(),
+        ..VisitorResp::default()
     };
     let Some(target) = ctx.secrets.get(&hello.server_name) else {
         write_frame(
@@ -1327,29 +1634,65 @@ async fn visitor_conn(mut stream: Stream, ctx: &ClientCtx) -> Result<(), TunnelE
         .await?;
         return Ok(());
     }
+    let Some(_lease) = target.limits.acquire() else {
+        write_frame(&mut stream, &refuse("connection limit reached")).await?;
+        return Ok(());
+    };
+    let visitor_key = if hello.use_encryption {
+        rustfrp_core::transform::random_key_hex().map_err(TunnelError::Wire)?
+    } else {
+        String::new()
+    };
     let mut work = within(
         ctx.cfg.user_conn_timeout,
         "open work stream",
         target.session.open(),
     )
     .await?;
+    let encryption_key = if target.use_encryption {
+        rustfrp_core::transform::random_key_hex().map_err(TunnelError::Wire)?
+    } else {
+        String::new()
+    };
     write_frame(
         &mut work,
         &StartWork {
             proxy: hello.server_name.clone(),
             src: format!("visitor:{}", ctx.user),
             dst: String::new(),
+            use_encryption: target.use_encryption,
+            use_compression: target.use_compression,
+            encryption_key: encryption_key.clone(),
         },
     )
     .await?;
+    let mut work = rustfrp_core::transform::wrap(
+        Box::new(work),
+        target.use_encryption,
+        target.use_compression,
+        &encryption_key,
+        true,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
     write_frame(
         &mut stream,
         &VisitorResp {
             ok: true,
             error: String::new(),
+            use_encryption: hello.use_encryption,
+            use_compression: hello.use_compression,
+            encryption_key: visitor_key.clone(),
         },
     )
     .await?;
+    let mut stream = rustfrp_core::transform::wrap(
+        Box::new(stream),
+        hello.use_encryption,
+        hello.use_compression,
+        &visitor_key,
+        false,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
     match &target.limiter {
         Some(l) => {
             let mut v = pipe::Limited::new(stream, l.clone());
@@ -1422,5 +1765,35 @@ mod tests {
         assert!(!same_listener(&s1, &s2));
         s2.bandwidth_bps = 1;
         assert!(same_listener(&s1, &s2));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn managed_listener_identity_includes_mux_limits_and_stream_transforms() {
+        let original = ManagedProxy {
+            name: "stream".into(),
+            kind: "tcp".into(),
+            ..Default::default()
+        };
+
+        let mut changed = original.clone();
+        changed.max_connections = 4;
+        assert!(!same_listener(&original, &changed));
+
+        let mut changed = original.clone();
+        changed.multiplexer = "httpconnect".into();
+        assert!(!same_listener(&original, &changed));
+
+        let mut changed = original.clone();
+        changed.use_encryption = true;
+        assert!(!same_listener(&original, &changed));
+
+        let mut changed = original.clone();
+        changed.use_compression = true;
+        assert!(!same_listener(&original, &changed));
     }
 }

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rustfrp_app/core/models.dart';
 import 'package:rustfrp_app/features/tunnels/tunnels_view.dart';
@@ -197,10 +198,16 @@ void main() {
     await tester.tap(find.byKey(Key('client-row-${c['id']}')));
     await settle(tester);
     await tapKey(tester, 'client-config-import');
+    await tapKey(tester, 'config-import-preview');
+    expect(find.text('请填写不超过 1 MiB 的 frpc 配置文本。'), findsOneWidget);
     await tester.enterText(
       find.byKey(const Key('config-import-text')),
       '[[proxies]]\nname="ssh"\ntype="tcp"',
     );
+    s.failNext = true;
+    await tapKey(tester, 'config-import-preview');
+    await settle(tester, 10);
+    expect(find.text('internal error'), findsOneWidget);
     await tapKey(tester, 'config-import-preview');
     await settle(tester, 10);
     expect(find.text('将应用 1 条隧道'), findsOneWidget);
@@ -221,6 +228,55 @@ void main() {
     expect(s.configImports.single['digest'], 'preview-digest');
     expect(s.configImports.single['accept_warnings'], true);
     expect(s.configImports.single['reason'], '按批准的配置迁移');
+  });
+
+  testWidgets('client config can be exported and copied', (tester) async {
+    final s = FakeServer();
+    final client = s.addClient('export-box');
+    await Harness.create(tester, s);
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await openClients(tester);
+    await tester.tap(find.byKey(Key('client-row-${client['id']}')));
+    await settle(tester);
+
+    await tapKey(tester, 'client-config-export');
+    await settle(tester, 10);
+    expect(find.byKey(const Key('config-export-text')), findsOneWidget);
+    expect(find.textContaining('name = "ssh"'), findsOneWidget);
+    await tapText(tester, '复制');
+    expect(copied, contains('name = "ssh"'));
+    expect(find.text('配置已复制'), findsOneWidget);
+    await tapText(tester, '关闭');
+    expect(find.byKey(const Key('config-export-text')), findsNothing);
+  });
+
+  testWidgets('migration reports when there is no alternate node', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final client = s.addClient('single-node');
+    await Harness.create(tester, s);
+    await openClients(tester);
+    await tester.tap(find.byKey(Key('client-row-${client['id']}')));
+    await settle(tester);
+    await tapKey(tester, 'client-migrate-node');
+    await settle(tester, 10);
+    expect(find.text('没有可迁移的目标节点'), findsOneWidget);
   });
 
   testWidgets('tunnels page: list, filter, toggle, edit, delete', (
@@ -375,13 +431,36 @@ void main() {
         .select(c['id']! as String);
     await openClients(tester);
     await tapKey(tester, 'client-new-tunnel');
-    await tester.enterText(find.byKey(const Key('tunnel-name')), 'rdp');
-    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '3389');
+    await tapKey(tester, 'tunnel-kind');
+    await tester.tap(find.text('TCPMUX（CONNECT 按域名分流）').last);
+    await settle(tester);
+    await tester.enterText(find.byKey(const Key('tunnel-name')), 'ssh-connect');
+    await tester.enterText(find.byKey(const Key('tunnel-local-port')), '22');
+    await tester.ensureVisible(find.byKey(const Key('tunnel-domains')));
+    await tester.enterText(
+      find.byKey(const Key('tunnel-domains')),
+      'ssh.example.test',
+    );
+    await tester.enterText(
+      find.byKey(const Key('tunnel-max-connections')),
+      '12',
+    );
+    await tester.ensureVisible(find.byKey(const Key('tunnel-use-encryption')));
+    await tester.tap(find.byKey(const Key('tunnel-use-encryption')));
+    await tester.tap(find.byKey(const Key('tunnel-use-compression')));
     await settle(tester);
     await tapKey(tester, 'tunnel-save');
     await settle(tester, 10);
     expect(s.tunnels.single['client_id'], c['id']);
-    expect(find.text('rdp'), findsOneWidget);
+    expect(s.tunnels.single['kind'], 'tcpmux');
+    expect(s.tunnels.single['multiplexer'], 'httpconnect');
+    expect(s.tunnels.single['max_connections'], 12);
+    expect(s.tunnels.single['use_encryption'], true);
+    expect(s.tunnels.single['use_compression'], true);
+    expect(
+      find.textContaining('CONNECT ssh.example.test:7443'),
+      findsOneWidget,
+    );
   });
 
   testWidgets(
@@ -620,6 +699,7 @@ void main() {
       publicHost: 'h.com',
       vhostHttpPort: 80,
       vhostHttpsPort: 8443,
+      tcpmuxHttpConnectPort: 7443,
       subdomainHost: 't.com',
     );
     Tunnel t(Map<String, Object?> j) => Tunnel.fromJson({'id': 'x', ...j});
@@ -632,6 +712,16 @@ void main() {
       ':6000',
     );
     expect(publicAddress(t({'kind': 'udp'}), node), '自动分配');
+    expect(
+      publicAddress(
+        t({
+          'kind': 'tcpmux',
+          'custom_domains': ['ssh.example.test'],
+        }),
+        node,
+      ),
+      'CONNECT ssh.example.test:7443',
+    );
     expect(
       publicAddress(
         t({
@@ -813,4 +903,124 @@ void clientTagAndRestartTests() {
     await settle(tester);
     expect(find.byTooltip('重启 agent'), findsNothing);
   });
+
+  testWidgets('client limit, edge migration and signed Agent update controls', (
+    tester,
+  ) async {
+    final s = FakeServer();
+    final client = s.addClient('nas', isOnline: true, maxConnections: 32);
+    final edge = s.addNode('edge-west', host: 'west.example.test');
+    await Harness.create(tester, s);
+    await openClients(tester);
+    await tester.tap(find.byKey(Key('client-row-${client['id']}')));
+    await settle(tester);
+
+    await tapKey(tester, 'client-connection-limit');
+    expect(
+      tester.widget<TextField>(find.byType(TextField).last).controller!.text,
+      '32',
+    );
+    await tester.enterText(
+      find.byKey(const Key('client-max-connections')),
+      'bad',
+    );
+    await tester.tap(find.widgetWithText(LButton, '保存'));
+    await settle(tester, 10);
+    expect(find.text('连接上限须为 0 到 1000000 的整数'), findsOneWidget);
+    await tapKey(tester, 'client-connection-limit');
+    await tester.enterText(
+      find.byKey(const Key('client-max-connections')),
+      '1000001',
+    );
+    await tester.tap(find.widgetWithText(LButton, '保存'));
+    await settle(tester, 10);
+    expect(find.text('连接上限须为 0 到 1000000 的整数'), findsOneWidget);
+    await tapKey(tester, 'client-connection-limit');
+    await tester.enterText(
+      find.byKey(const Key('client-max-connections')),
+      '128',
+    );
+    await tester.tap(find.widgetWithText(LButton, '保存'));
+    await settle(tester, 10);
+    expect(client['max_connections'], 128);
+
+    await tapKey(tester, 'client-connection-limit');
+    await tester.enterText(find.byKey(const Key('client-max-connections')), '');
+    await tester.tap(find.widgetWithText(LButton, '保存'));
+    await settle(tester, 10);
+    expect(client['max_connections'], 0);
+    final unchangedCount = s.requests.length;
+    await tapKey(tester, 'client-connection-limit');
+    await tapText(tester, '取消');
+    expect(s.requests.length, unchangedCount);
+
+    await tapKey(tester, 'client-migrate-node');
+    await settle(tester);
+    await tester.tap(find.byKey(Key('move-node-${edge['id']}')));
+    await settle(tester);
+    await fillReason(tester, '就近接入');
+    await tester.tap(find.widgetWithText(LButton, '迁移').last);
+    await settle(tester, 10);
+    expect(s.migrations.single['node_id'], edge['id']);
+
+    await tapKey(tester, 'client-update-agent');
+    await tester.enterText(
+      find.byKey(const Key('agent-update-version')),
+      'v1.2.3',
+    );
+    await tester.tap(find.widgetWithText(LButton, '下一步'));
+    await settle(tester);
+    await fillReason(tester, '安全更新');
+    await tester.tap(find.widgetWithText(LButton, '下发更新'));
+    await settle(tester, 10);
+    expect(s.agentUpdates.single['version'], 'v1.2.3');
+  });
+
+  testWidgets(
+    'narrow client detail exposes the limit, migration and update actions',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final s = FakeServer();
+      final client = s.addClient('mobile-narrow', isOnline: true);
+      final edge = s.addNode('edge-narrow', host: 'narrow.example.test');
+      await Harness.create(tester, s);
+      await openClients(tester);
+      await tester.tap(find.byKey(Key('client-row-${client['id']}')));
+      await settle(tester);
+
+      await tapKey(tester, 'client-connection-limit');
+      await tester.enterText(
+        find.byKey(const Key('client-max-connections')),
+        '16',
+      );
+      await tester.tap(find.widgetWithText(LButton, '保存'));
+      await settle(tester, 10);
+      expect(client['max_connections'], 16);
+
+      await tapKey(tester, 'client-migrate-node');
+      await settle(tester);
+      await tester.tap(find.byKey(Key('move-node-${edge['id']}')));
+      await settle(tester);
+      await fillReason(tester, '移动端就近接入');
+      await tester.tap(find.widgetWithText(LButton, '迁移').last);
+      await settle(tester, 10);
+      expect(s.migrations.single['node_id'], edge['id']);
+
+      await tapKey(tester, 'client-update-agent');
+      await tester.enterText(
+        find.byKey(const Key('agent-update-version')),
+        'v1.2.4',
+      );
+      await tester.tap(find.widgetWithText(LButton, '下一步'));
+      await settle(tester);
+      await fillReason(tester, '移动端更新');
+      await tester.tap(find.widgetWithText(LButton, '下发更新'));
+      await settle(tester, 10);
+      expect(s.agentUpdates.single['version'], 'v1.2.4');
+    },
+  );
 }

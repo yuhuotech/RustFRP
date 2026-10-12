@@ -91,6 +91,7 @@ struct Rig {
     events: mpsc::Receiver<ProxyEvent>,
     online: Arc<AtomicUsize>,
     http: std::net::SocketAddr,
+    fingerprint: String,
 }
 
 async fn rig() -> Rig {
@@ -119,6 +120,7 @@ async fn rig() -> Rig {
     .unwrap();
     let port = edge.local_addr().unwrap().port();
     let http = edge.http_addr().unwrap();
+    let fingerprint = edge.certificate_fingerprint().to_string();
     let stop = CancellationToken::new();
     tokio::spawn(edge.serve(stop.clone()));
     Rig {
@@ -128,6 +130,7 @@ async fn rig() -> Rig {
         cfg,
         events,
         online,
+        fingerprint,
     }
 }
 
@@ -380,6 +383,98 @@ async fn bad_enroll_token_unknown_device_and_forged_signature_are_rejected() {
     let (_rx, _c, task) = spawn_client(cfg);
     let err = timeout(T, task).await.unwrap().unwrap().unwrap_err();
     assert!(err.to_string().contains("unknown device"));
+    rig.stop.cancel();
+}
+
+#[tokio::test]
+async fn managed_client_follows_a_controller_migration_to_the_pinned_edge() {
+    let target = rig().await;
+    let source = rig().await;
+    let key = Arc::new(DeviceKey::generate().unwrap());
+
+    // Register the same device key at the assigned Edge before simulating migration.
+    let (mut target_rx, target_cancel, target_task) =
+        spawn_client(managed_client(target.port, key.clone(), None, Some("good")));
+    until(&mut target_rx, |event| {
+        matches!(event, Event::Enrolled { .. })
+    })
+    .await;
+    target_cancel.cancel();
+    target_task.await.unwrap().unwrap();
+
+    let (mut rx, cancel, task) = spawn_client(managed_client(source.port, key, None, Some("good")));
+    until(&mut rx, |event| matches!(event, Event::Enrolled { .. })).await;
+    let assigned = rustfrp_core::wire::EdgeRedirect {
+        address: "127.0.0.1".into(),
+        port: target.port,
+        tls_fingerprint: target.fingerprint.clone(),
+    };
+    source.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 1,
+        redirect: Some(assigned.clone()),
+        ..Default::default()
+    }));
+    assert_eq!(
+        until(&mut rx, |event| matches!(event, Event::Redirected(_))).await,
+        Event::Redirected(assigned)
+    );
+    until(&mut rx, |event| matches!(event, Event::Connected)).await;
+    assert_eq!(target.online.load(Ordering::SeqCst), 1);
+
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    source.stop.cancel();
+    target.stop.cancel();
+}
+
+#[tokio::test]
+async fn managed_update_sequence_is_monotonic_and_failed_or_same_version_updates_stay_online() {
+    let rig = rig().await;
+    let key = Arc::new(DeviceKey::generate().unwrap());
+    let (mut rx, cancel, task) = spawn_client(managed_client(rig.port, key, None, Some("good")));
+    until(&mut rx, |event| matches!(event, Event::Enrolled { .. })).await;
+    until(&mut rx, |event| {
+        matches!(event, Event::ConfigApplied { revision: 0, .. })
+    })
+    .await;
+
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 1,
+        update_seq: 0,
+        update_version: "v9.9.9".into(),
+        ..Default::default()
+    }));
+    until(&mut rx, |event| {
+        matches!(event, Event::ConfigApplied { revision: 1, .. })
+    })
+    .await;
+
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 2,
+        update_seq: 1,
+        update_version: "invalid-tag".into(),
+        ..Default::default()
+    }));
+    until(&mut rx, |event| {
+        matches!(event, Event::ConfigApplied { revision: 2, .. })
+    })
+    .await;
+
+    let current = option_env!("RUSTFRP_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    rig.cfg.send_replace(Arc::new(ConfigSet {
+        revision: 3,
+        update_seq: 2,
+        update_version: format!("v{current}"),
+        ..Default::default()
+    }));
+    until(&mut rx, |event| {
+        matches!(event, Event::ConfigApplied { revision: 3, .. })
+    })
+    .await;
+    assert_eq!(rig.online.load(Ordering::SeqCst), 1);
+
+    cancel.cancel();
+    task.await.unwrap().unwrap();
     rig.stop.cancel();
 }
 

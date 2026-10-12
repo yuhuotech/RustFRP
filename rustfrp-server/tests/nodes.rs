@@ -162,6 +162,8 @@ async fn start_node(
     let run = NodeRun {
         edge: edge_cfg(),
         identity: None,
+        dashboard_identity: None,
+        tcpmux_passthrough: false,
         link: link(key, node_port, node_id, token),
         store,
         events,

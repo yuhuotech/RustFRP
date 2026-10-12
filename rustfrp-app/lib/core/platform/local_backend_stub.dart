@@ -14,6 +14,12 @@ class UnsupportedLocalBackend implements LocalAgentBackend {
   Future<String> exportDiagnostics(LocalAgentConfig config) async =>
       throw UnsupportedError('本机模式仅支持桌面端');
   @override
+  Future<String> readConfig(LocalAgentConfig config) async =>
+      throw UnsupportedError('本机配置编辑仅支持桌面端');
+  @override
+  Future<void> saveConfig(LocalAgentConfig config, String text) async =>
+      throw UnsupportedError('本机配置编辑仅支持桌面端');
+  @override
   Future<List<Map<String, dynamic>>> tunnels(LocalAgentConfig config) async =>
       throw UnsupportedError('本机模式仅支持桌面端');
   @override

@@ -56,7 +56,7 @@ fn load(text: &str) -> Result<frpcfg::LoadedClient, StoreError> {
     Ok(loaded)
 }
 fn supported(p: &Proxy) -> bool {
-    ["tcp", "udp", "http", "https"].contains(&p.kind.as_str())
+    ["tcp", "udp", "http", "https", "tcpmux"].contains(&p.kind.as_str())
         && p.plugin.as_ref().is_none_or(plugin_supported)
 }
 fn plugin_supported(p: &rustfrp_core::frpcfg::Plugin) -> bool {
@@ -100,6 +100,10 @@ fn spec(p: &Proxy, client: &str, enabled: bool) -> store::NewTunnel {
         proxy_protocol: proxy_protocol(p),
         bandwidth_bps: bandwidth(p),
         bandwidth_server: p.transport.bandwidth_limit_mode == "server",
+        max_connections: usize::try_from(p.max_connections).unwrap_or(0),
+        multiplexer: p.multiplexer.clone(),
+        use_encryption: p.transport.use_encryption,
+        use_compression: p.transport.use_compression,
         lb: rustfrp_agent::plan::lb_opts(p),
         plugin: plugin_opts(p),
     }
@@ -192,6 +196,10 @@ fn apply(
                     proxy_protocol: Some(proxy_protocol(&p)),
                     bandwidth_bps: Some(bandwidth(&p)),
                     bandwidth_server: Some(p.transport.bandwidth_limit_mode == "server"),
+                    max_connections: usize::try_from(p.max_connections).ok(),
+                    multiplexer: Some(p.multiplexer.clone()),
+                    use_encryption: Some(p.transport.use_encryption),
+                    use_compression: Some(p.transport.use_compression),
                     lb_group: Some(lb.group.clone()),
                     lb_group_key: Some(lb.group_key.clone()),
                     health_check: Some(lb.health.clone().unwrap_or_default()),
@@ -214,14 +222,37 @@ fn apply(
     }
     Ok(changes)
 }
-fn policy(cfg: &Config, loaded: &frpcfg::LoadedClient) -> Result<(), StoreError> {
+fn policy(
+    c: &Connection,
+    cfg: &Config,
+    client: &str,
+    loaded: &frpcfg::LoadedClient,
+) -> Result<(), StoreError> {
+    let device = store::get_client(c, client)?;
+    let (vhost_http, vhost_https, tcpmux_port, subdomain_host) = if device.node_id.is_empty() {
+        (
+            cfg.vhost_http,
+            cfg.vhost_https,
+            cfg.tcpmux_http_connect_port,
+            cfg.subdomain_host.clone(),
+        )
+    } else {
+        let node = store::get_node(c, &device.node_id)?;
+        (
+            node.vhost_http,
+            node.vhost_https,
+            node.tcpmux_http_connect_port,
+            node.subdomain_host,
+        )
+    };
     for p in &loaded.source.proxies {
         if !supported(p) {
             continue;
         }
-        if (p.kind == "http" && cfg.vhost_http.is_none())
-            || (p.kind == "https" && cfg.vhost_https.is_none())
-            || (!p.subdomain.is_empty() && cfg.subdomain_host.is_empty())
+        if (p.kind == "http" && vhost_http.is_none())
+            || (p.kind == "https" && vhost_https.is_none())
+            || (p.kind == "tcpmux" && tcpmux_port.is_none())
+            || (!p.subdomain.is_empty() && subdomain_host.is_empty())
         {
             return Err(invalid("server vhost port or subdomain suffix is disabled"));
         }
@@ -251,8 +282,6 @@ fn warnings(loaded: &frpcfg::LoadedClient) -> Vec<String> {
             ));
         }
         for (on, field) in [
-            (p.transport.use_encryption, "encryption"),
-            (p.transport.use_compression, "compression"),
             (
                 p.kind == "udp" && !p.transport.bandwidth_limit.is_empty(),
                 "bandwidthLimit on udp",
@@ -321,7 +350,7 @@ pub fn preview(
     text: &str,
 ) -> Result<Preview, StoreError> {
     let loaded = load(text)?;
-    policy(cfg, &loaded)?;
+    policy(c, cfg, client, &loaded)?;
     let tx = c.transaction()?;
     let changes = apply(&tx, client, &loaded, store::now_ms())?;
     store::enforce_tunnel_quota(&tx, client, cfg.max_tunnels_per_client)?;
@@ -342,7 +371,7 @@ pub fn import(
 ) -> Result<usize, StoreError> {
     let (actor, reason, ip) = audit;
     let loaded = load(text)?;
-    policy(cfg, &loaded)?;
+    policy(c, cfg, client, &loaded)?;
     let now = store::now_ms();
     let tx = c.transaction()?;
     let changes = apply(&tx, client, &loaded, now)?;
@@ -440,6 +469,10 @@ pub fn export(c: &Connection, cfg: &Config, client: &str) -> Result<String, Stor
                 2 => "v2".into(),
                 _ => String::new(),
             };
+            p.max_connections = i64::try_from(t.max_connections).unwrap_or(0);
+            p.multiplexer = t.multiplexer;
+            p.transport.use_encryption = t.use_encryption;
+            p.transport.use_compression = t.use_compression;
             let plugin = store::tunnel_plugin_opts(c, &t.id)?;
             if let Some(plugin) = plugin {
                 p.plugin = Some(rustfrp_core::frpcfg::Plugin {
@@ -634,9 +667,8 @@ mod tests {
             ] {
                 assert!(!all.contains(ok), "{ok}: {all}");
             }
-            for pending in ["encryption", "compression"] {
-                assert!(all.contains(pending), "{pending}: {all}");
-            }
+            assert!(!all.contains("encryption"), "{all}");
+            assert!(!all.contains("compression"), "{all}");
             for kind in ["tcp", "udp", "https"] {
                 let mut c = c();
                 let cfg = Config {
@@ -646,6 +678,53 @@ mod tests {
                 let text=format!("serverAddr='x'\n[[proxies]]\nname='p'\ntype='{kind}'\nlocalPort=80\nremotePort=6000\ncustomDomains=['a.example.com']");
                 let _ = preview(&mut c, &cfg, "c", &text);
             }
+            let visitors = load(
+                "serverAddr='x'\n[[visitors]]\nname='private-ssh'\ntype='stcp'\nserverName='ssh'\nsecretKey='secret'\nbindAddr='127.0.0.1'\nbindPort=6100\n",
+            )
+            .unwrap();
+            assert!(warnings(&visitors)
+                .join("\n")
+                .contains("visitor [private-ssh] preserved"));
+        }
+        #[test]
+        fn encryption_compression_and_connection_limits_roundtrip() {
+            let mut c = c();
+            let cfg = Config {
+                allow_ports: vec![(1, 65535)],
+                ..Default::default()
+            };
+            let text = "serverAddr='x'\n[[proxies]]\nname='secure'\ntype='tcp'\nlocalPort=22\nremotePort=6000\nmaxConnections=17\ntransport.useEncryption=true\ntransport.useCompression=true\n";
+            import(&mut c, &cfg, "c", text, ("a", "r", "")).unwrap();
+            let tunnel = store::list_tunnels(&c, Some("c")).unwrap().remove(0);
+            assert_eq!(tunnel.max_connections, 17);
+            assert!(tunnel.use_encryption && tunnel.use_compression);
+            let exported = export(&c, &cfg, "c").unwrap();
+            assert!(exported.contains("maxConnections = 17"), "{exported}");
+            assert!(exported.contains("useEncryption = true"), "{exported}");
+            assert!(exported.contains("useCompression = true"), "{exported}");
+        }
+        #[test]
+        fn tcpmux_import_uses_the_selected_node_shared_listener() {
+            let mut c = c();
+            let cfg = Config {
+                tcpmux_http_connect_port: Some(7443),
+                ..Default::default()
+            };
+            let text = "serverAddr='x'\n[[proxies]]\nname='connect'\ntype='tcpmux'\nlocalPort=22\ncustomDomains=['ssh.example.test']\nmultiplexer='httpconnect'\n";
+            let preview = preview(&mut c, &cfg, "c", text).unwrap();
+            assert_eq!(preview.changes.len(), 1);
+            assert!(
+                !preview.warnings.join("\n").contains("tcpmux"),
+                "{:?}",
+                preview.warnings
+            );
+            import(&mut c, &cfg, "c", text, ("a", "r", "")).unwrap();
+            let tunnel = store::list_tunnels(&c, Some("c")).unwrap().remove(0);
+            assert_eq!(
+                (tunnel.kind.as_str(), tunnel.multiplexer.as_str()),
+                ("tcpmux", "httpconnect")
+            );
+            assert!(export(&c, &cfg, "c").unwrap().contains("type = \"tcpmux\""));
         }
         #[test]
         fn http_options_roundtrip_through_import_and_export() {
@@ -812,6 +891,20 @@ mod tests {
                 store::list_tunnels(&c, Some("c")).unwrap()[0].proxy_protocol,
                 0
             );
+            let v1 = text
+                .replace("name='t'", "name='t-v1'")
+                .replace("remotePort=6000", "remotePort=6001")
+                .replace("'v2'", "'v1'");
+            import(&mut c, &cfg, "c", &v1, ("a", "r", "")).unwrap();
+            let v1_tunnel = store::list_tunnels(&c, Some("c"))
+                .unwrap()
+                .into_iter()
+                .find(|t| t.name == "t-v1")
+                .unwrap();
+            assert_eq!(v1_tunnel.proxy_protocol, 1);
+            assert!(export(&c, &cfg, "c")
+                .unwrap()
+                .contains("proxyProtocolVersion = \"v1\""));
             // udp：frp 不支持，导入时提示。
             let udp = "serverAddr='x'\n[[proxies]]\nname='u'\ntype='udp'\nlocalPort=53\nremotePort=5353\ntransport.proxyProtocolVersion='v1'\n";
             assert!(preview(&mut c, &cfg, "c", udp)
@@ -930,6 +1023,75 @@ mod tests {
                     .join("")
             );
             assert!(load(&many).is_err());
+        }
+
+        #[test]
+        fn imports_validate_external_node_vhost_capabilities() {
+            fn preview_with_node(
+                info: rustfrp_core::node::NodeInfo,
+                proxy: &str,
+            ) -> Result<Preview, StoreError> {
+                let mut c = c();
+                store::create_node(
+                    &c,
+                    "edge",
+                    "edge",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &info,
+                    1,
+                )
+                .unwrap();
+                store::set_client_node(&c, "c", "edge").unwrap();
+                preview(
+                    &mut c,
+                    &Config::default(),
+                    "c",
+                    &format!("serverAddr='x'\n{proxy}"),
+                )
+            }
+
+            let full = rustfrp_core::node::NodeInfo {
+                vhost_http: Some(80),
+                vhost_https: Some(443),
+                tcpmux_http_connect_port: Some(7443),
+                subdomain_host: "node.example.test".into(),
+                ..Default::default()
+            };
+            let all_kinds = "[[proxies]]\nname='web'\ntype='http'\nlocalPort=80\ncustomDomains=['web.example.test']\n[[proxies]]\nname='secure'\ntype='https'\nlocalPort=443\ncustomDomains=['secure.example.test']\n[[proxies]]\nname='mux'\ntype='tcpmux'\nlocalPort=22\nmultiplexer='httpconnect'\ncustomDomains=['mux.example.test']\n[[proxies]]\nname='sub'\ntype='http'\nlocalPort=80\nsubdomain='api'\n";
+            assert!(preview_with_node(full.clone(), all_kinds).is_ok());
+
+            for (info, proxy) in [
+                (
+                    rustfrp_core::node::NodeInfo {
+                        vhost_http: None,
+                        ..full.clone()
+                    },
+                    "[[proxies]]\nname='web'\ntype='http'\nlocalPort=80\ncustomDomains=['web.example.test']\n",
+                ),
+                (
+                    rustfrp_core::node::NodeInfo {
+                        vhost_https: None,
+                        ..full.clone()
+                    },
+                    "[[proxies]]\nname='secure'\ntype='https'\nlocalPort=443\ncustomDomains=['secure.example.test']\n",
+                ),
+                (
+                    rustfrp_core::node::NodeInfo {
+                        tcpmux_http_connect_port: None,
+                        ..full.clone()
+                    },
+                    "[[proxies]]\nname='mux'\ntype='tcpmux'\nlocalPort=22\nmultiplexer='httpconnect'\ncustomDomains=['mux.example.test']\n",
+                ),
+                (
+                    rustfrp_core::node::NodeInfo {
+                        subdomain_host: String::new(),
+                        ..full.clone()
+                    },
+                    "[[proxies]]\nname='sub'\ntype='http'\nlocalPort=80\nsubdomain='api'\n",
+                ),
+            ] {
+                assert!(preview_with_node(info, proxy).is_err());
+            }
         }
     }
 }

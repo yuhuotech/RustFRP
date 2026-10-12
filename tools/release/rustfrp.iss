@@ -13,6 +13,9 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 WizardStyle=modern
+CloseApplications=yes
+CloseApplicationsFilter=rustfrp_app.exe
+RestartApplications=no
 UninstallDisplayIcon={app}\rustfrp_app.exe
 
 [Files]
@@ -23,4 +26,4 @@ Name: "{group}\RustFRP"; Filename: "{app}\rustfrp_app.exe"
 Name: "{autodesktop}\RustFRP"; Filename: "{app}\rustfrp_app.exe"
 
 [Run]
-Filename: "{app}\rustfrp_app.exe"; Description: "Launch RustFRP"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\rustfrp_app.exe"; Description: "Launch RustFRP"; Flags: postinstall nowait

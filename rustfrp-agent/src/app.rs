@@ -15,7 +15,10 @@ use crate::log::{Level, Logger};
 use crate::{client, local_control, managed, plan};
 
 /// 程序版本。
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = match option_env!("RUSTFRP_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 fn print_report(report: &CompatReport, out: &mut dyn Write) {
     for (sev, tag) in [
@@ -165,7 +168,17 @@ async fn admin_command(
         AdminAction::Status => "/api/status",
         AdminAction::Stop => "/api/stop",
     };
-    match crate::admin::request(&addr, path, &web.user, &web.password).await {
+    let request = if let Some(tls) = &web.tls {
+        match admin_tls_connector(tls, fs) {
+            Ok(connector) => {
+                crate::admin::request_tls(&addr, path, &web.user, &web.password, connector).await
+            }
+            Err(e) => return fail(err, &addr, e),
+        }
+    } else {
+        crate::admin::request(&addr, path, &web.user, &web.password).await
+    };
+    match request {
         Ok((200, body)) => {
             let _ = match action {
                 AdminAction::Reload => writeln!(out, "reload success"),
@@ -177,6 +190,55 @@ async fn admin_command(
         Ok((code, body)) => fail(err, &addr, format!("{path}: HTTP {code} {}", body.trim())),
         Err(e) => fail(err, &addr, e),
     }
+}
+
+fn admin_tls_acceptor(
+    web: &rustfrp_core::frpcfg::WebServerConfig,
+    fs: &dyn ConfigFs,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, String> {
+    let Some(tls) = &web.tls else { return Ok(None) };
+    let cert = fs
+        .read_to_string(&tls.cert_file)
+        .map_err(|e| format!("read webServer.tls.certFile {}: {e}", tls.cert_file))?;
+    let key = fs
+        .read_to_string(&tls.key_file)
+        .map_err(|e| format!("read webServer.tls.keyFile {}: {e}", tls.key_file))?;
+    let identity = rustfrp_core::tls::identity_from_pem(cert.as_bytes(), key.as_bytes())
+        .map_err(|e| format!("webServer.tls identity: {e}"))?;
+    let config = rustfrp_core::tls::app_server_config(identity).map_err(|e| e.to_string())?;
+    Ok(Some(tokio_rustls::TlsAcceptor::from(config)))
+}
+
+fn admin_tls_connector(
+    tls: &rustfrp_core::frpcfg::TlsConfig,
+    fs: &dyn ConfigFs,
+) -> Result<tokio_rustls::TlsConnector, String> {
+    let trusted = if tls.trusted_ca_file.is_empty() {
+        None
+    } else {
+        let pem = fs.read_to_string(&tls.trusted_ca_file).map_err(|e| {
+            format!(
+                "read webServer.tls.trustedCaFile {}: {e}",
+                tls.trusted_ca_file
+            )
+        })?;
+        Some(rustfrp_core::tls::certs_from_pem(pem.as_bytes()).map_err(|e| e.to_string())?)
+    };
+    let pin = if trusted.is_some() {
+        None
+    } else {
+        let pem = fs
+            .read_to_string(&tls.cert_file)
+            .map_err(|e| format!("read webServer.tls.certFile {}: {e}", tls.cert_file))?;
+        let certs = rustfrp_core::tls::certs_from_pem(pem.as_bytes()).map_err(|e| e.to_string())?;
+        let cert = certs
+            .first()
+            .ok_or("webServer.tls.certFile has no certificate")?;
+        Some(rustfrp_core::tls::certificate_fingerprint(cert))
+    };
+    let config = rustfrp_core::tls::app_client_config_pinned(trusted, pin.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(tokio_rustls::TlsConnector::from(config))
 }
 
 fn verify(
@@ -281,8 +343,15 @@ async fn run(
             };
             let log = logger(&plan.log_to, &plan.log_level, err);
             log_notes(&log, &plan.notes);
-            let edge = match Edge::bind(plan.cfg, plan.identity, log.clone()).await {
-                Ok(e) => e,
+            let edge = match Edge::bind_with_dashboard_token(
+                plan.cfg,
+                plan.identity,
+                plan.dashboard_identity,
+                log.clone(),
+            )
+            .await
+            {
+                Ok(e) => e.with_tcpmux_passthrough(plan.tcpmux_passthrough),
                 Err(e) => return fail(err, &o.config, e),
             };
             let addr = edge
@@ -337,6 +406,7 @@ async fn run_standalone_client(
             .await
             .map_err(|e| e.to_string());
     }
+    let admin_acceptor = admin_tls_acceptor(web, fs)?;
     let status: admin::StatusTable = Arc::default();
     let fill = |cfg: &client::ClientConfig| {
         *status
@@ -385,12 +455,18 @@ async fn run_standalone_client(
     let admin = Arc::new(Admin {
         user: web.user.clone(),
         password: web.password.clone(),
+        assets_dir: (!web.assets_dir.is_empty()).then(|| std::path::PathBuf::from(&web.assets_dir)),
         status: status.clone(),
         config_text: config_text.clone(),
         reload: reload_tx,
         stop: cancel.clone(),
     });
-    let server = tokio::spawn(admin::serve(listener, admin, cancel.clone()));
+    let server = tokio::spawn(admin::serve(
+        listener,
+        admin,
+        admin_acceptor,
+        cancel.clone(),
+    ));
     let traffic = cfg.traffic.clone();
     let task = client::run_with_reload(cfg, log.clone(), Some(etx), cancel.clone(), Some(cfg_rx));
     tokio::pin!(task);
@@ -493,44 +569,20 @@ async fn run_managed(
         Some((_, _, logs, _)) => log.with_ring(logs.clone()),
         None => log,
     };
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
     let key = id.key.clone();
-    let persist = async {
-        let mut persistence_error = None;
-        let mut restart = false;
-        while let Some(ev) = rx.recv().await {
-            if let Some((s, _, _, _)) = &status {
-                local_control::apply(s, &ev);
-            }
-            match ev {
-                client::Event::Enrolled { client_id } => {
-                    match managed::save(fs, &dir, &key, Some(&client_id)) {
-                        Ok(()) => log.info(&format!("enrolled as device [{client_id}]")),
-                        Err(e) => {
-                            cancel.cancel();
-                            persistence_error = Some(e);
-                            break;
-                        }
-                    }
-                }
-                client::Event::ConfigApplied { revision, proxies } => log.info(&format!(
-                    "applied config revision {revision} ({proxies} tunnels)"
-                )),
-                client::Event::RestartRequested => {
-                    if env.get("RUSTFRP_SUPERVISED").as_deref() == Some("1") {
-                        log.warn("restart requested by the controller; exiting so the service manager restarts the agent");
-                        restart = true;
-                        cancel.cancel();
-                        break;
-                    }
-                    log.warn("restart requested by the controller, but the agent is not running as a service; ignoring");
-                }
-                client::Event::Disconnected(r) => log.warn(&format!("disconnected: {r}")),
-                _ => {}
-            }
-        }
-        (persistence_error, restart)
-    };
+    let persist = persist_managed_events(
+        rx,
+        ManagedPersistContext {
+            fs,
+            dir: &dir,
+            key,
+            env,
+            log: log.clone(),
+            cancel: cancel.clone(),
+            status,
+        },
+    );
     let run = client::run(cfg, log.clone(), Some(tx), cancel.clone());
     let (result, (persistence_error, restart)) = tokio::join!(run, persist);
     if let Some(e) = persistence_error {
@@ -542,6 +594,89 @@ async fn run_managed(
         Ok(()) => 0,
         Err(e) => fail(err, "managed", e),
     }
+}
+
+type LocalManagedStatus = (
+    local_control::SharedStatus,
+    Arc<rustfrp_core::pipe::Traffic>,
+    Arc<crate::log_ring::LogRing>,
+    crate::local_control::TunnelList,
+);
+
+struct ManagedPersistContext<'a> {
+    fs: &'a dyn ConfigFs,
+    dir: &'a str,
+    key: Arc<rustfrp_core::identity::DeviceKey>,
+    env: &'a dyn Env,
+    log: Logger,
+    cancel: CancellationToken,
+    status: Option<LocalManagedStatus>,
+}
+
+async fn persist_managed_events(
+    mut rx: tokio::sync::mpsc::Receiver<client::Event>,
+    context: ManagedPersistContext<'_>,
+) -> (Option<String>, bool) {
+    let ManagedPersistContext {
+        fs,
+        dir,
+        key,
+        env,
+        log,
+        cancel,
+        status,
+    } = context;
+    let mut persistence_error = None;
+    let mut restart = false;
+    while let Some(ev) = rx.recv().await {
+        if let Some((s, _, _, _)) = &status {
+            local_control::apply(s, &ev);
+        }
+        match ev {
+            client::Event::Enrolled { client_id } => {
+                match managed::save(fs, dir, &key, Some(&client_id)) {
+                    Ok(()) => log.info(&format!("enrolled as device [{client_id}]")),
+                    Err(error) => {
+                        cancel.cancel();
+                        persistence_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            client::Event::ConfigApplied { revision, proxies } => log.info(&format!(
+                "applied config revision {revision} ({proxies} tunnels)"
+            )),
+            client::Event::RestartRequested => {
+                if env.get("RUSTFRP_SUPERVISED").as_deref() == Some("1") {
+                    log.warn("restart requested by the controller; exiting so the service manager restarts the agent");
+                    restart = true;
+                    cancel.cancel();
+                    break;
+                }
+                log.warn("restart requested by the controller, but the agent is not running as a service; ignoring");
+            }
+            client::Event::AgentUpdated => {
+                log.info("signed Agent update installed; exiting to start the new version");
+                restart = true;
+                cancel.cancel();
+                break;
+            }
+            client::Event::Redirected(target) => {
+                if let Err(error) = managed::save_redirect(fs, dir, &target) {
+                    cancel.cancel();
+                    persistence_error = Some(error);
+                    break;
+                }
+                log.info(&format!(
+                    "saved migrated edge {}:{}",
+                    target.address, target.port
+                ));
+            }
+            client::Event::Disconnected(reason) => log.warn(&format!("disconnected: {reason}")),
+            _ => {}
+        }
+    }
+    (persistence_error, restart)
 }
 
 /// 管理员远程重启时的退出码（EX_TEMPFAIL）：服务管理器据此重新拉起 agent。
@@ -666,10 +801,15 @@ fn prepare_node(
     let id = managed::load_or_create(fs, &dir)?;
     let (host, port) = managed::split_controller_default(&m.controller, 7001)?;
     // 监听参数：frps.toml（可选）；证书缺省时在状态目录里持久化一份自签名证书。
-    let (edge_cfg, cfg_identity, log) = if o.config.is_empty() {
+    let (edge_cfg, cfg_identity, dashboard_identity, tcpmux_passthrough, log) = if o
+        .config
+        .is_empty()
+    {
         (
             crate::edge::EdgeConfig::default(),
             None,
+            None,
+            false,
             Logger::new(Level::Info, Box::new(std::io::stderr())),
         )
     } else {
@@ -687,7 +827,13 @@ fn prepare_node(
         if !plan.cfg.token.is_empty() {
             log.warn("auth.token in the frps config is ignored in managed mode; devices authenticate with their own keys");
         }
-        (plan.cfg, plan.identity, log)
+        (
+            plan.cfg,
+            plan.identity,
+            plan.dashboard_identity,
+            plan.tcpmux_passthrough,
+            log,
+        )
     };
     let identity = match cfg_identity {
         Some(i) => i,
@@ -735,6 +881,8 @@ fn prepare_node(
     let run = crate::node::NodeRun {
         edge: edge_cfg,
         identity: Some(identity),
+        dashboard_identity,
+        tcpmux_passthrough,
         link: crate::node::LinkCtx {
             host,
             port,
@@ -927,6 +1075,69 @@ mod tests {
         assert!(error.contains("standalone tunnel summary exceeds capacity"));
     }
 
+    #[tokio::test]
+    async fn standalone_client_stop_covers_plain_and_admin_webserver_lifecycles() {
+        let fs = MemFs::new();
+        let env = MapEnv::default();
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let options = opts(Mode::Client, "frpc.toml");
+        let no_web = rustfrp_core::frpcfg::WebServerConfig::default();
+        let plain = run_standalone_client(
+            &options,
+            client::ClientConfig::default(),
+            &no_web,
+            (&fs, &env),
+            Logger::silent(),
+            stopped.clone(),
+            None,
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), plain)
+            .await
+            .unwrap()
+            .is_ok());
+
+        let out_of_range = run_standalone_client(
+            &opts(Mode::Client, "frpc.toml"),
+            client::ClientConfig::default(),
+            &rustfrp_core::frpcfg::WebServerConfig {
+                port: i64::from(u16::MAX) + 1,
+                ..Default::default()
+            },
+            (&fs, &env),
+            Logger::silent(),
+            stopped.clone(),
+            None,
+        )
+        .await;
+        assert!(out_of_range
+            .unwrap_err()
+            .contains("webServer.port out of range"));
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let web = rustfrp_core::frpcfg::WebServerConfig {
+            addr: "127.0.0.1".into(),
+            port: i64::from(port),
+            assets_dir: "/unused/dashboard".into(),
+            ..Default::default()
+        };
+        let web_run = run_standalone_client(
+            &options,
+            client::ClientConfig::default(),
+            &web,
+            (&fs, &env),
+            Logger::silent(),
+            stopped,
+            None,
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), web_run)
+            .await
+            .unwrap()
+            .is_ok());
+    }
+
     async fn exec(cmd: Command, fs: &MemFs) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = execute(
@@ -1030,11 +1241,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(plan::client_plan(&loaded, &fs)
-            .unwrap()
-            .notes
-            .iter()
-            .any(|n| n.contains("transport.useEncryption")));
+        let client_plan = plan::client_plan(&loaded, &fs).unwrap();
+        assert!(client_plan.cfg.proxies[0].use_encryption);
+        assert!(client_plan.notes.is_empty(), "{:?}", client_plan.notes);
         let cancel = CancellationToken::new();
         let stopper = {
             let c = cancel.clone();
@@ -1421,6 +1630,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_cli_covers_webserver_actions_errors_and_host_fallback() {
+        let env = MapEnv::default();
+        let options = opts(Mode::Client, "frpc.toml");
+        let missing_port = MemFs::new().with("frpc.toml", "serverAddr='127.0.0.1'\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = admin_command(
+            AdminAction::Status,
+            &options,
+            &missing_port,
+            &env,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("webServer.port is not configured"));
+
+        for (action, path, address, response, expected) in [
+            (
+                AdminAction::Reload,
+                "/api/reload",
+                "0.0.0.0",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "reload success",
+            ),
+            (
+                AdminAction::Status,
+                "/api/status",
+                "127.0.0.1",
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nstatus!",
+                "status!",
+            ),
+            (
+                AdminAction::Stop,
+                "/api/stop",
+                "0.0.0.0",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "stop success",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = response.to_string();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with(&format!("GET {path} ")), "{request}");
+                assert!(request.contains("Authorization: Basic"), "{request}");
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let fs = MemFs::new().with(
+                "frpc.toml",
+                &format!("serverAddr='127.0.0.1'\nwebServer.addr='{address}'\nwebServer.port={port}\nwebServer.user='admin'\nwebServer.password='secret'\n"),
+            );
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = admin_command(action, &options, &fs, &env, &mut out, &mut err).await;
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+            assert!(String::from_utf8(out).unwrap().contains(expected));
+            server.await.unwrap();
+        }
+
+        let tls = MemFs::new().with(
+            "frpc.toml",
+            "serverAddr='127.0.0.1'\nwebServer.addr='127.0.0.1'\nwebServer.port=7000\nwebServer.tls.certFile='missing.pem'\n",
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            admin_command(
+                AdminAction::Status,
+                &options,
+                &tls,
+                &env,
+                &mut out,
+                &mut err,
+            )
+            .await,
+            1
+        );
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("webServer.tls.certFile"));
+    }
+
+    #[tokio::test]
     async fn the_service_command_is_reachable_from_execute() {
         // `--print` 只打印服务定义，不改动系统。
         let args: Vec<String> = [
@@ -1465,7 +1766,7 @@ mod tests {
             exec(Command::Convert(opts(Mode::Client, "legacy.ini")), &fs).await;
         assert_eq!(code, 0);
         assert!(text.contains("bandwidthLimit = \"1MB\""));
-        assert!(report.contains("unsupported"));
+        assert!(!report.contains("unsupported"), "{report}");
         assert!(fs
             .read_to_string("legacy.ini")
             .unwrap()
@@ -1494,5 +1795,258 @@ mod tests {
         .await;
         assert_eq!(code, 1);
         assert!(String::from_utf8(error).unwrap().contains("convert output"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use rustfrp_core::frpcfg::{ConfigFs, MapEnv, MemFs};
+    use rustfrp_core::wire::EdgeRedirect;
+    use std::collections::BTreeMap;
+
+    struct ReadOnlyFs;
+
+    impl ConfigFs for ReadOnlyFs {
+        fn read_to_string(&self, _: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("disk read-only"))
+        }
+
+        fn list_files(&self, _: &str) -> std::io::Result<Vec<String>> {
+            Err(std::io::Error::other("disk read-only"))
+        }
+
+        fn dir_exists(&self, _: &str) -> bool {
+            false
+        }
+
+        fn write_private(&self, _: &str, _: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk read-only"))
+        }
+
+        fn create_dir_all(&self, _: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk read-only"))
+        }
+    }
+
+    async fn process(
+        events: impl IntoIterator<Item = client::Event>,
+        fs: &dyn ConfigFs,
+        env: &dyn Env,
+        cancel: CancellationToken,
+    ) -> (Option<String>, bool) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        persist_managed_events(
+            rx,
+            ManagedPersistContext {
+                fs,
+                dir: "/state",
+                key: Arc::new(rustfrp_core::identity::DeviceKey::generate().unwrap()),
+                env,
+                log: Logger::silent(),
+                cancel,
+                status: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_event_persistence_saves_redirect_and_enrollment_and_handles_restart() {
+        let fs = MemFs::new();
+        let cancel = CancellationToken::new();
+        let target = EdgeRedirect {
+            address: "edge.example.test".into(),
+            port: 7443,
+            tls_fingerprint: "ab".repeat(32),
+        };
+        let events = vec![
+            client::Event::Enrolled {
+                client_id: "device-1".into(),
+            },
+            client::Event::ConfigApplied {
+                revision: 1,
+                proxies: 0,
+            },
+            client::Event::Redirected(target.clone()),
+            client::Event::Disconnected("moved".into()),
+        ];
+        assert_eq!(
+            process(events, &fs, &MapEnv::default(), cancel.clone()).await,
+            (None, false)
+        );
+        assert!(fs
+            .read_to_string("/state/identity.json")
+            .unwrap()
+            .contains("device-1"));
+        assert_eq!(
+            serde_json::from_str::<EdgeRedirect>(
+                &fs.read_to_string("/state/edge-redirect.json").unwrap()
+            )
+            .unwrap(),
+            target
+        );
+
+        let supervised = MapEnv(BTreeMap::from([("RUSTFRP_SUPERVISED".into(), "1".into())]));
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            process(
+                [client::Event::AgentUpdated],
+                &fs,
+                &supervised,
+                cancel.clone()
+            )
+            .await,
+            (None, true)
+        );
+        assert!(cancel.is_cancelled());
+
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            process(
+                [client::Event::RestartRequested],
+                &fs,
+                &supervised,
+                cancel.clone()
+            )
+            .await,
+            (None, true)
+        );
+        assert!(cancel.is_cancelled());
+
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            process(
+                [client::Event::RestartRequested],
+                &fs,
+                &MapEnv::default(),
+                cancel.clone()
+            )
+            .await,
+            (None, false)
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn managed_event_persistence_stops_on_identity_or_redirect_write_errors() {
+        for event in [
+            client::Event::Enrolled {
+                client_id: "device-1".into(),
+            },
+            client::Event::Redirected(EdgeRedirect {
+                address: "edge.example.test".into(),
+                port: 7000,
+                tls_fingerprint: "cd".repeat(32),
+            }),
+        ] {
+            let cancel = CancellationToken::new();
+            let (error, restart) =
+                process([event], &ReadOnlyFs, &MapEnv::default(), cancel.clone()).await;
+            assert!(!restart);
+            assert!(error.unwrap().contains("disk read-only"));
+            assert!(cancel.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn client_webserver_tls_acceptor_and_connector_cover_identity_and_ca_paths() {
+        use rustfrp_core::frpcfg::{TlsConfig, WebServerConfig};
+
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = generated.cert.pem();
+        let key = generated.signing_key.serialize_pem();
+        let fs = MemFs::new()
+            .with("cert.pem", &certificate)
+            .with("key.pem", &key)
+            .with("ca.pem", &certificate);
+
+        assert!(admin_tls_acceptor(&WebServerConfig::default(), &fs)
+            .unwrap()
+            .is_none());
+        let server_tls = TlsConfig {
+            cert_file: "cert.pem".into(),
+            key_file: "key.pem".into(),
+            ..Default::default()
+        };
+        let web_server = WebServerConfig {
+            tls: Some(server_tls.clone()),
+            ..Default::default()
+        };
+        assert!(admin_tls_acceptor(&web_server, &fs).unwrap().is_some());
+        assert!(admin_tls_connector(&server_tls, &fs).is_ok());
+        assert!(admin_tls_connector(
+            &TlsConfig {
+                trusted_ca_file: "ca.pem".into(),
+                ..Default::default()
+            },
+            &fs
+        )
+        .is_ok());
+
+        for tls in [
+            TlsConfig {
+                cert_file: "missing-cert.pem".into(),
+                key_file: "key.pem".into(),
+                ..Default::default()
+            },
+            TlsConfig {
+                cert_file: "cert.pem".into(),
+                key_file: "missing-key.pem".into(),
+                ..Default::default()
+            },
+            TlsConfig {
+                cert_file: "cert.pem".into(),
+                key_file: "other-key.pem".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(admin_tls_acceptor(
+                &WebServerConfig {
+                    tls: Some(tls),
+                    ..Default::default()
+                },
+                &fs
+            )
+            .is_err());
+        }
+        assert!(admin_tls_connector(
+            &TlsConfig {
+                trusted_ca_file: "missing-ca.pem".into(),
+                ..Default::default()
+            },
+            &fs
+        )
+        .is_err());
+        let bad_ca = MemFs::new().with("bad-ca.pem", "not a certificate");
+        assert!(admin_tls_connector(
+            &TlsConfig {
+                trusted_ca_file: "bad-ca.pem".into(),
+                ..Default::default()
+            },
+            &bad_ca
+        )
+        .is_err());
+        assert!(admin_tls_connector(
+            &TlsConfig {
+                cert_file: "missing-cert.pem".into(),
+                ..Default::default()
+            },
+            &fs
+        )
+        .is_err());
+        let no_cert = MemFs::new().with("empty-ca.pem", "");
+        assert!(admin_tls_connector(
+            &TlsConfig {
+                cert_file: "empty-ca.pem".into(),
+                ..Default::default()
+            },
+            &no_cert
+        )
+        .is_err());
     }
 }

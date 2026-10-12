@@ -2,6 +2,7 @@
 //! 以及 `reload` / `status` / `stop` 命令行用的请求端。只提供 JSON / 文本接口，不带网页界面。
 
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use rustfrp_core::http1::ct_eq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Event;
@@ -43,6 +45,8 @@ pub struct Admin {
     pub user: String,
     /// 密码。
     pub password: String,
+    /// 静态仪表盘资源目录；为空时只提供 JSON 管理接口。
+    pub assets_dir: Option<PathBuf>,
     /// 当前代理状态。
     pub status: StatusTable,
     /// 配置文件原文（`/api/config`）。
@@ -128,7 +132,13 @@ fn status_json(table: &StatusTable) -> String {
     format!("{{{}}}", body.join(","))
 }
 
-async fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str, extra: &str) {
+async fn respond<S: tokio::io::AsyncWrite + Unpin>(
+    s: &mut S,
+    status: &str,
+    ctype: &str,
+    body: &str,
+    extra: &str,
+) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",
         body.len()
@@ -138,7 +148,91 @@ async fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str, extra
     let _ = s.shutdown().await;
 }
 
-async fn handle(mut s: TcpStream, admin: Arc<Admin>) {
+async fn respond_bytes<S: tokio::io::AsyncWrite + Unpin>(
+    s: &mut S,
+    status: &str,
+    ctype: &str,
+    body: &[u8],
+    extra: &str,
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{extra}\r\n",
+        body.len()
+    );
+    let _ = s.write_all(head.as_bytes()).await;
+    let _ = s.write_all(body).await;
+    let _ = s.shutdown().await;
+}
+
+fn asset_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn serve_asset<S: tokio::io::AsyncWrite + Unpin>(s: &mut S, root: &Path, request_path: &str) {
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(_) => return respond(s, "404 Not Found", "text/plain", "not found", "").await,
+    };
+    let relative = request_path.strip_prefix('/').unwrap_or(request_path);
+    if Path::new(relative)
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return respond(s, "404 Not Found", "text/plain", "not found", "").await;
+    }
+    let mut candidate = root.join(if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    });
+    let mut canonical = match tokio::fs::canonicalize(&candidate).await {
+        Ok(path) => path,
+        Err(_) => {
+            candidate = root.join("index.html");
+            match tokio::fs::canonicalize(&candidate).await {
+                Ok(path) => path,
+                Err(_) => return respond(s, "404 Not Found", "text/plain", "not found", "").await,
+            }
+        }
+    };
+    if !canonical.starts_with(&root) {
+        return respond(s, "404 Not Found", "text/plain", "not found", "").await;
+    }
+    if let Ok(meta) = tokio::fs::metadata(&canonical).await {
+        if meta.is_dir() {
+            canonical.push("index.html");
+        }
+    }
+    let metadata = match tokio::fs::metadata(&canonical).await {
+        Ok(meta) if meta.is_file() && meta.len() <= 16 * 1024 * 1024 => meta,
+        _ => return respond(s, "404 Not Found", "text/plain", "not found", "").await,
+    };
+    let _ = metadata;
+    match tokio::fs::read(&canonical).await {
+        Ok(bytes) => respond_bytes(s, "200 OK", asset_content_type(&canonical), &bytes, "").await,
+        Err(_) => respond(s, "404 Not Found", "text/plain", "not found", "").await,
+    }
+}
+
+async fn handle(mut s: rustfrp_core::transform::BoxAsyncIo, admin: Arc<Admin>) {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     let head = loop {
@@ -210,6 +304,13 @@ async fn handle(mut s: TcpStream, admin: Arc<Admin>) {
             respond(&mut s, "200 OK", "text/plain", "", "").await;
             admin.stop.cancel();
         }
+        ("GET", _) => {
+            if let Some(root) = admin.assets_dir.as_deref() {
+                serve_asset(&mut s, root, &head.path).await;
+            } else {
+                respond(&mut s, "404 Not Found", "text/plain", "not found", "").await;
+            }
+        }
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found", "").await,
     }
 }
@@ -226,13 +327,29 @@ async fn await_reload(
 }
 
 /// 在 `listener` 上提供管理接口，直到 `cancel`。
-pub async fn serve(listener: TcpListener, admin: Arc<Admin>, cancel: CancellationToken) {
+pub async fn serve(
+    listener: TcpListener,
+    admin: Arc<Admin>,
+    acceptor: Option<TlsAcceptor>,
+    cancel: CancellationToken,
+) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             accepted = listener.accept() => {
                 let Ok((conn, _)) = accepted else { continue };
-                tokio::spawn(handle(conn, admin.clone()));
+                let acceptor = acceptor.clone();
+                let admin = admin.clone();
+                tokio::spawn(async move {
+                    let stream: rustfrp_core::transform::BoxAsyncIo = match acceptor {
+                        Some(acceptor) => match acceptor.accept(conn).await {
+                            Ok(tls) => Box::new(tls),
+                            Err(_) => return,
+                        },
+                        None => Box::new(conn),
+                    };
+                    handle(stream, admin).await;
+                });
             }
         }
     }
@@ -245,10 +362,45 @@ pub async fn request(
     user: &str,
     password: &str,
 ) -> Result<(u16, String), String> {
-    let mut s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
         .map_err(|_| format!("connect {addr}: timeout"))?
         .map_err(|e| format!("connect {addr}: {e}"))?;
+    request_stream(stream, addr, path, user, password).await
+}
+
+/// TLS 加密的命令行管理请求。
+pub async fn request_tls(
+    addr: &str,
+    path: &str,
+    user: &str,
+    password: &str,
+    connector: TlsConnector,
+) -> Result<(u16, String), String> {
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect {addr}: timeout"))?
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let host = addr
+        .rsplit_once(':')
+        .map_or(addr, |(host, _)| host)
+        .trim_matches(['[', ']']);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| "invalid webServer TLS host name".to_string())?;
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("webServer TLS: {e}"))?;
+    request_stream(stream, addr, path, user, password).await
+}
+
+async fn request_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut s: S,
+    addr: &str,
+    path: &str,
+    user: &str,
+    password: &str,
+) -> Result<(u16, String), String> {
     let auth = if user.is_empty() && password.is_empty() {
         String::new()
     } else {
@@ -411,5 +563,187 @@ mod tests {
             await_reload(rx, Duration::from_millis(1)).await,
             Err("reload timed out".into())
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod coverage_tests {
+    use super::*;
+
+    async fn handle_response(admin: Arc<Admin>, request: Vec<u8>) -> Vec<u8> {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            let stream: rustfrp_core::transform::BoxAsyncIo = Box::new(server);
+            handle(stream, admin).await;
+        });
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        response
+    }
+
+    fn admin(reload: mpsc::Sender<ReloadReq>, stop: CancellationToken) -> Arc<Admin> {
+        Arc::new(Admin {
+            user: "admin".into(),
+            password: "secret".into(),
+            assets_dir: None,
+            status: Arc::default(),
+            config_text: Arc::new(Mutex::new("frpc config".into())),
+            reload,
+            stop,
+        })
+    }
+
+    fn get(path: &str, credentials: bool) -> Vec<u8> {
+        let auth = if credentials {
+            format!("Authorization: Basic {}\r\n", base64("admin:secret"))
+        } else {
+            String::new()
+        };
+        format!("GET {path} HTTP/1.1\r\nHost: local\r\n{auth}Connection: close\r\n\r\n")
+            .into_bytes()
+    }
+
+    async fn asset_response(root: &Path, path: &str) -> Vec<u8> {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let root = root.to_path_buf();
+        let path = path.to_string();
+        let task = tokio::spawn(async move { serve_asset(&mut server, &root, &path).await });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        response
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rustfrp-admin-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn dashboard_assets_cover_mime_fallback_and_safe_boundaries() {
+        let root = temp_dir("assets");
+        std::fs::write(root.join("index.html"), "root dashboard").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/index.html"), "docs dashboard").unwrap();
+
+        for (extension, mime) in [
+            ("html", "text/html; charset=utf-8"),
+            ("css", "text/css; charset=utf-8"),
+            ("js", "text/javascript; charset=utf-8"),
+            ("mjs", "text/javascript; charset=utf-8"),
+            ("json", "application/json"),
+            ("map", "application/json"),
+            ("svg", "image/svg+xml"),
+            ("png", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("woff", "font/woff"),
+            ("woff2", "font/woff2"),
+            ("ttf", "font/ttf"),
+            ("unknown", "application/octet-stream"),
+        ] {
+            let file = root.join(format!("asset.{extension}"));
+            std::fs::write(&file, "asset").unwrap();
+            assert_eq!(asset_content_type(&file), mime, "{extension}");
+        }
+
+        let response = asset_response(&root, "/docs/").await;
+        assert!(String::from_utf8_lossy(&response).contains("docs dashboard"));
+        let fallback = asset_response(&root, "/client/route").await;
+        assert!(String::from_utf8_lossy(&fallback).contains("root dashboard"));
+        for path in ["/../secret", "/docs/../../secret"] {
+            assert!(String::from_utf8_lossy(&asset_response(&root, path).await)
+                .starts_with("HTTP/1.1 404"));
+        }
+
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(
+            String::from_utf8_lossy(&asset_response(&root, "/empty/").await)
+                .starts_with("HTTP/1.1 404")
+        );
+        let oversized = root.join("oversized.bin");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&asset_response(&root, "/oversized.bin").await)
+                .starts_with("HTTP/1.1 404")
+        );
+        assert!(
+            String::from_utf8_lossy(&asset_response(&root.join("missing"), "/").await)
+                .starts_with("HTTP/1.1 404")
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = temp_dir("outside");
+            std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+            std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("escape.txt"))
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&asset_response(&root, "/escape.txt").await)
+                    .starts_with("HTTP/1.1 404")
+            );
+            std::fs::remove_dir_all(outside).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_cover_auth_reload_stop_and_unknown_requests() {
+        let (reload, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let stop = CancellationToken::new();
+        let api = admin(reload, stop.clone());
+        let health = handle_response(api.clone(), get("/healthz", false)).await;
+        assert!(String::from_utf8_lossy(&health).starts_with("HTTP/1.1 200"));
+        let denied = handle_response(api.clone(), get("/api/status", false)).await;
+        assert!(String::from_utf8_lossy(&denied).starts_with("HTTP/1.1 401"));
+        let status = handle_response(api.clone(), get("/api/status", true)).await;
+        assert!(String::from_utf8_lossy(&status).contains("{}"));
+        let config = handle_response(api.clone(), get("/api/config", true)).await;
+        assert!(String::from_utf8_lossy(&config).contains("frpc config"));
+        let unknown = handle_response(api.clone(), get("/unknown", true)).await;
+        assert!(String::from_utf8_lossy(&unknown).starts_with("HTTP/1.1 404"));
+        let unavailable = handle_response(api, get("/api/reload", true)).await;
+        assert!(String::from_utf8_lossy(&unavailable).starts_with("HTTP/1.1 400"));
+
+        let (reload, mut receiver) = mpsc::channel(1);
+        let success_api = admin(reload, CancellationToken::new());
+        let success_task = tokio::spawn(handle_response(
+            success_api.clone(),
+            get("/api/reload", true),
+        ));
+        let request = receiver.recv().await.unwrap();
+        request.reply.send(Ok(())).unwrap();
+        let response = success_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+        let (reload, mut receiver) = mpsc::channel(1);
+        let abandoned_api = admin(reload, CancellationToken::new());
+        let abandoned_task = tokio::spawn(handle_response(abandoned_api, get("/api/reload", true)));
+        drop(receiver.recv().await.unwrap());
+        let response = abandoned_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"));
+
+        let (reload, _receiver) = mpsc::channel(1);
+        let stopped_api = admin(reload, stop.clone());
+        let stopped_response = handle_response(stopped_api, get("/api/stop", true)).await;
+        assert!(String::from_utf8_lossy(&stopped_response).starts_with("HTTP/1.1 200"));
+        assert!(stop.is_cancelled());
     }
 }

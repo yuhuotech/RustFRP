@@ -14,10 +14,19 @@ Configure these repository Actions secrets before creating a release tag:
   `APPLE_DEVELOPER_IDENTITY`, `APPLE_ID`, `APPLE_APP_PASSWORD`, and
   `APPLE_TEAM_ID`: Developer ID signing and notarization credentials.
 
+Set the repository Actions variable `RUSTFRP_RELEASE_PUBLIC_KEY_HEX` to the
+32-byte raw Ed25519 public key in lowercase or uppercase hexadecimal. Every
+Agent binary embeds this trusted key and `GITHUB_REPOSITORY`; the publish job
+derives the public key from the signing secret and fails unless it matches the
+embedded key. Do not rotate the key without a staged release that still trusts
+the previous key.
+
 Generate the signing key outside the repository with OpenSSL, put the private
-PEM in the protected GitHub secret, and pin its public key in the installer and
-updater before distributing signed releases. The attached public key is useful
-for verification only after it has been trusted through a separate channel.
+PEM in the protected GitHub secret, and set the matching public-key repository
+variable before distributing signed releases. The Agent embeds this key at
+build time; installers still need a separately trusted verification key. The
+attached public key is useful only after it has been trusted through a separate
+channel.
 
 Verify downloaded files with:
 
@@ -25,5 +34,23 @@ Verify downloaded files with:
 bash tools/release/verify.sh /path/to/trusted-public-key.pem /path/to/release
 ```
 
-The release workflow requires those secrets and fails closed when they are
-missing. It does not publish unsigned packages.
+The release workflow requires those signing values and fails closed when they
+are missing. Agent updates download the signed `SHA256SUMS`, verify its
+Ed25519 signature using the embedded key, verify the selected binary digest,
+then replace the Agent with rollback on failure. A Controller administrator
+sends the requested version to an online Agent; the Agent exits after a
+successful replacement so its process supervisor can start the new binary.
+
+The CA-07 Agent updater and D-09 Flutter desktop App updater are implemented
+and have automated signature, digest, install-plan, and rollback tests. The App
+updater checks GitHub Releases or the configured mainland mirrors and installs
+the package for the detected platform. Neither updater can accept an unsigned
+package; both use the embedded Ed25519 public key.
+
+No signed Release has been published or verified with real Actions credentials
+yet. Configure `RUSTFRP_RELEASE_SIGNING_KEY_PEM` and the matching
+`RUSTFRP_RELEASE_PUBLIC_KEY_HEX` variable before publishing; the workflow checks
+that the public key compiled into the Agent/App matches the signing key. Public
+website deployment, cross-host migration, and multi-platform host acceptance
+also remain deployment tasks; successful CI builds and local loopback tests do
+not establish those acceptance results.

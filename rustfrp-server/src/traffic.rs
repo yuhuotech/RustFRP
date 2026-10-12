@@ -64,6 +64,8 @@ pub fn persist(
 pub fn sample_from_wire(s: &rustfrp_core::node::TrafficSample) -> Sample {
     Sample {
         name: s.name.clone(),
+        kind: String::new(),
+        active: true,
         generation: s.generation,
         traffic: rustfrp_core::pipe::TrafficSnapshot {
             bytes_in: s.bytes_in,
@@ -171,6 +173,8 @@ mod tests {
     fn sample(name: &str, generation: u64, bytes: u64) -> Sample {
         Sample {
             name: name.into(),
+            kind: "tcp".into(),
+            active: true,
             generation,
             traffic: TrafficSnapshot {
                 bytes_in: bytes,

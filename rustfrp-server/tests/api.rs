@@ -1249,6 +1249,8 @@ async fn traffic_history_requires_auth_and_bounds_queries() {
             store::now_ms(),
             &[Sample {
                 name: sample_id,
+                kind: "tcp".into(),
+                active: true,
                 generation: 0,
                 traffic: TrafficSnapshot {
                     bytes_in: 19,
@@ -2360,6 +2362,137 @@ async fn client_tags_and_remote_restart_are_validated_and_audited() {
         .await
         .iter()
         .any(|a| a == "client.restart"));
+}
+
+#[tokio::test]
+async fn client_connection_limits_signed_updates_and_live_node_migration_work_together() {
+    let r = rig().await;
+    let admin = r.admin("owner", Role::Admin).await;
+    let client_id = r.client("move-me").await;
+    let path = format!("/api/v1/clients/{client_id}");
+    let (status, body) = r
+        .send(
+            Method::PATCH,
+            &path,
+            &admin,
+            json!({"max_connections": 8, "reason": "limit"}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["max_connections"].as_u64()),
+        (StatusCode::OK, Some(8))
+    );
+
+    let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(8);
+    let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(8);
+    let client_for_db = client_id.clone();
+    r.db.call(move |c| {
+        for (id, host) in [("n1", "old.edge.test"), ("n2", "new.edge.test")] {
+            store::create_node(
+                c,
+                id,
+                id,
+                &"ab".repeat(32),
+                &rustfrp_core::node::NodeInfo {
+                    public_host: host.into(),
+                    edge_port: 7443,
+                    tls_fingerprint: "cd".repeat(32),
+                    ..Default::default()
+                },
+                store::now_ms(),
+            )?;
+        }
+        let tunnel = store::create_tunnel(
+            c,
+            &store::NewTunnel {
+                client_id: client_for_db.clone(),
+                name: "ssh".into(),
+                kind: "tcp".into(),
+                local_ip: "127.0.0.1".into(),
+                local_port: 22,
+                remote_port: 0,
+                enabled: true,
+                ..Default::default()
+            },
+            store::now_ms(),
+        )?;
+        store::set_client_node(c, &client_for_db, "n1")?;
+        Ok(tunnel.id)
+    })
+    .await
+    .unwrap();
+    r.hub.node_attach("n1", old_tx);
+    r.hub.node_attach("n2", new_tx);
+    r.hub.node_client_state("n1", &client_id, true, "").await;
+
+    let (status, body) = r
+        .send(
+            Method::POST,
+            &format!("{path}/update"),
+            &admin,
+            json!({"version": "v1.2.3", "reason": "security update"}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["version"].as_str()),
+        (StatusCode::OK, Some("v1.2.3"))
+    );
+    let update_client = client_id.clone();
+    let pending =
+        r.db.call(move |c| store::managed_config(c, &update_client))
+            .await
+            .unwrap();
+    assert_eq!(
+        (
+            pending.max_connections,
+            pending.update_seq,
+            pending.update_version.as_str()
+        ),
+        (8, 1, "v1.2.3")
+    );
+
+    let (status, body) = r
+        .send(
+            Method::POST,
+            &format!("{path}/migrate"),
+            &admin,
+            json!({"node_id": "n2", "reason": "closer edge"}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["node_id"].as_str()),
+        (StatusCode::OK, Some("n2"))
+    );
+    let mut redirected = false;
+    while let Ok(message) = old_rx.try_recv() {
+        if matches!(message, rustfrp_core::node::CtlMsg::RedirectClient { client_id: moved, target } if moved == client_id && target.address == "new.edge.test")
+        {
+            redirected = true;
+        }
+    }
+    assert!(redirected);
+    assert!(
+        matches!(new_rx.try_recv(), Ok(rustfrp_core::node::CtlMsg::Device(device)) if device.id == client_id && device.config.max_connections == 8)
+    );
+    let old_snapshot =
+        r.db.call(|c| store::list_node_devices(c, "n1"))
+            .await
+            .unwrap();
+    assert_eq!(old_snapshot.len(), 1);
+    assert!(old_snapshot[0].config.proxies.is_empty());
+    assert_eq!(
+        old_snapshot[0]
+            .config
+            .redirect
+            .as_ref()
+            .map(|d| d.address.as_str()),
+        Some("new.edge.test")
+    );
+    assert!(r
+        .audit_actions()
+        .await
+        .iter()
+        .any(|action| action == "client.move_node"));
 }
 
 #[tokio::test]

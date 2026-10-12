@@ -200,6 +200,38 @@ impl Hub {
         );
     }
 
+    /// 通知旧 Edge 清空代理并下发新 Edge 目标，然后更新新 Edge 的设备名册。
+    pub async fn redirect_device(
+        &self,
+        client_id: &str,
+        old_node_id: &str,
+        target: rustfrp_core::wire::EdgeRedirect,
+    ) {
+        if old_node_id.is_empty() {
+            let tx = self
+                .channels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(client_id);
+            if let Some(tx) = tx {
+                let mut config = (**tx.borrow()).clone();
+                config.proxies.clear();
+                config.visitors.clear();
+                config.redirect = Some(target.clone());
+                tx.send_replace(Arc::new(config));
+            }
+        } else {
+            self.node_send(
+                old_node_id,
+                CtlMsg::RedirectClient {
+                    client_id: client_id.to_string(),
+                    target: target.clone(),
+                },
+            );
+        }
+        self.sync_device(client_id).await;
+    }
+
     /// 处理节点上报的设备上线 / 离线。
     pub async fn node_client_state(&self, node_id: &str, client_id: &str, online: bool, ip: &str) {
         {
@@ -566,6 +598,25 @@ impl Policy for DbPolicy {
             }
             if client.disabled_at.is_some() {
                 return Err("device is disabled".into());
+            }
+            if !client.node_id.is_empty() {
+                let node_id = client.node_id.clone();
+                let node = self
+                    .db
+                    .call(move |c| store::get_node(c, &node_id))
+                    .await
+                    .map_err(|_| "device is assigned to an unavailable node".to_string())?;
+                if node.disabled_at.is_some()
+                    || node.edge_port == 0
+                    || node.tls_fingerprint.is_empty()
+                {
+                    return Err("device is assigned to an unavailable node".into());
+                }
+                return Ok(Admission::Redirect(rustfrp_core::wire::EdgeRedirect {
+                    address: node.public_host,
+                    port: node.edge_port,
+                    tls_fingerprint: node.tls_fingerprint,
+                }));
             }
             self.admit(client.id, false, remote_ip(login)).await
         })

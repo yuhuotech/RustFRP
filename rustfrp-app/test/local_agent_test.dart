@@ -41,6 +41,7 @@ class FakeLocal implements LocalAgentBackend {
   Completer<void>? pending;
   int starts = 0, stops = 0, reads = 0;
   String? receivedToken;
+  String? savedConfig;
   LocalAgentConfig? startedWith;
   bool exits = false;
   List<String> logLines = ['agent connected'];
@@ -55,6 +56,15 @@ class FakeLocal implements LocalAgentBackend {
   Future<String> exportDiagnostics(LocalAgentConfig config) async {
     if (error != null) throw error!;
     return '/state/diagnostics-test.json';
+  }
+
+  @override
+  Future<String> readConfig(LocalAgentConfig config) async =>
+      "serverAddr='example.com'\n";
+
+  @override
+  Future<void> saveConfig(LocalAgentConfig config, String text) async {
+    savedConfig = text;
   }
 
   List<Map<String, dynamic>> tunnelItems = [];
@@ -423,9 +433,18 @@ void main() {
     expect(find.byKey(const Key('local-controller')), findsNothing);
     expect(find.byKey(const Key('local-token')), findsNothing);
     expect(
-      find.text('独立模式直接读取本机 frpc 配置，不连接 Controller。配置文件由 Agent 读取；修改后请先停止再启动。'),
+      find.text('独立模式直接读取本机 frpc 配置，不连接 Controller。保存前会运行 Agent verify。'),
       findsOneWidget,
     );
+    expect(find.byKey(const Key('local-edit-config')), findsOneWidget);
+    await tapKey(tester, 'local-edit-config');
+    expect(find.byKey(const Key('standalone-config-text')), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const Key('standalone-config-text')),
+      "serverAddr='new.example.com'\n",
+    );
+    await tapKey(tester, 'standalone-config-save');
+    expect(backend.savedConfig, "serverAddr='new.example.com'\n");
     await tester.enterText(
       find.byKey(const Key('local-configFile')),
       '/tmp/another-frpc.toml',

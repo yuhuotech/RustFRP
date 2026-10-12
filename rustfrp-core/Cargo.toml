@@ -16,6 +16,7 @@ serde_yaml_ng = "0.10"
 httparse = "1"
 tokio.workspace = true
 tokio-util.workspace = true
+bytes.workspace = true
 futures.workspace = true
 yamux.workspace = true
 tokio-rustls.workspace = true
@@ -23,6 +24,7 @@ rustls.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
 ring.workspace = true
+lz4_flex.workspace = true
 getrandom.workspace = true
 
 [dev-dependencies]

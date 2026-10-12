@@ -388,7 +388,10 @@ void main() {
 
     await tapKey(tester, 'settings-about');
     expect(find.text('RustFRP'), findsWidgets);
-    expect(find.text('面板版本'), findsOneWidget);
+    expect(find.text('应用版本'), findsOneWidget);
+    expect(find.byKey(const Key('app-update-check')), findsOneWidget);
+    await tapKey(tester, 'app-update-check');
+    expect(find.textContaining('Release 仓库地址'), findsOneWidget);
 
     await tapKey(tester, 'settings-account');
     await tapKey(tester, 'logout');

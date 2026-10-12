@@ -40,6 +40,32 @@ class _LocalPageState extends ConsumerState<LocalPage> {
     }
   }
 
+  Future<void> _editStandaloneConfig() async {
+    final path = _fields['configFile']?.text.trim() ?? '';
+    if (path.isEmpty) {
+      setState(() => _diagnosticResult = '请先填写 frpc 配置文件的绝对路径。');
+      return;
+    }
+    final current = ref.read(localAgentProvider).config;
+    final config = LocalAgentConfig.fromJson({
+      ...current.toJson(),
+      'configFile': path,
+    });
+    try {
+      final text = await ref.read(localBackendProvider).readConfig(config);
+      if (!mounted) return;
+      final saved = await showDialog<bool>(
+        context: context,
+        builder: (_) => StandaloneConfigEditor(config: config, initialText: text),
+      );
+      if (saved == true && mounted) {
+        setState(() => _diagnosticResult = '配置已通过 Agent verify 并原子保存。启动独立 Agent 后生效。');
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _diagnosticResult = '无法打开配置文件：$error');
+    }
+  }
+
   void _goTop() {
     _scroll.animateTo(
       0,
@@ -240,9 +266,21 @@ class _LocalPageState extends ConsumerState<LocalPage> {
                   const SizedBox(height: 12),
                 ],
                 if (_standaloneMode)
-                  Text(
-                    '独立模式直接读取本机 frpc 配置，不连接 Controller。配置文件由 Agent 读取；修改后请先停止再启动。',
-                    style: Type.caption.copyWith(color: c.text3),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '独立模式直接读取本机 frpc 配置，不连接 Controller。保存前会运行 Agent verify。',
+                        style: Type.caption.copyWith(color: c.text3),
+                      ),
+                      const SizedBox(height: 8),
+                      LButton(
+                        key: const Key('local-edit-config'),
+                        label: '编辑 frpc 配置',
+                        icon: LucideIcons.filePenLine,
+                        onPressed: state.status == null ? _editStandaloneConfig : null,
+                      ),
+                    ],
                   )
                 else ...[
                   Text(
@@ -341,6 +379,87 @@ class _LocalPageState extends ConsumerState<LocalPage> {
       ),
     );
   }
+}
+
+class StandaloneConfigEditor extends ConsumerStatefulWidget {
+  const StandaloneConfigEditor({
+    super.key,
+    required this.config,
+    required this.initialText,
+  });
+  final LocalAgentConfig config;
+  final String initialText;
+
+  @override
+  ConsumerState<StandaloneConfigEditor> createState() =>
+      _StandaloneConfigEditorState();
+}
+
+class _StandaloneConfigEditorState extends ConsumerState<StandaloneConfigEditor> {
+  late final _text = TextEditingController(text: widget.initialText);
+  bool _saving = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _text.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (_saving) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await ref.read(localBackendProvider).saveConfig(widget.config, _text.text);
+      if (mounted) Navigator.pop(context, true);
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => DialogShell(
+    title: '编辑本机 frpc 配置',
+    maxWidth: 900,
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(widget.config.configFile, style: Type.caption.copyWith(color: context.c.text3)),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 440,
+          child: LTextField(
+            key: const Key('standalone-config-text'),
+            controller: _text,
+            maxLines: null,
+            hint: '粘贴或编辑完整 frpc TOML / YAML / JSON 配置',
+            onChanged: (_) => setState(() => _error = null),
+          ),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 8),
+          SelectableText(_error!, style: Type.caption.copyWith(color: context.c.dangerText)),
+        ],
+      ],
+    ),
+    actions: [
+      LButton(label: '取消', onPressed: _saving ? null : () => Navigator.pop(context)),
+      LButton(
+        key: const Key('standalone-config-save'),
+        label: '校验并保存',
+        icon: LucideIcons.save,
+        variant: BtnVariant.solid,
+        loading: _saving,
+        onPressed: _saving ? null : _save,
+      ),
+    ],
+  );
 }
 
 class _LocalLogsDialog extends ConsumerWidget {

@@ -153,6 +153,12 @@ pub struct VisitorSpec {
     pub bind_addr: String,
     /// 本机监听端口，0 = 自动分配。
     pub bind_port: u16,
+    /// 访问者到 Edge 的单工作流加密。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_encryption: bool,
+    /// 访问者到 Edge 的单工作流压缩。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_compression: bool,
 }
 
 /// 访问者在新流上发给 Edge 的第一帧。
@@ -164,16 +170,31 @@ pub struct VisitorHello {
     pub timestamp: i64,
     /// `auth_key(sk, timestamp)`。
     pub sign: String,
+    /// 请求对当前访问者工作流启用附加加密。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_encryption: bool,
+    /// 请求对当前访问者工作流启用有界压缩。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_compression: bool,
 }
 
 /// Edge 对访问者的应答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct VisitorResp {
     /// 是否放行（放行后流即成为到对端的透明通道）。
     pub ok: bool,
     /// 拒绝原因。
     #[serde(default)]
     pub error: String,
+    /// 获准后的访问者工作流加密参数。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_encryption: bool,
+    /// 获准后的访问者工作流压缩参数。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_compression: bool,
+    /// Edge 为当前工作流生成的随机密钥，32 字节十六进制。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encryption_key: String,
 }
 
 impl HttpOpts {
@@ -232,6 +253,18 @@ pub struct ManagedProxy {
     pub name: String,
     /// `tcp` / `udp` / `http` / `https`。
     pub kind: String,
+    /// 每隧道并发流或 UDP 活跃源地址上限；0 = 不限。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub max_connections: usize,
+    /// TCPMUX 复用器名称（目前支持 `httpconnect`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub multiplexer: String,
+    /// 独立代理工作流加密。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_encryption: bool,
+    /// 独立代理工作流压缩。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_compression: bool,
     /// 远程端口，0 = 自动分配（http / https 不使用）。
     pub remote_port: u16,
     /// 本地目标主机。
@@ -291,9 +324,36 @@ pub struct ConfigSet {
     /// 远程重启计数：值比会话开始时大，说明管理员要求重启这台设备上的 agent。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub restart_seq: u64,
+    /// 设备全部隧道共享的并发 TCP 连接上限；0 = 不限。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub max_connections: usize,
+    /// 更新器命令序号；大于 0 时 Agent 校验签名后更新。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub update_seq: u64,
+    /// 更新 Release tag，例如 `v1.2.3`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub update_version: String,
+    /// 节点迁移目标；旧节点清空代理后下发，客户端收到后立即改连目标节点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<EdgeRedirect>,
+}
+
+/// 受 Controller 信任的 Edge 迁移目标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRedirect {
+    /// 可解析的主机名或 IP。
+    pub address: String,
+    /// 客户端接入端口。
+    pub port: u16,
+    /// 目标 Edge 证书 SHA-256 指纹。
+    pub tls_fingerprint: String,
 }
 
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_usize(n: &usize) -> bool {
     *n == 0
 }
 
@@ -304,6 +364,18 @@ pub struct ProxySpec {
     pub name: String,
     /// `tcp` / `udp` / `http` / `https`。
     pub kind: String,
+    /// 每隧道并发 TCP 连接上限；0 = 不限。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub max_connections: usize,
+    /// TCPMUX 复用器名称（目前支持 `httpconnect`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub multiplexer: String,
+    /// 独立代理工作流加密。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_encryption: bool,
+    /// 独立代理工作流压缩。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_compression: bool,
     /// 远程端口，0 = 由服务端从允许范围内分配（http / https 不使用）。
     pub remote_port: u16,
     /// http / https：自定义域名（可含 `*.example.com` 通配）。
@@ -375,6 +447,9 @@ pub enum ServerMsg {
         /// 为 true 表示由 Controller 管理：随后会下发 `Config`，客户端不需要自己注册代理。
         #[serde(default)]
         managed: bool,
+        /// 设备迁移时由当前节点告知新 Edge。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redirect: Option<EdgeRedirect>,
     },
     /// 下发受管配置。
     Config(ConfigSet),
@@ -401,6 +476,15 @@ pub struct StartWork {
     /// 访问者连接到的公网地址（PROXY protocol 头的目的地址）。
     #[serde(default)]
     pub dst: String,
+    /// 对该工作流启用附加加密；密钥只在现有 TLS 会话内传递。
+    #[serde(default)]
+    pub use_encryption: bool,
+    /// 对该工作流启用有界流式压缩。
+    #[serde(default)]
+    pub use_compression: bool,
+    /// 每条工作流独立的随机加密密钥，32 字节十六进制。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encryption_key: String,
 }
 
 /// 写一帧。
@@ -493,6 +577,7 @@ mod tests {
                 run_id: "r".into(),
                 client_id: "c1".into(),
                 managed: true,
+                redirect: None,
             },
             ServerMsg::NewProxyResp {
                 name: "n".into(),
@@ -521,6 +606,9 @@ mod tests {
             proxy: "p".into(),
             src: "1.2.3.4:5".into(),
             dst: String::new(),
+            use_encryption: false,
+            use_compression: false,
+            encryption_key: String::new(),
         };
         write_frame(&mut a, &w).await.unwrap();
         assert_eq!(read_frame::<_, StartWork>(&mut b).await.unwrap(), w);
@@ -550,6 +638,9 @@ mod tests {
             proxy: "x".repeat(MAX_FRAME),
             src: String::new(),
             dst: String::new(),
+            use_encryption: false,
+            use_compression: false,
+            encryption_key: String::new(),
         };
         assert!(matches!(
             write_frame(&mut a, &big).await,

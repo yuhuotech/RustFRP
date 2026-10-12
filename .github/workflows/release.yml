@@ -33,6 +33,10 @@ jobs:
   linux:
     needs: verify
     runs-on: ubuntu-latest
+    env:
+      RUSTFRP_RELEASE_VERSION: ${{ github.ref_name }}
+      RUSTFRP_RELEASE_REPOSITORY: ${{ github.repository }}
+      RUSTFRP_RELEASE_PUBLIC_KEY_HEX: ${{ vars.RUSTFRP_RELEASE_PUBLIC_KEY_HEX }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +52,7 @@ jobs:
           mkdir -p dist
           cp target/release/rustfrp-agent dist/rustfrp-agent-linux-x86_64
           sha256sum dist/rustfrp-agent-linux-x86_64 | cut -d ' ' -f 1 > dist/rustfrp-agent-linux-x86_64.sha256
-          cd rustfrp-app && flutter pub get && flutter build linux --release && cd ..
+          cd rustfrp-app && flutter pub get && flutter build linux --release --build-name="$VERSION" --dart-define=RUSTFRP_VERSION="$VERSION" --dart-define=RUSTFRP_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX="$RUSTFRP_RELEASE_PUBLIC_KEY_HEX" && cd ..
           mkdir -p dist/rustfrp-linux-x86_64/app dist/rustfrp-linux-x86_64/bin
           cp target/release/rustfrp-agent target/release/rustfrp-server dist/rustfrp-linux-x86_64/bin/
           cp -R rustfrp-app/build/linux/x64/release/bundle/. dist/rustfrp-linux-x86_64/app/
@@ -76,6 +80,10 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFRP_RELEASE_VERSION: ${{ github.ref_name }}
+      RUSTFRP_RELEASE_REPOSITORY: ${{ github.repository }}
+      RUSTFRP_RELEASE_PUBLIC_KEY_HEX: ${{ vars.RUSTFRP_RELEASE_PUBLIC_KEY_HEX }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -98,12 +106,10 @@ jobs:
           done
           VERSION="${GITHUB_REF_NAME#v}"
           cargo build --release --bins
-          cd rustfrp-app && flutter pub get && flutter build macos --release && cd ..
+          cd rustfrp-app && flutter pub get && flutter build macos --release --build-name="$VERSION" --dart-define=RUSTFRP_VERSION="$VERSION" --dart-define=RUSTFRP_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX="$RUSTFRP_RELEASE_PUBLIC_KEY_HEX" && cd ..
           APP="rustfrp-app/build/macos/Build/Products/Release/rustfrp_app.app"
           mkdir -p "$APP/Contents/Resources/bin" dist
           cp target/release/rustfrp-agent target/release/rustfrp-server "$APP/Contents/Resources/bin/"
-          cp target/release/rustfrp-agent "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}"
-          shasum -a 256 "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}" | cut -d ' ' -f 1 > "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}.sha256"
           KEYCHAIN="$RUNNER_TEMP/rustfrp-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -115,6 +121,8 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN"
           codesign --force --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP/Contents/Resources/bin/rustfrp-agent"
           codesign --force --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP/Contents/Resources/bin/rustfrp-server"
+          cp "$APP/Contents/Resources/bin/rustfrp-agent" "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}"
+          shasum -a 256 "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}" | cut -d ' ' -f 1 > "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}.sha256"
           codesign --force --deep --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/rustfrp-macos-${RUSTFRP_ARCH}.zip"
@@ -130,6 +138,10 @@ jobs:
   windows:
     needs: verify
     runs-on: windows-latest
+    env:
+      RUSTFRP_RELEASE_VERSION: ${{ github.ref_name }}
+      RUSTFRP_RELEASE_REPOSITORY: ${{ github.repository }}
+      RUSTFRP_RELEASE_PUBLIC_KEY_HEX: ${{ vars.RUSTFRP_RELEASE_PUBLIC_KEY_HEX }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -143,7 +155,7 @@ jobs:
           cargo build --release --bins
           Push-Location rustfrp-app
           flutter pub get
-          flutter build windows --release
+          flutter build windows --release --build-name=$env:RUSTFRP_VERSION --dart-define=RUSTFRP_VERSION=$env:RUSTFRP_VERSION --dart-define=RUSTFRP_GITHUB_REPOSITORY=$env:GITHUB_REPOSITORY --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX=$env:RUSTFRP_RELEASE_PUBLIC_KEY_HEX
           Pop-Location
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           Copy-Item rustfrp-app/build/windows/x64/runner/Release/* dist/windows/ -Recurse -Force
@@ -173,14 +185,20 @@ jobs:
       - name: Sign release manifest and publish
         env:
           RUSTFRP_RELEASE_SIGNING_KEY_PEM: ${{ secrets.RUSTFRP_RELEASE_SIGNING_KEY_PEM }}
+          RUSTFRP_RELEASE_PUBLIC_KEY_HEX: ${{ vars.RUSTFRP_RELEASE_PUBLIC_KEY_HEX }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test -n "$RUSTFRP_RELEASE_SIGNING_KEY_PEM" || { echo 'Missing RUSTFRP_RELEASE_SIGNING_KEY_PEM secret' >&2; exit 1; }
+          test -n "$RUSTFRP_RELEASE_PUBLIC_KEY_HEX" || { echo 'Missing RUSTFRP_RELEASE_PUBLIC_KEY_HEX repository variable' >&2; exit 1; }
           cd dist
+          printf '%s\n' "$GITHUB_REF_NAME" > RELEASE_VERSION
           printf '%s\n' "$RUSTFRP_RELEASE_SIGNING_KEY_PEM" > "$RUNNER_TEMP/rustfrp-release-key.pem"
           openssl pkey -in "$RUNNER_TEMP/rustfrp-release-key.pem" -pubout -out RUSTFRP_RELEASE_PUBLIC_KEY.pem
-          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          ACTUAL_KEY_HEX="$(openssl pkey -in "$RUNNER_TEMP/rustfrp-release-key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          test "${ACTUAL_KEY_HEX,,}" = "${RUSTFRP_RELEASE_PUBLIC_KEY_HEX,,}" || { echo 'Pinned updater key does not match release signing key' >&2; exit 1; }
+          printf '%s\n' "$GITHUB_REF_NAME" > RELEASE_VERSION
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
           openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/rustfrp-release-key.pem" -in SHA256SUMS -out SHA256SUMS.sig
           rm -f "$RUNNER_TEMP/rustfrp-release-key.pem"
           cd ..

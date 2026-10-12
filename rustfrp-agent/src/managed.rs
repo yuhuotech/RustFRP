@@ -7,6 +7,7 @@ use rustfrp_core::identity::DeviceKey;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{ClientConfig, EnrollInfo, ManagedCfg};
+use rustfrp_core::wire::EdgeRedirect;
 
 /// 受管模式命令行参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,18 @@ pub fn state_dir(opts: &ManagedOpts, env: &dyn Env) -> Result<String, String> {
 
 fn identity_path(dir: &str) -> String {
     format!("{dir}/identity.json")
+}
+
+fn redirect_path(dir: &str) -> String {
+    format!("{dir}/edge-redirect.json")
+}
+
+/// 保存 Controller 认证过的迁移目标；后续系统服务重启仍连接新 Edge。
+pub fn save_redirect(fs: &dyn ConfigFs, dir: &str, target: &EdgeRedirect) -> Result<(), String> {
+    let text = serde_json::to_string(target).map_err(|e| e.to_string())?;
+    let path = redirect_path(dir);
+    fs.write_private(&path, &text)
+        .map_err(|e| format!("write {path}: {e}"))
 }
 
 /// 读取身份文件；不存在则生成新密钥并保存。
@@ -135,19 +148,38 @@ pub fn client_config(
     fs: &dyn ConfigFs,
     env: &dyn Env,
 ) -> Result<ClientConfig, String> {
-    let (host, port) = split_controller(&opts.controller)?;
+    let redirect = if let Ok(dir) = state_dir(opts, env) {
+        match fs.read_to_string(&redirect_path(&dir)) {
+            Ok(text) => Some(
+                serde_json::from_str::<EdgeRedirect>(&text)
+                    .map_err(|e| format!("invalid saved edge redirect: {e}"))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("read saved edge redirect: {error}")),
+        }
+    } else {
+        None
+    };
+    let (host, port) = match &redirect {
+        Some(target) => (target.address.clone(), target.port),
+        None => split_controller(&opts.controller)?,
+    };
     if id.client_id.is_none() && opts.enroll_token.is_none() {
         return Err(
             "this device is not enrolled yet; pass --enroll-token <token> from the panel".into(),
         );
     }
-    let trusted_ca_pem = match &opts.ca_file {
-        Some(f) => Some(
-            fs.read_to_string(f)
-                .map_err(|e| format!("read --ca-file {f}: {e}"))?
-                .into_bytes(),
-        ),
-        None => None,
+    let trusted_ca_pem = if redirect.is_some() {
+        None
+    } else {
+        match &opts.ca_file {
+            Some(f) => Some(
+                fs.read_to_string(f)
+                    .map_err(|e| format!("read --ca-file {f}: {e}"))?
+                    .into_bytes(),
+            ),
+            None => None,
+        }
     };
     let enroll = opts.enroll_token.as_ref().map(|t| EnrollInfo {
         token: t.clone(),
@@ -160,7 +192,9 @@ pub fn client_config(
         server_addr: host,
         server_port: port,
         trusted_ca_pem,
-        tls_pin: opts.tls_pin.clone(),
+        tls_pin: redirect
+            .map(|target| target.tls_fingerprint)
+            .or_else(|| opts.tls_pin.clone()),
         // 首次接入失败（令牌无效 / 过期）应直接报错退出；已接入的设备则一直重试。
         login_fail_exit: id.client_id.is_none(),
         managed: Some(ManagedCfg {
@@ -307,6 +341,34 @@ mod tests {
         o.ca_file = None;
         o.controller = ":".into();
         assert!(client_config(&o, &fresh, &fs, &env(&[])).is_err());
+    }
+
+    #[test]
+    fn migrated_edge_endpoint_is_persisted_and_pinned_after_restart() {
+        let fs = MemFs::new();
+        fs.create_dir_all("/state").unwrap();
+        let mut options = opts();
+        options.state_dir = Some("/state".into());
+        let identity = LoadedIdentity {
+            key: Arc::new(DeviceKey::generate().unwrap()),
+            client_id: Some("device-1".into()),
+        };
+        let target = EdgeRedirect {
+            address: "edge-new.example.test".into(),
+            port: 7443,
+            tls_fingerprint: "ab".repeat(32),
+        };
+        save_redirect(&fs, "/state", &target).unwrap();
+        let config = client_config(&options, &identity, &fs, &env(&[])).unwrap();
+        assert_eq!(
+            (config.server_addr.as_str(), config.server_port),
+            ("edge-new.example.test", 7443)
+        );
+        assert_eq!(
+            config.tls_pin.as_deref(),
+            Some(target.tls_fingerprint.as_str())
+        );
+        assert!(config.trusted_ca_pem.is_none());
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod admin;
 pub mod app;
 pub mod cli;
 pub mod client;
+pub mod dashboard;
 pub mod edge;
 pub mod health;
 pub mod local_control;
@@ -23,6 +24,7 @@ pub mod plan;
 pub mod plugin;
 pub mod proxy_rt;
 pub mod service;
+pub mod updater;
 pub mod visitor;
 
 pub mod metrics;

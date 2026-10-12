@@ -99,6 +99,7 @@ class ClientDevice {
     this.nodeId = '',
     this.tags = const [],
     this.lastIp = '',
+    this.maxConnections = 0,
   });
   final String id, name, os, arch, version;
 
@@ -111,6 +112,7 @@ class ClientDevice {
   /// 服务该设备的节点（空串 = 内置节点）。
   final String nodeId;
   final int revision, createdAt;
+  final int maxConnections;
   final int? lastSeenAt, disabledAt;
   final bool online;
 
@@ -132,6 +134,7 @@ class ClientDevice {
       online: m['online'] == true,
       nodeId: _str(m['node_id']),
       lastIp: _str(m['last_ip']),
+      maxConnections: _int(m['max_connections']),
       tags: [
         for (final t in _list(m['tags']))
           if (t is String) t,
@@ -154,6 +157,7 @@ class ClientDevice {
       other.online == online &&
       other.nodeId == nodeId &&
       other.lastIp == lastIp &&
+      other.maxConnections == maxConnections &&
       listEquals(other.tags, tags);
   @override
   int get hashCode => Object.hashAll([
@@ -169,6 +173,7 @@ class ClientDevice {
     online,
     nodeId,
     lastIp,
+    maxConnections,
     ...tags,
   ]);
 }
@@ -208,10 +213,12 @@ class Visitor {
     this.bindAddr = '127.0.0.1',
     this.bindPort = 0,
     this.enabled = true,
+    this.useEncryption = false,
+    this.useCompression = false,
   });
   final String id, clientId, name, tunnelId, bindAddr;
   final int bindPort;
-  final bool enabled;
+  final bool enabled, useEncryption, useCompression;
 
   factory Visitor.fromJson(Object? j) {
     final m = _map(j);
@@ -224,6 +231,8 @@ class Visitor {
       bindAddr: _str(m['bind_addr']),
       bindPort: _int(m['bind_port']),
       enabled: m['enabled'] != false,
+      useEncryption: m['use_encryption'] == true,
+      useCompression: m['use_compression'] == true,
     );
   }
 
@@ -236,10 +245,21 @@ class Visitor {
       other.tunnelId == tunnelId &&
       other.bindAddr == bindAddr &&
       other.bindPort == bindPort &&
-      other.enabled == enabled;
+      other.enabled == enabled &&
+      other.useEncryption == useEncryption &&
+      other.useCompression == useCompression;
   @override
-  int get hashCode =>
-      Object.hash(id, clientId, name, tunnelId, bindAddr, bindPort, enabled);
+  int get hashCode => Object.hash(
+    id,
+    clientId,
+    name,
+    tunnelId,
+    bindAddr,
+    bindPort,
+    enabled,
+    useEncryption,
+    useCompression,
+  );
 }
 
 /// 对本地服务的健康检查。
@@ -374,6 +394,10 @@ class Tunnel {
     this.proxyProtocol = 0,
     this.bandwidthBps = 0,
     this.bandwidthServer = false,
+    this.maxConnections = 0,
+    this.multiplexer = '',
+    this.useEncryption = false,
+    this.useCompression = false,
     this.lbGroup = '',
     this.lbGroupKeySet = false,
     this.healthCheck,
@@ -394,6 +418,9 @@ class Tunnel {
   /// 限速（字节 / 秒，0 = 不限）；`bandwidthServer` 为真时在服务端限，否则在客户端限。
   final int bandwidthBps;
   final bool bandwidthServer;
+  final int maxConnections;
+  final String multiplexer;
+  final bool useEncryption, useCompression;
   final String id,
       clientId,
       name,
@@ -414,6 +441,7 @@ class Tunnel {
   final Map<String, String> responseHeaders;
 
   bool get isWeb => kind == 'http' || kind == 'https';
+  bool get isDomain => isWeb || kind == 'tcpmux';
 
   /// 私密隧道（stcp / sudp）：没有公网端口，只能经访问者连接。
   bool get isSecret => kind == 'stcp' || kind == 'sudp';
@@ -457,6 +485,10 @@ class Tunnel {
       proxyProtocol: _int(m['proxy_protocol']),
       bandwidthBps: _int(m['bandwidth_bps']),
       bandwidthServer: m['bandwidth_server'] == true,
+      maxConnections: _int(m['max_connections']),
+      multiplexer: _str(m['multiplexer']),
+      useEncryption: m['use_encryption'] == true,
+      useCompression: m['use_compression'] == true,
       lbGroup: _str(m['lb_group']),
       lbGroupKeySet: m['lb_group_key_set'] == true,
       healthCheck: m['health_check'] is Map<String, dynamic>
@@ -506,6 +538,10 @@ class Tunnel {
       other.proxyProtocol == proxyProtocol &&
       other.bandwidthBps == bandwidthBps &&
       other.bandwidthServer == bandwidthServer &&
+      other.maxConnections == maxConnections &&
+      other.multiplexer == multiplexer &&
+      other.useEncryption == useEncryption &&
+      other.useCompression == useCompression &&
       other.lbGroup == lbGroup &&
       other.lbGroupKeySet == lbGroupKeySet &&
       other.healthCheck == healthCheck &&
@@ -537,6 +573,10 @@ class Tunnel {
     proxyProtocol,
     bandwidthBps,
     bandwidthServer,
+    maxConnections,
+    multiplexer,
+    useEncryption,
+    useCompression,
     lbGroup,
     lbGroupKeySet,
     healthCheck,
@@ -711,6 +751,7 @@ class NodeInfo {
     this.clientsOnline = 0,
     this.vhostHttpPort,
     this.vhostHttpsPort,
+    this.tcpmuxHttpConnectPort,
     this.subdomainHost = '',
     this.online = true,
     this.clients = 0,
@@ -729,7 +770,11 @@ class NodeInfo {
   final bool builtin, online;
   final String name, publicHost, version, subdomainHost, os, tlsFingerprint;
   final int edgePort, clientsOnline, clients;
-  final int? vhostHttpPort, vhostHttpsPort, lastSeenAt, disabledAt;
+  final int? vhostHttpPort,
+      vhostHttpsPort,
+      tcpmuxHttpConnectPort,
+      lastSeenAt,
+      disabledAt;
 
   bool get disabled => disabledAt != null;
 
@@ -761,6 +806,7 @@ class NodeInfo {
       clientsOnline: _int(m['clients_online']),
       vhostHttpPort: _intOrNull(m['vhost_http_port'] ?? m['vhost_http']),
       vhostHttpsPort: _intOrNull(m['vhost_https_port'] ?? m['vhost_https']),
+      tcpmuxHttpConnectPort: _intOrNull(m['tcpmux_http_connect_port']),
       subdomainHost: _str(m['subdomain_host']),
       online: m['online'] != false,
       clients: _int(m['clients']),

@@ -264,7 +264,7 @@ flowchart TB
 - 仅监听 `127.0.0.1:<随机端口>`，采用有界、带本地令牌的 JSON 控制请求（非 HTTP，浏览器不能直接调用）。协议与共享 fixture 见 `rustfrp-protocol/LOCAL_CONTROL.md`。
 - macOS 首次用令牌接入并保存身份，然后交给 `launchd bootstrap gui/<uid>`；服务定义放在用户状态目录，**不含接入令牌**。Linux / Windows 使用独立后台进程，尚需实机验收。
 - 关闭窗口只关闭界面，重开恢复原进程的状态；仅显式「停止」发出带本地令牌的停止请求，不通过 PID 强杀。
-- 当前实现覆盖受管与独立本机入口、随包 Agent、本机隧道/状态/日志/诊断、托盘、关闭到托盘、用户级开机启动和连接通知。完整 frp 配置编辑、CA-07 更新器及三平台真实安装验收仍待完成。
+- 当前实现覆盖受管与独立本机入口、随包 Agent、本机隧道/状态/日志/诊断、托盘、关闭到托盘、用户级开机启动和连接通知；独立模式可编辑完整 TOML/YAML/JSON 配置并在保存前验证。CA-07 Agent 和 D-09 Flutter App 更新器均已实现签名清单/版本标记/包摘要校验与平台安装或回滚；真实签名 Release 仍需配置 CI 密钥，三平台真实安装验收仍待完成。
 - 设计增量内存：仅在显式 `--local-control` 时分配监听器、几个状态标量和约 2 KiB 请求缓冲；请求串行处理，读写 2 秒超时，无额外 per-connection 线程或无界容器。
 
 ### 3.4 Flutter 平台差异隔离
@@ -286,7 +286,7 @@ core/platform/
 | 实时事件 | WebSocket | WebSocket（同源，Origin 校验天然通过） |
 | 本机 agent | ✅ | ❌（隐藏入口） |
 | 托盘 / 开机启动 / 窗口控制 | ✅ | ❌（隐藏） |
-| 应用内更新（CA-07） | ❌（更新器未实现） | ❌（隐藏） |
+| Flutter App 包更新（D-09） | ✅（桌面更新器实现；真实签名 Release 待配置） | ❌（隐藏，随 Controller 更新） |
 | 多标签页 | — | Web Locks 互斥，非活动标签页只读提示（沿用 linkory） |
 | 构建 | `flutter build macos|linux|windows` | `flutter build web --release --wasm`，**CanvasKit 随包、不依赖外部 CDN**，内置中文字体 |
 
@@ -704,16 +704,16 @@ Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用 Flutter 静
 接入命令的 POSIX 参数使用单引号转义，Windows 返回可直接粘贴到 PowerShell 的表达式，保留设备名中的引号、中文及特殊字符。
 脚本按系统/架构选择 `/downloads/` 下的原始 agent，通过 HTTPS 下载并校验对应 SHA256 文件，失败保留旧 agent。
 下载目录由外部静态服务器托管，避免管理 API 整包读取发布二进制。
-当前桌面实现包含托盘、用户级开机启动和通知；Agent 的 systemd/launchd/Windows 任务计划服务命令也已实现。多平台 Release workflow、静态官网和部署模板已加入，但尚未运行真实 Release 或部署官网。签名/公证依赖未配置的 CI 凭据；安装器/更新器尚未固定并校验可信公钥，CA-07 应用更新器和正式安全审计报告仍缺。
+当前桌面实现包含托盘、用户级开机启动和通知；Agent 的 systemd/launchd/Windows 任务计划服务命令也已实现。CA-07 Agent 与 D-09 Flutter App 更新器使用编译时固定的 Ed25519 公钥校验签名清单及包摘要，并执行安全替换/失败处理。CI 公钥变量/签名私钥尚未配置，所以未发布真实签名 Release。官网部署和正式安全审计报告仍缺，三平台实机验收也未完成。
 目录约定、验证命令与增量内存评估见 [installer/README.md](../installer/README.md)。
 
 
 ### 本轮验收记录
 
 宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；颜色与字号 token 无变更。
-Flutter 132 项测试通过；2026-10-12 最终 Rust/Flutter 覆盖率和 Web 同源构建结果见 [HANDOFF.md](HANDOFF.md)。macOS ARM64 Release `.app` 已构建；托盘、自启动、通知及 Linux/Windows 后台进程仍需真实目标主机验收。
+Flutter analyze 与 158 项测试通过；Web 同源构建成功。Rust/Flutter 覆盖率见 [HANDOFF.md](HANDOFF.md)：Core、Server、Flutter 达到历史基线，Agent 仍低于历史基线。真实签名 Release、公网部署、跨主机迁移和多平台目标主机验收尚未完成。
 macOS 隔离实例实测：首次接入错误提示、有效接入、停止、复用身份启动、菜单收起、重开保留折叠与原 PID、窗口完全退出后真实 TCP 隧道继续回显；最后通过本地控制接口停止并清理临时 launchd 任务。
-Rust 全仓测试、fmt / clippy、覆盖率与全链路冒烟通过。2026-10-12 `make bench-mem`（10 条隧道）100 条空闲连接 Edge / Client 为 6.78 / 7.12 MiB，20 次 512 KiB 回显后为 7.12 / 7.69 MiB，连接关闭后为 7.14 / 7.70 MiB；均低于 10 MiB 上限。
+Rust 全仓测试、fmt / clippy、全链路冒烟通过；`make cov` 仅 Agent 覆盖率未达历史基线。2026-10-12 `make bench-mem`（10 条隧道）空闲 Edge/Client 为 5.05/5.06 MiB，100 条空闲连接为 6.97/7.41 MiB，20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB；均低于 10 MiB 上限。
 
 菜单顶部品牌区：logo 22px、名称使用常规 13px；桌面顶部留 44px，Web 留 24px。收起时整行隐藏品牌图形与名称，只显示水平居中的展开按钮。
 

@@ -1,10 +1,10 @@
 # RustFRP 交接文档
 
-> 更新于 2026-10-12。进度的权威清单是 `docs/IMPLEMENTATION_STATUS.md`，协作规则见 `AGENTS.md`。本文说明当前工作区状态、明确缺口和接手顺序。
+> 更新于 2026-10-12。进度的权威清单是 `docs/IMPLEMENTATION_STATUS.md`，协作规则见 `AGENTS.md`。本文记录本轮功能实现、整体验收结果及剩余条件。
 
 ## 1. 仓库状态
 
-- 当前工作区有本轮实现和文档改动，尚未提交；提交/推送状态以 `git status --short --branch` 为准。
+- 本文随本轮功能实现、整体验收结果及进度文档同步更新；具体代码版本以 `main` 最新提交为准。
 - 根 `README.md` 是面向使用者的进度摘要；`docs/IMPLEMENTATION_STATUS.md` 是逐项验收权威清单，二者与本文需保持一致。
 
 ## 2. 开工前先读
@@ -40,49 +40,51 @@ Flutter 测试偶尔超过 2 分钟，可在 `rustfrp-app/` 下直接 `flutter t
 
 - 受管模式下配置经隧道控制流整份下发（`ConfigSet`），代理名即隧道 ID。
 - 写操作必须带 `reason` 并与业务同事务写审计。
-- 数据库 `user_version` 当前是 **15**（迁移 `0015_managed_plugins.sql`）；新增迁移要同步改 `db.rs` 与 `tests/maintenance.rs` 里的断言。
+- 数据库 `user_version` 当前是 **19**（本轮迁移 `0016_connection_limits_updates.sql` 至 `0019_visitor_stream_transforms.sql`）；新增迁移要同步改 `db.rs`、API/维护测试和 `tools/e2e/full_stack.py` 里的断言。
 - 外置节点保存本地设备名册，Controller 掉线时数据面继续工作。
 
 ## 5. 已实现（本轮及之前）
 
-- **隧道类型**：tcp / udp / http / https / stcp / sudp。
+- **隧道类型**：tcp / udp / http / https / tcpmux（仅 httpconnect）/ stcp / sudp。
 - **HTTP**：逐请求选路、locations、routeByHTTPUser、Basic Auth、requestHeaders / responseHeaders、Host 改写、Upgrade 透传。
-- **通用选项**：PROXY protocol v1/v2、限速（客户端 / 服务端，双向共享令牌桶）、健康检查（tcp / http）、负载均衡组。
+- **通用选项**：PROXY protocol v1/v2、限速（客户端 / 服务端，双向共享令牌桶）、TCP 与 Visitor 工作流 AES-256-GCM/有界 LZ4、客户端/隧道/UDP peer/SUDP Visitor workflow 并发上限、健康检查（tcp / http）、负载均衡组。
 - **访问者**：独立模式用 `[[visitors]]`；受管模式在客户端详情页创建。
 - **插件**：独立与受管模式均支持 socks5、http_proxy、static_file、unix_domain_socket、http2https、https2http、https2https、tls2raw；受管私密字段不经 REST 返回，证书文件在 Agent 本机按路径读取并受 16 KiB 限制，`*2*` 转发仅支持 HTTP/1.1。
 - **运维**：独立客户端 `webServer` 管理接口与 `reload` / `status` / `stop`；`service install|…` 系统服务；远程重启（退出码 75，需服务托管）。
-- **Controller**：管理员与角色、API Token、流量历史、配置导入导出（含预览/警告/理由确认）、备份与配置化保留清理、标签、`/metrics`、设备登录 IP、外置节点、有界日志尾随。
-- **面板**：概览、节点、客户端、隧道（含 HTTP 选项、插件 JSON、限速、健康检查、分组）、访问者、审计、设置；桌面本机模式可选受管或独立 TOML。
-- **本轮新增**：受管插件存储/校验/下发/导入导出与面板 JSON 配置；配置化审计/流量保留；Controller 和本机日志游标尾随；独立模式桌面入口；桌面托盘、自启动、连接通知和随包 Agent；中文官网、HTTPS 部署模板、多平台 Release 构建及 Ed25519 清单签名工作流。
+- **TCPMUX**：`multiplexer=httpconnect`、CONNECT Host 路由、并发限制与 `tcpmuxPassthrough` 完整 CONNECT 透传均已实现并有真实回环测试。
+- **frps dashboard / TLS**：只读 dashboard JSON API、Basic Auth、HTTPS 与 `assetsDir` 安全静态资源已接入；独立 frpc 的 `webServer.tls` / `assetsDir` 也由运行时支持。
+- **Controller**：管理员与角色、API Token、流量历史、配置导入导出（含预览/警告/理由确认）、备份与配置化保留清理、标签、`/metrics`、设备登录 IP、外置节点、设备跨节点迁移（迁移理由审计、旧节点清理、目标指纹固定重连）、Agent 更新命令、有界日志尾随。
+- **面板**：概览、节点、客户端、隧道（含 TCPMUX、每客户端/隧道连接上限、HTTP 选项、插件 JSON、限速、健康检查、分组）、访问者、审计、设置；桌面本机模式可编辑完整本地 TOML/YAML/JSON 文件并在保存前校验。
+- **此前完成**：受管插件存储/校验/下发/导入导出与面板 JSON 配置；配置化审计/流量保留；Controller 和本机日志游标尾随；独立模式桌面入口；桌面托盘、自启动、连接通知和随包 Agent；中文官网、HTTPS 部署模板、多平台 Release 构建及 Ed25519 清单签名工作流。
+- **本轮补齐**：TCPMUX passthrough、Visitor 加密/压缩、客户端/隧道/UDP/SUDP 连接限制、CA-07 Agent 签名更新、D-09 Flutter App 更新、Controller 触发的跨 Edge 迁移、桌面完整配置文本编辑、frps dashboard/TLS/assetsDir。指定功能均有自动化回归；真实签名/公网/跨主机/多平台验收仍按下表保留。
 
-## 6. 未实现 / 缺口
+## 6. 功能边界与交付缺口
 
 | 项 | 说明 |
 |---|---|
-| TCPMUX、xtcp | TCPMUX 是 V1.0 P1 缺口，尚无运行时；XTCP 属 P2/V1.1。二者在兼容报告中明确列出 |
-| 传输加密 / 压缩、连接数限制 | 尚无运行时实现；加密/压缩会进入兼容报告，连接数限制仍缺 |
-| `frps` dashboard、`webServer.tls` / `assetsDir` | 配置能力未实现并有提示；管理面 HTTPS 用反向代理部署模板，需真实部署验收 |
-| 设备跨节点迁移、桌面完整本地配置编辑 | 尚未完成 |
+| TCPMUX / Visitor 选项 / 连接上限 | TCPMUX passthrough、Visitor `useEncryption/useCompression`、UDP/SUDP `maxConnections` 均已实现并有回环/单元测试；XTCP 属 P2/V1.1 |
+| `frps` dashboard、`webServer.tls` / `assetsDir` | 运行时与自动化测试已实现；公网域名、证书和反向代理部署验收仍待完成 |
+| 设备跨节点迁移 | API、审计、旧节点代理清理、目标 Edge TLS 指纹固定、Agent 重连/持久化均已实现；跨主机/WAN 验收未做 |
+| 桌面本地配置编辑 | 完整 TOML/YAML/JSON 文本编辑、Agent 校验、暂存/原子替换和失败保护已实现并有自动化测试；目标主机验收未做 |
+| CA-07 / D-09 更新器 | Agent 与 Flutter App 均有 Ed25519 签名清单/版本标记验证、摘要校验、平台安装/回滚逻辑及自动化测试；签名私钥/公钥变量未配置，真实 Release 未发布 |
 | 官网与部署 | `rustfrp-web/`、Caddy/nginx/Compose/systemd 模板已加入，尚未部署 |
-| 桌面 | 托盘、关闭到托盘、自启动、状态通知、独立配置入口、随包 Agent 已实现并有自动化测试；三平台实机验收仍缺 |
-| 自动更新 | CA-07 更新器未实现：可信公钥固定、签名校验、原子替换、回滚、App/Agent 协调升级均缺 |
-| 发布 / 签名 | 多平台 Release 工作流和 Ed25519 SHA256 清单签名已写；尚未运行真实 Release。Apple 签名/公证和清单签名需要 CI 凭据；安装器/更新器尚未固定可信公钥，正式安全审计报告未出 |
+| 多平台安装、系统集成与安全 | macOS/Linux/Windows 主机上的安装/更新、托盘、自启动、服务仍需真实验收；Apple 签名/公证、真实签名 Release、供应链加固与正式安全审计报告未完成 |
 
-## 7. 质量现状（2026-10-12 最终联调）
+## 7. 质量现状（2026-10-12）
 
-| Crate | 行 | 函数 | 分支 |
-|---|---|---|---|
-| core | 99.19% | 98.04% | 97.44% |
-| agent | 98.10% | 95.40% | 91.49% |
-| server | 97.00% | 95.65% | 93.37% |
+| Crate | 行 | 函数 | 分支 | 历史基线 |
+|---|---:|---:|---:|---|
+| core | 99.03% | 97.97% | 97.16% | 通过 |
+| agent | 97.07% | 91.40% | 91.29% | 行/函数未通过（98.14/95.36）；分支通过（91.10） |
+| server | 97.16% | 95.80% | 92.88% | 通过 |
+| Flutter App | 97.30% | — | — | 通过（行基线 97.28%） |
 
-- Flutter 行覆盖率 97.28%，132 项测试通过。
-- `make lint`、`make test`、`make cov`、Flutter analyze、132 项 Flutter 测试/`make app-cov`、`make web-build`、`make e2e` 与 `make bench-mem` 均通过；Compose、Release workflow YAML 与发布校验脚本语法检查通过。
-- 覆盖率检查器对既有基线允许 0.05 个百分点误差。Agent 行覆盖率 98.10%，比 98.14% 基线低 0.04 个百分点，因此检查器通过；函数 / 分支均高于基线。其他 crate 达到或超过基线。
-- `make bench-mem`（macOS Release，10 条隧道）结果：100 条空闲连接 Edge/Client 6.78/7.12 MiB；20 次 512 KiB 回显后的峰值 Edge/Client 7.12/7.69 MiB，连接关闭后 7.14/7.70 MiB，均低于 10 MiB 上限。
-- `make e2e` 使用真实 server/agent 完成受管接入、300000 字节 TCP 回显、流量/日志/隧道列表、重连、UDP、HTTP 域名与子域名、在线备份及审计检查。
-- 本机 macOS ARM64 Release `.app` 构建成功（51.5 MB）；Linux、Windows、macOS Intel 发布包未在真实主机完成安装验收，Release 签名/公证未运行。
-- `make cov` 与 `make app-cov` 不会降低基线；新增代码仍须带有有效断言的测试。
+- `make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 均通过；`make core-cov`、`make server-cov`、`make app-cov` 通过，`make agent-cov` 因 Agent 低于历史基线失败。
+- 本机 `flutter build macos --release` 成功，产出 `rustfrp_app.app`（52.2 MB）；该产物不是签名 Release，也不代表 Windows/Linux/macOS Intel 的实机验收。
+- `make bench-mem`（macOS Release，10 条隧道）：空闲 Edge/Client 5.05/5.06 MiB，100 条空闲连接 6.97/7.41 MiB；20 次 512 KiB 回显后 7.39/7.88 MiB，关闭后 7.41/7.89 MiB，均低于 10 MiB 上限。
+- `make e2e` 使用真实 server/agent 完成受管接入、300000 字节 TCP 回显、流量/日志/隧道列表、重连、UDP、HTTP 域名与子域名、在线备份及审计检查。新增 TCPMUX/加密/压缩、Agent 更新签名流水线、节点迁移与 dashboard 另有集成/单元测试。
+- 本轮未发布真实签名 Release，也未在 Windows、Linux、macOS Intel 真实主机完成安装验收；签名/公证密钥、公网部署与跨主机迁移环境尚未配置。
+- 本轮指定功能代码与自动化回归完成；Agent 历史覆盖率基线及正式安全审计仍未完成。不得通过降低覆盖率基线解决。
 - 代码里 `tests/` 下的集成测试不计入覆盖率；单元测试模块用 `#[cfg_attr(coverage, coverage(off))]`。
 
 ## 8. 已知注意事项
@@ -95,13 +97,13 @@ Flutter 测试偶尔超过 2 分钟，可在 `rustfrp-app/` 下直接 `flutter t
 - 早先一次 `dart format` 让部分没改功能的 Flutter 文件出现了纯格式差异。
 - 编辑代码时避免在 `cargo fmt` 之后用「字符串替换」脚本去改同一段代码：格式变了会静默匹配不上。脚本里要断言目标存在。
 
-## 9. 建议的下一步（按价值排序）
+## 9. 剩余工作（按价值排序）
 
-1. 先补 V1.0 P1：TCPMUX、按客户端/隧道连接数限制、传输加密/压缩（逐项依据上游行为实现或显式确认边界）。
-2. 完成桌面本地配置编辑与 CA-07 更新器：可信公钥固定、签名校验、回滚和 Agent/App 协调更新。
-3. 用 macOS arm64/Intel、Windows x64、Linux x64 真实主机验收桌面托盘、自启动、通知、后台 Agent、安装/卸载；修正发布包后再跑签名/公证 Release。
-4. 将官网部署到正式域名，按 `deploy/README.md` 完成反向代理 HTTPS、Cookie 与 WebSocket 的生产验收。
-5. 做跨节点迁移、安全审计与完整性能/内存回归；然后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
+1. 只需继续将 Agent 覆盖率补回历史基线；其他 Crate 与 Flutter 已达到基线。
+2. 配置受保护的 `RUSTFRP_RELEASE_SIGNING_KEY_PEM` 与匹配的 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX`，发布并验证真实签名 Release。
+3. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和正式安全审计。
+4. 在 macOS arm64/Intel、Windows x64、Linux x64 主机验收安装/更新/卸载、托盘、自启动、通知、后台 Agent 与系统服务。
+5. 在跨主机/WAN 环境复验迁移，并补 Linux/高并发性能测试；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
 
 ## 10. 提交规范
 

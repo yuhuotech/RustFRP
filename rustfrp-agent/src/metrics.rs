@@ -10,11 +10,14 @@ struct Entry {
     traffic: Arc<Traffic>,
     active: bool,
     generation: u64,
+    kind: String,
 }
 
 /// 一次代理实例采样。
 pub struct Sample {
     pub name: String,
+    pub kind: String,
+    pub active: bool,
     pub generation: u64,
     pub traffic: TrafficSnapshot,
 }
@@ -50,9 +53,21 @@ impl Metrics {
                 traffic: Arc::new(Traffic::child(self.total.clone())),
                 active: true,
                 generation: self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                kind: String::new(),
             },
         );
         true
+    }
+    pub(crate) fn set_kind(&self, name: &str, kind: &str) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(name)
+        {
+            entry.kind.clear();
+            entry.kind.push_str(kind);
+        }
     }
     pub(crate) fn release(&self, name: &str) {
         if let Some(e) = self
@@ -88,6 +103,8 @@ impl Metrics {
             .iter()
             .map(|(name, e)| Sample {
                 name: name.clone(),
+                kind: e.kind.clone(),
+                active: e.active,
                 generation: e.generation,
                 traffic: e.traffic.snapshot(),
             })
@@ -131,6 +148,8 @@ mod tests {
         assert!(metrics.claim("a"));
         assert!(!metrics.claim("a"));
         assert!(metrics.claim("b"));
+        assert!(metrics.counter("missing").is_none());
+        metrics.set_kind("missing", "tcp");
         assert!(metrics.counter("missing").is_none());
         let a = metrics.counter("a").unwrap();
         let b = metrics.counter("b").unwrap();

@@ -74,7 +74,7 @@ class VisitorsSection extends ConsumerWidget {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '${v.bindAddr}:${v.bindPort == 0 ? '自动' : v.bindPort}  →  ${target(v)}',
+                            '${v.bindAddr}:${v.bindPort == 0 ? '自动' : v.bindPort}  →  ${target(v)}${v.useEncryption ? ' · 加密' : ''}${v.useCompression ? ' · 压缩' : ''}',
                             style: Type.caption.copyWith(
                               color: c.text2,
                               fontFamily: 'monospace',
@@ -164,6 +164,8 @@ class _VisitorEditorState extends ConsumerState<VisitorEditor> {
         : '${widget.existing!.bindPort}',
   );
   late String? _tunnel = widget.existing?.tunnelId;
+  late bool _useEncryption = widget.existing?.useEncryption ?? false;
+  late bool _useCompression = widget.existing?.useCompression ?? false;
   bool _busy = false;
 
   @override
@@ -199,6 +201,8 @@ class _VisitorEditorState extends ConsumerState<VisitorEditor> {
           tunnelId: _tunnel!,
           bindAddr: _addr.text.trim(),
           bindPort: _portValue!,
+          useEncryption: _useEncryption,
+          useCompression: _useCompression,
           reason: '通过面板创建访问者',
         );
       } else {
@@ -208,6 +212,8 @@ class _VisitorEditorState extends ConsumerState<VisitorEditor> {
           tunnelId: _tunnel,
           bindAddr: _addr.text.trim(),
           bindPort: _portValue,
+          useEncryption: _useEncryption,
+          useCompression: _useCompression,
           reason: '通过面板修改访问者',
         );
       }
@@ -303,6 +309,27 @@ class _VisitorEditorState extends ConsumerState<VisitorEditor> {
                     ),
                   ],
                 ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const Expanded(child: Text('访问者工作流加密')),
+              LSwitch(
+                key: const Key('visitor-use-encryption'),
+                value: _useEncryption,
+                onChanged: (value) => setState(() => _useEncryption = value),
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              const Expanded(child: Text('访问者工作流压缩')),
+              LSwitch(
+                key: const Key('visitor-use-compression'),
+                value: _useCompression,
+                onChanged: (value) => setState(() => _useCompression = value),
               ),
             ],
           ),

@@ -24,6 +24,7 @@ class Harness {
     bool sameOrigin = true,
     Map<String, Object> prefs = const {},
     bool login = true,
+    List<dynamic> extraOverrides = const [],
     Future<bool> Function()? desktopStartupEnabled,
     Future<void> Function(bool)? desktopStartupToggle,
   }) async {
@@ -42,6 +43,7 @@ class Harness {
         prefsProvider.overrideWithValue(p),
         apiFactoryProvider.overrideWithValue((base) => server.api(base)),
         sameOriginProvider.overrideWithValue(sameOrigin),
+        ...extraOverrides,
         tickProvider.overrideWith((ref) => tick.stream),
         if (desktopStartupEnabled != null)
           desktopStartupEnabledProvider.overrideWithValue(

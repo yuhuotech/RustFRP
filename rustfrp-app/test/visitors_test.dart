@@ -36,6 +36,12 @@ void main() {
       'enabled': false,
     });
     expect((v.bindAddr, v.bindPort, v.enabled), ('0.0.0.0', 2222, false));
+    final transformed = Visitor.fromJson({
+      'id': 'v-secure',
+      'use_encryption': true,
+      'use_compression': true,
+    });
+    expect(transformed.useEncryption && transformed.useCompression, isTrue);
     expect(v == Visitor.fromJson({'id': 'v1'}), isFalse);
     expect(
       Visitor.fromJson({'id': 'v1'}) == Visitor.fromJson({'id': 'v1'}),
@@ -84,11 +90,16 @@ void main() {
     expect(save(tester).onPressed, isNull, reason: 'port must be numeric');
     await tester.enterText(find.byKey(const Key('visitor-port')), '2222');
     await settle(tester);
+    await tester.tap(find.byKey(const Key('visitor-use-encryption')));
+    await tester.tap(find.byKey(const Key('visitor-use-compression')));
+    await settle(tester);
     await tapKey(tester, 'visitor-save');
     await settle(tester, 10);
     expect(s.visitors.length, 1);
     expect(s.visitors.single['bind_port'], 2222);
     expect(s.visitors.single['tunnel_id'], stcp['id']);
+    expect(s.visitors.single['use_encryption'], true);
+    expect(s.visitors.single['use_compression'], true);
     expect(find.text('访问者（1）'), findsOneWidget);
     expect(find.textContaining('127.0.0.1:2222'), findsOneWidget);
 
@@ -208,9 +219,10 @@ void main() {
       await settle(tester);
       await tester.tap(find.text('TCP'));
       await settle(tester);
-      await tester.tap(find.textContaining('SUDP').last);
+      await tester.tap(find.text('SUDP（私密 UDP，需访问者）').last);
       await settle(tester);
       expect(find.byKey(const Key('tunnel-bandwidth')), findsNothing);
+      expect(find.byKey(const Key('tunnel-max-connections')), findsOneWidget);
     },
   );
 }

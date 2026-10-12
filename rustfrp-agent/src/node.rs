@@ -352,6 +352,18 @@ impl Registry {
             }
             CtlMsg::Remove { client_id } => self.remove(&client_id),
             CtlMsg::Kick { client_id } => self.kick(&client_id),
+            CtlMsg::RedirectClient { client_id, target } => {
+                let mut devices = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(entry) = devices.get_mut(&client_id) {
+                    let mut config = (**entry.tx.borrow()).clone();
+                    config.proxies.clear();
+                    config.visitors.clear();
+                    config.redirect = Some(target);
+                    entry.tx.send_replace(Arc::new(config));
+                }
+                drop(devices);
+                self.dirty.notify_one();
+            }
             CtlMsg::EnrollResp {
                 req_id,
                 ok,
@@ -668,6 +680,8 @@ fn to_wire(s: &crate::metrics::Sample) -> TrafficSample {
 fn from_wire(s: &TrafficSample) -> crate::metrics::Sample {
     crate::metrics::Sample {
         name: s.name.clone(),
+        kind: String::new(),
+        active: true,
         generation: s.generation,
         traffic: rustfrp_core::pipe::TrafficSnapshot {
             bytes_in: s.bytes_in,
@@ -836,6 +850,10 @@ pub struct NodeRun {
     pub edge: crate::edge::EdgeConfig,
     /// 给客户端用的 TLS 证书（`None` = 临时自签名）。
     pub identity: Option<rustfrp_core::tls::Identity>,
+    /// frps dashboard 的独立 TLS 身份。
+    pub dashboard_identity: Option<rustfrp_core::tls::Identity>,
+    /// Whether CONNECT requests are forwarded unchanged to the selected Client.
+    pub tcpmux_passthrough: bool,
     /// 到 Controller 的链路参数。
     pub link: LinkCtx,
     /// 设备名册的持久化介质。
@@ -884,15 +902,17 @@ pub async fn start_node(
         log.info(&format!("restored {n} device(s) from the local cache"));
     }
     let policy: Arc<dyn Policy> = Arc::new(registry.clone());
-    let edge = crate::edge::Edge::bind_with_policy(
+    let edge = crate::edge::Edge::bind_with_dashboard(
         run.edge.clone(),
         run.identity.take(),
+        run.dashboard_identity.take(),
         policy,
         log.clone(),
     )
     .await
     .map_err(start_error)?
-    .retain_metrics(true);
+    .retain_metrics(true)
+    .with_tcpmux_passthrough(run.tcpmux_passthrough);
     let metrics = edge.metrics();
     run.link.metrics = Some(metrics.clone());
     let edge_addr = edge.local_addr().map_err(io_text)?;
@@ -901,6 +921,7 @@ pub async fn start_node(
     run.link.info.tls_fingerprint = edge.certificate_fingerprint().to_string();
     run.link.info.vhost_http = http_addr.map(|a| a.port());
     run.link.info.vhost_https = edge.https_addr().map(|a| a.port());
+    run.link.info.tcpmux_http_connect_port = edge.tcpmux_addr().map(|a| a.port());
     run.link.info.subdomain_host = run.edge.sub_domain_host.clone();
     run.link.info.allow_ports = run.edge.allow_ports.clone();
     log.info(&format!("rustfrp node listening on {edge_addr}"));
@@ -1035,6 +1056,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_command_clears_proxy_snapshot_and_survives_later_login() {
+        let (registry, _out, _events) = Registry::new();
+        let key = DeviceKey::generate().unwrap();
+        assert!(registry.upsert(device("moved", &key, 9)));
+        let target = rustfrp_core::wire::EdgeRedirect {
+            address: "new.example.test".into(),
+            port: 7443,
+            tls_fingerprint: "ab".repeat(32),
+        };
+        let mut seen = None;
+        registry.apply(
+            CtlMsg::RedirectClient {
+                client_id: "moved".into(),
+                target: target.clone(),
+            },
+            &mut seen,
+        );
+        let Ok(Admission::Managed(session)) = registry.login(&login("moved", &key)).await else {
+            panic!("redirect snapshot must remain an authenticated managed entry");
+        };
+        let config = session.config.borrow();
+        assert!(config.proxies.is_empty());
+        assert_eq!(config.redirect.as_ref(), Some(&target));
+    }
+
+    #[tokio::test]
     async fn online_offline_and_proxy_state_are_reported_and_resynced() {
         let (r, mut out, _events) = Registry::new();
         let k = DeviceKey::generate().unwrap();
@@ -1139,6 +1186,22 @@ mod tests {
         r.apply(CtlMsg::Device(device("a", &k, 1)), &mut seen);
         r.apply(CtlMsg::Device(device("b", &k, 1)), &mut seen);
         assert_eq!(r.len(), 2);
+        r.apply(
+            CtlMsg::RedirectClient {
+                client_id: "missing".into(),
+                target: rustfrp_core::wire::EdgeRedirect {
+                    address: "edge.example.test".into(),
+                    port: 7000,
+                    tls_fingerprint: "ab".repeat(32),
+                },
+            },
+            &mut seen,
+        );
+        assert_eq!(
+            r.len(),
+            2,
+            "redirects for unknown clients do not add devices"
+        );
         // 全量清单：未出现的 b 被清掉。
         r.apply(CtlMsg::SnapshotBegin, &mut seen);
         r.apply(CtlMsg::Device(device("a", &k, 2)), &mut seen);
@@ -1335,6 +1398,8 @@ mod tests {
                 ..Default::default()
             },
             identity: None,
+            dashboard_identity: None,
+            tcpmux_passthrough: false,
             link: LinkCtx {
                 host: "127.0.0.1".into(),
                 port: 1,

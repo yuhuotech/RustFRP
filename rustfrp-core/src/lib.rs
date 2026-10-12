@@ -20,6 +20,7 @@ pub mod node;
 pub mod pipe;
 pub mod proxyproto;
 pub mod tls;
+pub mod transform;
 pub mod udpframe;
 pub mod vhost;
 pub mod wire;

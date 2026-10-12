@@ -109,6 +109,8 @@ async fn run(spec: VisitorSpec, session: Session, env: VisitorEnv, stop: Cancell
     let target = VisitorTarget {
         server_name: full_name(&spec, &env.user),
         sk: spec.sk.clone(),
+        use_encryption: spec.use_encryption,
+        use_compression: spec.use_compression,
     };
     let fail = |error: String| {
         env.log
@@ -180,6 +182,7 @@ async fn run(spec: VisitorSpec, session: Session, env: VisitorEnv, stop: Cancell
                 open_timeout: env.open_timeout,
                 traffic: env.traffic.clone(),
                 visitor: Some(target),
+                limits: crate::edge::ConnectionLimits::unlimited(),
             };
             udp_proxy(
                 sock,
@@ -224,7 +227,15 @@ async fn stcp_conn(
     let mut stream = tokio::time::timeout(env.open_timeout, session.open())
         .await
         .map_err(|_| TunnelError::Timeout("open visitor stream"))??;
-    visitor_handshake(&mut stream, target, env.open_timeout).await?;
+    let transform = visitor_handshake(&mut stream, target, env.open_timeout).await?;
+    let mut stream = rustfrp_core::transform::wrap(
+        Box::new(stream),
+        transform.use_encryption,
+        transform.use_compression,
+        &transform.encryption_key,
+        true,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
     pipe::relay_counted(&mut conn, &mut stream, &env.traffic).await?;
     Ok(())
 }

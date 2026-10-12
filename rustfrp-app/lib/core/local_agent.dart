@@ -121,6 +121,8 @@ abstract interface class LocalAgentBackend {
   Future<List<String>> logs(LocalAgentConfig config);
   Future<List<Map<String, dynamic>>> tunnels(LocalAgentConfig config);
   Future<String> exportDiagnostics(LocalAgentConfig config);
+  Future<String> readConfig(LocalAgentConfig config);
+  Future<void> saveConfig(LocalAgentConfig config, String text);
   Future<void> start(LocalAgentConfig config, String enrollToken);
   Future<void> stop(LocalAgentConfig config);
 }
@@ -166,6 +168,8 @@ class LocalAgentState {
 class LocalAgentNotifier extends Notifier<LocalAgentState> {
   bool _working = false;
   bool _disposed = false;
+  bool _desiredRunning = false;
+  DateTime? _nextRestart;
   bool? _lastConnected;
   @override
   LocalAgentState build() {
@@ -204,11 +208,23 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
     final config = old.config;
     state = LocalAgentState(config: config, status: old.status, busy: true);
     try {
-      final status = await ref.read(localBackendProvider).status(config);
+      final backend = ref.read(localBackendProvider);
+      var status = await backend.status(config);
+      if (status == null &&
+          _desiredRunning &&
+          (_nextRestart == null || DateTime.now().isAfter(_nextRestart!))) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        if (!_disposed && _desiredRunning) {
+          await backend.start(config, '');
+          status = await backend.status(config);
+          _nextRestart = null;
+        }
+      }
       _recordConnection(status?.connected ?? false);
       if (!_disposed) state = LocalAgentState(config: config, status: status);
     } on Exception catch (e) {
       if (!_disposed) {
+        if (_desiredRunning) _nextRestart = DateTime.now().add(const Duration(seconds: 10));
         state = LocalAgentState(
           config: config,
           status: old.status,
@@ -250,6 +266,8 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
     try {
       await prefs.setString('local_agent', jsonEncode(config.toJson()));
       await backend.start(config, token);
+      _desiredRunning = true;
+      _nextRestart = null;
       final status = await backend.status(config);
       if (status == null) throw const FormatException('agent 已退出，请检查接入令牌或证书');
       _recordConnection(status.connected);
@@ -270,6 +288,8 @@ class LocalAgentNotifier extends Notifier<LocalAgentState> {
   Future<void> stop() async {
     if (_working) return;
     _working = true;
+    _desiredRunning = false;
+    _nextRestart = null;
     final old = state;
     state = LocalAgentState(config: old.config, status: old.status, busy: true);
     try {

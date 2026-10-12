@@ -376,6 +376,9 @@ fn node_from(r: &Row<'_>) -> rusqlite::Result<Node> {
         vhost_https: r
             .get::<_, Option<i64>>(6)?
             .and_then(|p| u16::try_from(p).ok()),
+        tcpmux_http_connect_port: r
+            .get::<_, Option<i64>>(15)?
+            .and_then(|p| u16::try_from(p).ok()),
         subdomain_host: r.get(7)?,
         allow_ports: serde_json::from_str(&ports).unwrap_or_default(),
         version: r.get(9)?,
@@ -387,7 +390,7 @@ fn node_from(r: &Row<'_>) -> rusqlite::Result<Node> {
         clients: r.get(14)?,
     })
 }
-const NODE_COLS: &str = "id, name, public_host, edge_port, tls_fingerprint, vhost_http, vhost_https, subdomain_host, allow_ports, version, os, created_at, last_seen_at, disabled_at, (SELECT COUNT(*) FROM clients c WHERE c.node_id = nodes.id AND c.deleted_at IS NULL)";
+const NODE_COLS: &str = "id, name, public_host, edge_port, tls_fingerprint, vhost_http, vhost_https, subdomain_host, allow_ports, version, os, created_at, last_seen_at, disabled_at, (SELECT COUNT(*) FROM clients c WHERE c.node_id = nodes.id AND c.deleted_at IS NULL), tcpmux_http_connect_port";
 
 /// 创建外置节点。
 pub fn create_node(
@@ -446,7 +449,8 @@ pub fn update_node_info(c: &Connection, id: &str, info: &NodeInfo, now: i64) -> 
     c.execute(
         "UPDATE nodes SET public_host = CASE WHEN ?2 = '' THEN public_host ELSE ?2 END,
                 edge_port = ?3, tls_fingerprint = ?4, vhost_http = ?5, vhost_https = ?6,
-                subdomain_host = ?7, allow_ports = ?8, version = ?9, os = ?10, last_seen_at = ?11
+                subdomain_host = ?7, allow_ports = ?8, version = ?9, os = ?10, last_seen_at = ?11,
+                tcpmux_http_connect_port = ?12
           WHERE id = ?1",
         params![
             id,
@@ -459,7 +463,8 @@ pub fn update_node_info(c: &Connection, id: &str, info: &NodeInfo, now: i64) -> 
             ports,
             info.version,
             info.os,
-            now
+            now,
+            info.tcpmux_http_connect_port.map(i64::from)
         ],
     )?;
     Ok(())
@@ -527,6 +532,104 @@ pub fn set_client_node(c: &Connection, client_id: &str, node_id: &str) -> Res<()
     Ok(())
 }
 
+/// 原子修改设备的 Edge，并保留 30 天的旧节点重定向快照。
+pub fn move_client_to_node(
+    c: &Connection,
+    client_id: &str,
+    node_id: &str,
+    target: &rustfrp_core::wire::EdgeRedirect,
+    now: i64,
+) -> Res<String> {
+    let client = get_client(c, client_id)?;
+    if client.node_id == node_id {
+        return Err(StoreError::Invalid(
+            "client is already assigned to this node".into(),
+        ));
+    }
+    if !node_id.is_empty() {
+        let node = get_node(c, node_id)?;
+        if node.disabled_at.is_some() {
+            return Err(StoreError::Conflict("destination node is disabled".into()));
+        }
+    }
+    let pin_ok = target.tls_fingerprint.len() == 64
+        && target
+            .tls_fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit());
+    if target.address.trim().is_empty()
+        || target.address.len() > 253
+        || target.address.chars().any(char::is_control)
+        || target.port == 0
+        || !pin_ok
+    {
+        return Err(StoreError::Invalid(
+            "destination edge endpoint or TLS fingerprint is invalid".into(),
+        ));
+    }
+    validate_visitor_node_dependencies(c, client_id, node_id)?;
+    let old = client.node_id;
+    c.execute(
+        "UPDATE clients SET previous_node_id = ?2, node_id = ?3, redirect_address = ?4,
+                redirect_port = ?5, redirect_tls_pin = ?6, redirect_expires_at = ?7
+         WHERE id = ?1",
+        params![
+            client_id,
+            old,
+            node_id,
+            target.address,
+            i64::from(target.port),
+            target.tls_fingerprint,
+            now.saturating_add(30 * 24 * 60 * 60 * 1000)
+        ],
+    )?;
+    bump_revision(c, client_id)?;
+    mark_client_tunnels_stopped(c, client_id)?;
+    Ok(old)
+}
+
+fn validate_visitor_node_dependencies(
+    c: &Connection,
+    client_id: &str,
+    destination_node: &str,
+) -> Res<()> {
+    let outbound: Option<(String, String)> = c
+        .query_row(
+            "SELECT v.name, target.node_id
+             FROM visitors v
+             JOIN tunnels t ON t.id = v.tunnel_id
+             JOIN clients target ON target.id = t.client_id
+             WHERE v.client_id = ?1 AND v.deleted_at IS NULL AND t.deleted_at IS NULL
+               AND target.node_id <> ?2 LIMIT 1",
+            params![client_id, destination_node],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((name, target_node)) = outbound {
+        return Err(StoreError::Invalid(format!(
+            "visitor [{name}] targets a tunnel on node [{target_node}]; remove or recreate it on the destination node before migration"
+        )));
+    }
+    let inbound: Option<(String, String)> = c
+        .query_row(
+            "SELECT v.name, owner.node_id
+             FROM visitors v
+             JOIN tunnels t ON t.id = v.tunnel_id
+             JOIN clients owner ON owner.id = v.client_id
+             WHERE t.client_id = ?1 AND v.deleted_at IS NULL AND t.deleted_at IS NULL
+               AND owner.node_id <> ?2 LIMIT 1",
+            params![client_id, destination_node],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((name, visitor_node)) = inbound {
+        return Err(StoreError::Invalid(format!(
+            "visitor [{name}] on node [{visitor_node}] depends on this client; remove or recreate it on the destination node before migration"
+        )));
+    }
+    Ok(())
+}
+
 /// 设备所属节点（包含已删除的设备，用于删除后通知节点）。
 pub fn client_node_id_any(c: &Connection, client_id: &str) -> Res<String> {
     Ok(c.query_row(
@@ -554,12 +657,44 @@ pub fn node_device(c: &Connection, client_id: &str) -> Res<NodeDevice> {
 /// 某节点应持有的全部设备（不含被停用的）。
 pub fn list_node_devices(c: &Connection, node_id: &str) -> Res<Vec<NodeDevice>> {
     let mut st = c.prepare(
-        "SELECT id FROM clients WHERE node_id = ?1 AND deleted_at IS NULL AND disabled_at IS NULL ORDER BY created_at",
+        "SELECT id, node_id FROM clients WHERE deleted_at IS NULL AND disabled_at IS NULL
+         AND (node_id = ?1 OR (previous_node_id = ?1 AND redirect_expires_at > ?2)) ORDER BY created_at",
     )?;
     let ids = st
-        .query_map([node_id], |r| r.get::<_, String>(0))?
+        .query_map(params![node_id, now_ms()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    ids.iter().map(|id| node_device(c, id)).collect()
+    ids.iter()
+        .map(|(id, assigned)| {
+            if assigned == node_id {
+                node_device(c, id)
+            } else {
+                node_redirect_device(c, id)
+            }
+        })
+        .collect()
+}
+
+fn node_redirect_device(c: &Connection, client_id: &str) -> Res<NodeDevice> {
+    let (address, port, tls_fingerprint, expires): (String, i64, String, i64) = c.query_row(
+        "SELECT redirect_address, redirect_port, redirect_tls_pin, redirect_expires_at
+         FROM clients WHERE id = ?1 AND deleted_at IS NULL",
+        [client_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    if expires <= now_ms() {
+        return Err(StoreError::NotFound);
+    }
+    let mut device = node_device(c, client_id)?;
+    device.config.proxies.clear();
+    device.config.visitors.clear();
+    device.config.redirect = Some(rustfrp_core::wire::EdgeRedirect {
+        address,
+        port: u16::try_from(port).unwrap_or(0),
+        tls_fingerprint,
+    });
+    Ok(device)
 }
 
 // ───────────── 客户端 ─────────────
@@ -579,10 +714,11 @@ fn client_from(r: &Row<'_>) -> rusqlite::Result<Client> {
         node_id: r.get(9)?,
         tags: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
         last_ip: r.get(11)?,
+        max_connections: usize::try_from(r.get::<_, i64>(12)?).unwrap_or(0),
     })
 }
 const CLIENT_COLS: &str =
-    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at, node_id, tags, last_ip";
+    "id, name, os, arch, version, revision, created_at, last_seen_at, disabled_at, node_id, tags, last_ip, max_connections";
 
 /// 创建设备。
 #[allow(clippy::too_many_arguments)]
@@ -621,7 +757,7 @@ pub fn get_client_with_key(c: &Connection, id: &str) -> Res<(Client, String)> {
     Ok(c.query_row(
         &format!("SELECT {CLIENT_COLS}, pubkey FROM clients WHERE id = ?1 AND deleted_at IS NULL"),
         [id],
-        |r| Ok((client_from(r)?, r.get(12)?)),
+        |r| Ok((client_from(r)?, r.get(13)?)),
     )?)
 }
 
@@ -659,6 +795,49 @@ pub fn update_client(
         )?;
     }
     get_client(c, id)
+}
+
+/// 设置设备共享并发流 / UDP 活跃源地址上限；0 = 不限。
+pub fn set_client_max_connections(c: &Connection, id: &str, max: usize) -> Res<Client> {
+    if max > 1_000_000 {
+        return Err(StoreError::Invalid(
+            "max_connections must be in 0..=1000000".into(),
+        ));
+    }
+    let client = get_client(c, id)?;
+    c.execute(
+        "UPDATE clients SET max_connections = ?2 WHERE id = ?1",
+        params![id, i64::try_from(max).unwrap_or(0)],
+    )?;
+    if client.max_connections != max {
+        bump_revision(c, id)?;
+    }
+    get_client(c, id)
+}
+
+/// 给在线设备排队一个签名 Release 更新命令。
+pub fn request_client_update(c: &Connection, id: &str, version: &str) -> Res<(i64, String)> {
+    let version = version.trim();
+    if version.len() > 64
+        || version.strip_prefix('v').is_none_or(|v| v.is_empty())
+        || version
+            .chars()
+            .any(|x| !(x.is_ascii_alphanumeric() || ".-_".contains(x)))
+    {
+        return Err(StoreError::Invalid(
+            "update version must be a release tag such as v1.2.3".into(),
+        ));
+    }
+    get_client(c, id)?;
+    c.execute(
+        "UPDATE clients SET update_seq = update_seq + 1, update_version = ?2 WHERE id = ?1",
+        params![id, version],
+    )?;
+    bump_revision(c, id)?;
+    let seq = c.query_row("SELECT update_seq FROM clients WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })?;
+    Ok((seq, version.to_string()))
 }
 
 /// 软删除设备及其全部隧道。
@@ -790,6 +969,14 @@ pub struct NewTunnel {
     pub bandwidth_bps: u64,
     /// 限速由服务端执行。
     pub bandwidth_server: bool,
+    /// 每隧道并发流或 UDP 活跃源地址上限；0 = 不限。
+    pub max_connections: usize,
+    /// TCPMUX 复用器名称。
+    pub multiplexer: String,
+    /// 代理工作流附加加密。
+    pub use_encryption: bool,
+    /// 代理工作流压缩。
+    pub use_compression: bool,
     /// 负载均衡组与健康检查。
     pub lb: LbOpts,
     /// Agent 本地插件配置。
@@ -833,6 +1020,14 @@ pub struct TunnelPatch {
     pub bandwidth_bps: Option<u64>,
     /// 限速位置。
     pub bandwidth_server: Option<bool>,
+    /// 每隧道并发流或 UDP 活跃源地址上限；0 = 不限。
+    pub max_connections: Option<usize>,
+    /// TCPMUX 复用器名称。
+    pub multiplexer: Option<String>,
+    /// 代理工作流附加加密。
+    pub use_encryption: Option<bool>,
+    /// 代理工作流压缩。
+    pub use_compression: Option<bool>,
     /// 负载均衡组名（`Some("")` 退出组）。
     pub lb_group: Option<String>,
     /// 组密钥（`Some("")` 清除，`None` 保持）。
@@ -892,10 +1087,33 @@ fn store_lb(o: &LbOpts) -> String {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct RuntimeOpts {
+    max_connections: usize,
+    multiplexer: String,
+    use_encryption: bool,
+    use_compression: bool,
+}
+
+fn parse_runtime(raw: &str) -> RuntimeOpts {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn store_runtime(o: &RuntimeOpts) -> String {
+    if o.max_connections == 0 && o.multiplexer.is_empty() && !o.use_encryption && !o.use_compression
+    {
+        String::new()
+    } else {
+        serde_json::to_string(o).unwrap_or_default()
+    }
+}
+
 fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
     let opts = parse_opts(&r.get::<_, String>(16)?);
     let lb = parse_lb(&r.get::<_, String>(20)?);
     let plugin = parse_plugin(&r.get::<_, String>(21)?);
+    let runtime = parse_runtime(&r.get::<_, String>(22)?);
     Ok(Tunnel {
         id: r.get(0)?,
         client_id: r.get(1)?,
@@ -922,13 +1140,17 @@ fn tunnel_from(r: &Row<'_>) -> rusqlite::Result<Tunnel> {
         proxy_protocol: u8::try_from(r.get::<_, i64>(17)?).unwrap_or(0),
         bandwidth_bps: u64::try_from(r.get::<_, i64>(18)?).unwrap_or(0),
         bandwidth_server: r.get::<_, i64>(19)? != 0,
+        max_connections: runtime.max_connections,
+        multiplexer: runtime.multiplexer,
+        use_encryption: runtime.use_encryption,
+        use_compression: runtime.use_compression,
         lb_group: lb.group,
         lb_group_key_set: !lb.group_key.is_empty(),
         health_check: lb.health,
         plugin: plugin_summary(plugin),
     })
 }
-const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts";
+const TUNNEL_COLS: &str = "id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, status_state, status_port, status_error, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts, runtime_opts";
 
 fn check_port(v: i64, what: &str, allow_zero: bool) -> Res<()> {
     let lo = i64::from(!allow_zero);
@@ -950,7 +1172,7 @@ fn check_host(h: &str) -> Res<()> {
     Ok(())
 }
 
-const KINDS: &[&str] = &["tcp", "udp", "http", "https", "stcp", "sudp"];
+const KINDS: &[&str] = &["tcp", "udp", "http", "https", "tcpmux", "stcp", "sudp"];
 
 fn is_secret(kind: &str) -> bool {
     kind == "stcp" || kind == "sudp"
@@ -958,6 +1180,10 @@ fn is_secret(kind: &str) -> bool {
 
 fn is_web(kind: &str) -> bool {
     kind == "http" || kind == "https"
+}
+
+fn is_domain(kind: &str) -> bool {
+    is_web(kind) || kind == "tcpmux"
 }
 
 fn split_domains(s: &str) -> Vec<String> {
@@ -1027,7 +1253,7 @@ fn ensure_remote_port_free(
     lb: &LbOpts,
     except_id: Option<&str>,
 ) -> Res<()> {
-    if is_web(kind) {
+    if is_domain(kind) {
         return Ok(());
     }
     let mut st = c.prepare(
@@ -1073,7 +1299,7 @@ fn ensure_domains_free(
     lb: &LbOpts,
     except_id: Option<&str>,
 ) -> Res<()> {
-    if !is_web(kind) {
+    if !is_domain(kind) {
         return Ok(());
     }
     let mut st = c.prepare(
@@ -1339,6 +1565,7 @@ struct Checked {
     proxy_protocol: u8,
     bandwidth_bps: u64,
     bandwidth_server: bool,
+    runtime: RuntimeOpts,
     lb: LbOpts,
     plugin: Option<rustfrp_core::wire::PluginOpts>,
 }
@@ -1352,9 +1579,29 @@ fn check_tunnel(
     check_name(&t.name, "name")?;
     if !KINDS.contains(&t.kind.as_str()) {
         return Err(StoreError::Invalid(format!(
-            "tunnel type \"{}\" is not supported yet, supported: tcp, udp, http, https, stcp, sudp",
+            "tunnel type \"{}\" is not supported yet, supported: tcp, udp, http, https, tcpmux, stcp, sudp",
             t.kind
         )));
+    }
+    if t.runtime.max_connections > 1_000_000 {
+        return Err(StoreError::Invalid(
+            "max_connections must be in 0..=1000000".into(),
+        ));
+    }
+    if !matches!(t.runtime.multiplexer.as_str(), "" | "httpconnect")
+        || (t.kind == "tcpmux" && t.runtime.multiplexer != "httpconnect")
+        || (t.kind != "tcpmux" && !t.runtime.multiplexer.is_empty())
+    {
+        return Err(StoreError::Invalid(
+            "tcpmux supports only multiplexer=httpconnect".into(),
+        ));
+    }
+    if (t.kind == "udp" || t.kind == "sudp")
+        && (t.runtime.use_encryption || t.runtime.use_compression)
+    {
+        return Err(StoreError::Invalid(
+            "useEncryption and useCompression apply only to TCP streams".into(),
+        ));
     }
     check_host(&t.local_ip)?;
     check_port(t.local_port, "local_port", false)?;
@@ -1381,20 +1628,27 @@ fn check_tunnel(
             "stcp / sudp tunnels have no public port; remote_port must be 0".into(),
         ));
     }
-    if is_web(&t.kind) {
+    if is_domain(&t.kind) {
         if domains.is_empty() && t.subdomain.is_empty() {
             return Err(StoreError::Invalid(
-                "http / https tunnels need a custom domain or a subdomain".into(),
+                "http / https / tcpmux tunnels need a custom domain or a subdomain".into(),
             ));
         }
         if t.remote_port != 0 {
-            return Err(StoreError::Invalid(
-                "http / https tunnels use the vhost port; remote_port must be 0".into(),
-            ));
+            return Err(StoreError::Invalid(if t.kind == "tcpmux" {
+                "tcpmux tunnels use a shared listener; remote_port must be 0".into()
+            } else {
+                "http / https tunnels use the vhost port; remote_port must be 0".into()
+            }));
         }
         if t.kind == "https" && !t.rewrite.is_empty() {
             return Err(StoreError::Invalid(
                 "host_header_rewrite only applies to http tunnels".into(),
+            ));
+        }
+        if t.kind == "tcpmux" && !t.rewrite.is_empty() {
+            return Err(StoreError::Invalid(
+                "host_header_rewrite does not apply to tcpmux tunnels".into(),
             ));
         }
     } else if !domains.is_empty() || !t.subdomain.is_empty() || !t.rewrite.is_empty() {
@@ -1403,6 +1657,11 @@ fn check_tunnel(
         ));
     }
     let lb = check_lb(&t.kind, t.lb.clone())?;
+    if t.kind == "tcpmux" && (!lb.group.is_empty() || lb.health.is_some()) {
+        return Err(StoreError::Invalid(
+            "tcpmux does not support load-balancer groups or health checks".into(),
+        ));
+    }
     let plugin = check_plugin(&t.kind, t.plugin.clone())?;
     if plugin.is_some() && t.proxy_protocol != 0 {
         return Err(StoreError::Invalid(
@@ -1456,6 +1715,12 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
             proxy_protocol: t.proxy_protocol,
             bandwidth_bps: t.bandwidth_bps,
             bandwidth_server: t.bandwidth_server,
+            runtime: RuntimeOpts {
+                max_connections: t.max_connections,
+                multiplexer: t.multiplexer.clone(),
+                use_encryption: t.use_encryption,
+                use_compression: t.use_compression,
+            },
             lb: t.lb.clone(),
             plugin: t.plugin.clone(),
         },
@@ -1464,9 +1729,9 @@ pub fn create_tunnel(c: &Connection, t: &NewTunnel, now: i64) -> Res<Tunnel> {
     )?;
     let id = new_id();
     c.execute(
-        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts, secret_key)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin), if is_secret(&k.kind) { random_id() } else { String::new() }],
+        "INSERT INTO tunnels (id, client_id, name, kind, local_ip, local_port, remote_port, enabled, created_at, updated_at, custom_domains, subdomain, host_header_rewrite, http_opts, proxy_protocol, bandwidth_bps, bandwidth_server, lb_opts, plugin_opts, secret_key, runtime_opts)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        params![id, t.client_id, k.name.trim(), k.kind, k.local_ip, k.local_port, k.remote_port, i64::from(t.enabled), now, k.domains.join(","), k.subdomain, k.rewrite, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin), if is_secret(&k.kind) { random_id() } else { String::new() }, store_runtime(&k.runtime)],
     )?;
     bump_revision(c, &t.client_id)?;
     get_tunnel(c, &id)
@@ -1542,6 +1807,15 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             .unwrap_or_else(|| cur_opts.response_headers.clone()),
     };
     let cur_lb = tunnel_lb(c, id)?;
+    let runtime = RuntimeOpts {
+        max_connections: p.max_connections.unwrap_or(cur.max_connections),
+        multiplexer: p
+            .multiplexer
+            .clone()
+            .unwrap_or_else(|| cur.multiplexer.clone()),
+        use_encryption: p.use_encryption.unwrap_or(cur.use_encryption),
+        use_compression: p.use_compression.unwrap_or(cur.use_compression),
+    };
     let plugin = p.plugin.clone().or_else(|| cur_plugin.clone());
     let new_lb = LbOpts {
         group: p.lb_group.clone().unwrap_or_else(|| cur_lb.group.clone()),
@@ -1580,6 +1854,7 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
             proxy_protocol: p.proxy_protocol.unwrap_or(cur.proxy_protocol),
             bandwidth_bps: p.bandwidth_bps.unwrap_or(cur.bandwidth_bps),
             bandwidth_server: p.bandwidth_server.unwrap_or(cur.bandwidth_server),
+            runtime: runtime.clone(),
             lb: new_lb,
             plugin,
         },
@@ -1591,6 +1866,10 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
         || k.proxy_protocol != cur.proxy_protocol
         || k.bandwidth_bps != cur.bandwidth_bps
         || k.bandwidth_server != cur.bandwidth_server
+        || k.runtime.max_connections != cur.max_connections
+        || k.runtime.multiplexer != cur.multiplexer
+        || k.runtime.use_encryption != cur.use_encryption
+        || k.runtime.use_compression != cur.use_compression
         || k.lb != cur_lb
         || k.plugin != cur_plugin
         || k.local_ip != cur.local_ip
@@ -1602,8 +1881,8 @@ pub fn update_tunnel(c: &Connection, id: &str, p: &TunnelPatch, now: i64) -> Res
     // 仅数据面配置变化时等待 Edge 回报；重复启停和改显示名保留实际状态。
     c.execute(
         "UPDATE tunnels SET name=?2, local_ip=?3, local_port=?4, remote_port=?5, enabled=?6, updated_at=?7, status_state=CASE WHEN ?11 THEN 'pending' ELSE status_state END, status_error=CASE WHEN ?11 THEN '' ELSE status_error END,
-                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15, lb_opts=?16, plugin_opts=?17 WHERE id=?1",
-        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin)],
+                custom_domains=?8, subdomain=?9, host_header_rewrite=?10, http_opts=?12, proxy_protocol=?13, bandwidth_bps=?14, bandwidth_server=?15, lb_opts=?16, plugin_opts=?17, runtime_opts=?18 WHERE id=?1",
+        params![id, k.name.trim(), k.local_ip, k.local_port, k.remote_port, i64::from(enabled), now, k.domains.join(","), k.subdomain, k.rewrite, runtime_changed, store_opts(&k.http), i64::from(k.proxy_protocol), i64::try_from(k.bandwidth_bps).unwrap_or(0), i64::from(k.bandwidth_server), store_lb(&k.lb), store_plugin(&k.plugin), store_runtime(&k.runtime)],
     )?;
     bump_revision(c, &cur.client_id)?;
     // 访问者只在目标隧道启用时才下发：启停会改变它们所在设备的配置。
@@ -1824,6 +2103,8 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
                 sk: secrets.get(&t.id).cloned().unwrap_or_default(),
                 bind_addr: v.bind_addr,
                 bind_port: v.bind_port,
+                use_encryption: v.use_encryption,
+                use_compression: v.use_compression,
             })
         })
         .collect();
@@ -1840,6 +2121,10 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
                     allow_users: vec![],
                 },
                 plugin,
+                max_connections: t.max_connections,
+                multiplexer: t.multiplexer,
+                use_encryption: t.use_encryption,
+                use_compression: t.use_compression,
                 proxy_protocol: t.proxy_protocol,
                 bandwidth_bps: t.bandwidth_bps,
                 bandwidth_server: t.bandwidth_server,
@@ -1854,13 +2139,17 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
             }
         })
         .collect();
-    let restart_seq: i64 = c.query_row(
-        "SELECT restart_seq FROM clients WHERE id = ?1",
+    let (restart_seq, update_seq, update_version): (i64, i64, String) = c.query_row(
+        "SELECT restart_seq, update_seq, update_version FROM clients WHERE id = ?1",
         [client_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     Ok(ConfigSet {
         restart_seq: u64::try_from(restart_seq).unwrap_or(0),
+        update_seq: u64::try_from(update_seq).unwrap_or(0),
+        update_version,
+        max_connections: client.max_connections,
+        redirect: None,
         revision: client.revision as u64,
         proxies,
         visitors,
@@ -1870,7 +2159,7 @@ pub fn managed_config(c: &Connection, client_id: &str) -> Res<ConfigSet> {
 // ───────────── 访问者 ─────────────
 
 const VISITOR_COLS: &str =
-    "id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at";
+    "id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at, use_encryption, use_compression";
 
 fn visitor_from(r: &Row<'_>) -> rusqlite::Result<Visitor> {
     Ok(Visitor {
@@ -1883,6 +2172,8 @@ fn visitor_from(r: &Row<'_>) -> rusqlite::Result<Visitor> {
         enabled: r.get::<_, i64>(6)? != 0,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
+        use_encryption: r.get::<_, i64>(9)? != 0,
+        use_compression: r.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -1901,6 +2192,10 @@ pub struct NewVisitor {
     pub bind_port: i64,
     /// 是否启用。
     pub enabled: bool,
+    /// 访问者工作流加密。
+    pub use_encryption: bool,
+    /// 访问者工作流压缩。
+    pub use_compression: bool,
 }
 
 /// 修改访问者的参数（`None` 表示不改）。
@@ -1916,6 +2211,10 @@ pub struct VisitorPatch {
     pub bind_port: Option<i64>,
     /// 是否启用。
     pub enabled: Option<bool>,
+    /// 访问者工作流加密。
+    pub use_encryption: Option<bool>,
+    /// 访问者工作流压缩。
+    pub use_compression: Option<bool>,
 }
 
 /// 取访问者。
@@ -1991,9 +2290,9 @@ pub fn create_visitor(c: &Connection, v: &NewVisitor, now: i64) -> Res<Visitor> 
     let bind_addr = check_visitor(c, &v.client_id, v, None)?;
     let id = new_id();
     c.execute(
-        "INSERT INTO visitors (id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
-        params![id, v.client_id, v.name.trim(), v.tunnel_id, bind_addr, v.bind_port, i64::from(v.enabled), now],
+        "INSERT INTO visitors (id, client_id, name, tunnel_id, bind_addr, bind_port, enabled, created_at, updated_at, use_encryption, use_compression)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)",
+        params![id, v.client_id, v.name.trim(), v.tunnel_id, bind_addr, v.bind_port, i64::from(v.enabled), now, i64::from(v.use_encryption), i64::from(v.use_compression)],
     )?;
     bump_revision(c, &v.client_id)?;
     get_visitor(c, &id)
@@ -2009,11 +2308,13 @@ pub fn update_visitor(c: &Connection, id: &str, p: &VisitorPatch, now: i64) -> R
         bind_addr: p.bind_addr.clone().unwrap_or_else(|| cur.bind_addr.clone()),
         bind_port: p.bind_port.unwrap_or(i64::from(cur.bind_port)),
         enabled: p.enabled.unwrap_or(cur.enabled),
+        use_encryption: p.use_encryption.unwrap_or(cur.use_encryption),
+        use_compression: p.use_compression.unwrap_or(cur.use_compression),
     };
     let bind_addr = check_visitor(c, &cur.client_id, &next, Some(id))?;
     c.execute(
-        "UPDATE visitors SET name=?2, tunnel_id=?3, bind_addr=?4, bind_port=?5, enabled=?6, updated_at=?7 WHERE id=?1",
-        params![id, next.name.trim(), next.tunnel_id, bind_addr, next.bind_port, i64::from(next.enabled), now],
+        "UPDATE visitors SET name=?2, tunnel_id=?3, bind_addr=?4, bind_port=?5, enabled=?6, updated_at=?7, use_encryption=?8, use_compression=?9 WHERE id=?1",
+        params![id, next.name.trim(), next.tunnel_id, bind_addr, next.bind_port, i64::from(next.enabled), now, i64::from(next.use_encryption), i64::from(next.use_compression)],
     )?;
     bump_revision(c, &cur.client_id)?;
     get_visitor(c, id)
@@ -2415,6 +2716,7 @@ mod tests {
             tls_fingerprint: "f".repeat(64),
             vhost_http: Some(80),
             vhost_https: None,
+            tcpmux_http_connect_port: None,
             subdomain_host: "t.example.com".into(),
             allow_ports: vec![(6000, 6100)],
             version: "0.1".into(),
@@ -2559,6 +2861,160 @@ mod tests {
         assert!(matches!(
             delete_node(&c, "n1", 41),
             Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn migrating_client_clears_old_node_tunnels_and_retains_redirect() {
+        let c = conn();
+        let device = client(&c, "moving");
+        let public_key = "cd".repeat(32);
+        for (id, host) in [("old", "old.edge.test"), ("new", "new.edge.test")] {
+            create_node(
+                &c,
+                id,
+                id,
+                &public_key,
+                &NodeInfo {
+                    public_host: host.into(),
+                    edge_port: 7443,
+                    tls_fingerprint: "ab".repeat(32),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        }
+        create_node(
+            &c,
+            "disabled",
+            "disabled",
+            &public_key,
+            &NodeInfo {
+                public_host: "disabled.edge.test".into(),
+                edge_port: 7443,
+                tls_fingerprint: "ab".repeat(32),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        update_node(&c, "disabled", None, Some(true), 10).unwrap();
+        set_client_node(&c, &device.id, "old").unwrap();
+        let mut source = nt(&device.id, "ssh", 0);
+        source.kind = "stcp".into();
+        let tunnel = create_tunnel(&c, &source, 11).unwrap();
+        let target = rustfrp_core::wire::EdgeRedirect {
+            address: "new.edge.test".into(),
+            port: 7443,
+            tls_fingerprint: "ab".repeat(32),
+        };
+        let visitor_client = client(&c, "visitor-client");
+        set_client_node(&c, &visitor_client.id, "old").unwrap();
+        let mut remote = nt(&visitor_client.id, "remote", 0);
+        remote.kind = "stcp".into();
+        let remote = create_tunnel(&c, &remote, 12).unwrap();
+        let inbound = create_visitor(
+            &c,
+            &NewVisitor {
+                client_id: visitor_client.id.clone(),
+                name: "inbound".into(),
+                tunnel_id: tunnel.id.clone(),
+                enabled: true,
+                ..Default::default()
+            },
+            13,
+        )
+        .unwrap();
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "new", &target, 14),
+            Err(StoreError::Invalid(message)) if message.contains("depends on this client")
+        ));
+        delete_visitor(&c, &inbound.id, 15).unwrap();
+        let outbound = create_visitor(
+            &c,
+            &NewVisitor {
+                client_id: device.id.clone(),
+                name: "outbound".into(),
+                tunnel_id: remote.id.clone(),
+                enabled: true,
+                ..Default::default()
+            },
+            16,
+        )
+        .unwrap();
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "new", &target, 17),
+            Err(StoreError::Invalid(message)) if message.contains("targets a tunnel")
+        ));
+        delete_visitor(&c, &outbound.id, 18).unwrap();
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "old", &target, 19),
+            Err(StoreError::Invalid(message)) if message.contains("already assigned")
+        ));
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "disabled", &target, 19),
+            Err(StoreError::Conflict(message)) if message.contains("disabled")
+        ));
+        let invalid_target = rustfrp_core::wire::EdgeRedirect {
+            address: String::new(),
+            ..target.clone()
+        };
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "new", &invalid_target, 20),
+            Err(StoreError::Invalid(message)) if message.contains("endpoint")
+        ));
+        for bad_target in [
+            rustfrp_core::wire::EdgeRedirect {
+                address: "x".repeat(254),
+                ..target.clone()
+            },
+            rustfrp_core::wire::EdgeRedirect {
+                address: "edge\nhost".into(),
+                ..target.clone()
+            },
+            rustfrp_core::wire::EdgeRedirect {
+                port: 0,
+                ..target.clone()
+            },
+            rustfrp_core::wire::EdgeRedirect {
+                tls_fingerprint: "zz".repeat(32),
+                ..target.clone()
+            },
+            rustfrp_core::wire::EdgeRedirect {
+                tls_fingerprint: "ab".repeat(31),
+                ..target.clone()
+            },
+        ] {
+            assert!(matches!(
+                move_client_to_node(&c, &device.id, "new", &bad_target, 20),
+                Err(StoreError::Invalid(message)) if message.contains("endpoint")
+            ));
+        }
+        let migrated_at = now_ms();
+        assert_eq!(
+            move_client_to_node(&c, &device.id, "new", &target, migrated_at).unwrap(),
+            "old"
+        );
+        let old = list_node_devices(&c, "old").unwrap();
+        assert_eq!(
+            old.len(),
+            2,
+            "the redirect and the unrelated visitor device stay on the old node"
+        );
+        let redirected = old.iter().find(|entry| entry.id == device.id).unwrap();
+        assert!(redirected.config.proxies.is_empty());
+        assert_eq!(redirected.config.redirect.as_ref(), Some(&target));
+        let new = list_node_devices(&c, "new").unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(
+            new[0].config.proxies.first().map(|p| p.name.as_str()),
+            Some(tunnel.id.as_str())
+        );
+        assert!(new[0].config.redirect.is_none());
+        assert!(matches!(
+            move_client_to_node(&c, &device.id, "new", &target, migrated_at + 1),
+            Err(StoreError::Invalid(_))
         ));
     }
 
@@ -2937,6 +3393,7 @@ mod tests {
             tls_fingerprint: "f".repeat(64),
             vhost_http: None,
             vhost_https: None,
+            tcpmux_http_connect_port: None,
             subdomain_host: String::new(),
             allow_ports: vec![],
             version: "0.1".into(),
@@ -2949,6 +3406,8 @@ mod tests {
             name: "v".into(),
             tunnel_id: tunnel.id.clone(),
             enabled: true,
+            use_encryption: true,
+            use_compression: true,
             ..Default::default()
         };
         assert!(
@@ -2956,7 +3415,23 @@ mod tests {
         );
         // 同一节点后可以创建。
         set_client_node(&c, &a.id, "n1").unwrap();
-        create_visitor(&c, &v, 7).unwrap();
+        let created_visitor = create_visitor(&c, &v, 7).unwrap();
+        assert!(created_visitor.use_encryption && created_visitor.use_compression);
+        let config = managed_config(&c, &b.id).unwrap();
+        assert_eq!(config.visitors.len(), 1);
+        assert!(config.visitors[0].use_encryption && config.visitors[0].use_compression);
+        let patched = update_visitor(
+            &c,
+            &created_visitor.id,
+            &VisitorPatch {
+                use_encryption: Some(false),
+                use_compression: Some(false),
+                ..Default::default()
+            },
+            8,
+        )
+        .unwrap();
+        assert!(!patched.use_encryption && !patched.use_compression);
 
         // 健康检查：先配、再整体替换成另一种。
         let mut hc = nt(&a.id, "hc", 6000);
@@ -3037,6 +3512,59 @@ mod tests {
             request_client_restart(&c, "nope"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn client_connection_limits_and_update_versions_are_bounded() {
+        let c = conn();
+        let a = client(&c, "updates");
+        let original = a.revision;
+        let limited = set_client_max_connections(&c, &a.id, 24).unwrap();
+        assert_eq!(limited.max_connections, 24);
+        assert_eq!(limited.revision, original + 1);
+        let unchanged = set_client_max_connections(&c, &a.id, 24).unwrap();
+        assert_eq!(unchanged.revision, limited.revision);
+        assert!(matches!(
+            set_client_max_connections(&c, &a.id, 1_000_001),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            set_client_max_connections(&c, "missing", 1),
+            Err(StoreError::NotFound)
+        ));
+
+        for invalid in [
+            "",
+            "1.2.3",
+            "v",
+            "v1.2.3+build",
+            &format!("v{}", "1".repeat(64)),
+        ] {
+            assert!(
+                matches!(
+                    request_client_update(&c, &a.id, invalid),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            request_client_update(&c, &a.id, " v1.2.3 ").unwrap(),
+            (1, "v1.2.3".into())
+        );
+        assert!(matches!(
+            request_client_update(&c, "missing", "v1.2.3"),
+            Err(StoreError::NotFound)
+        ));
+        let config = managed_config(&c, &a.id).unwrap();
+        assert_eq!(
+            (
+                config.max_connections,
+                config.update_seq,
+                config.update_version.as_str()
+            ),
+            (24, 1, "v1.2.3")
+        );
     }
 
     #[test]
@@ -3121,6 +3649,10 @@ mod tests {
             proxy_protocol: 0,
             bandwidth_bps: 0,
             bandwidth_server: false,
+            max_connections: 0,
+            multiplexer: String::new(),
+            use_encryption: false,
+            use_compression: false,
             lb: Default::default(),
             plugin: None,
         };
@@ -3408,6 +3940,101 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_runtime_limits_transforms_and_tcpmux_options_are_validated() {
+        let c = conn();
+        let a = client(&c, "runtime-options");
+
+        let mut excessive = nt(&a.id, "excessive", 0);
+        excessive.max_connections = 1_000_001;
+        assert!(matches!(
+            create_tunnel(&c, &excessive, 1),
+            Err(StoreError::Invalid(message)) if message.contains("max_connections")
+        ));
+
+        let mut encrypted_udp = nt(&a.id, "encrypted-udp", 53);
+        encrypted_udp.kind = "udp".into();
+        encrypted_udp.use_encryption = true;
+        assert!(matches!(
+            create_tunnel(&c, &encrypted_udp, 1),
+            Err(StoreError::Invalid(message)) if message.contains("only to TCP streams")
+        ));
+        encrypted_udp.use_encryption = false;
+        encrypted_udp.use_compression = true;
+        assert!(matches!(
+            create_tunnel(&c, &encrypted_udp, 1),
+            Err(StoreError::Invalid(message)) if message.contains("only to TCP streams")
+        ));
+
+        let mut bad_mux = nt(&a.id, "bad-mux", 0);
+        bad_mux.multiplexer = "kcp".into();
+        assert!(matches!(
+            create_tunnel(&c, &bad_mux, 1),
+            Err(StoreError::Invalid(message)) if message.contains("httpconnect")
+        ));
+        let mut missing_mux = nt(&a.id, "missing-mux", 0);
+        missing_mux.kind = "tcpmux".into();
+        missing_mux.custom_domains = vec!["mux.example.test".into()];
+        assert!(matches!(
+            create_tunnel(&c, &missing_mux, 1),
+            Err(StoreError::Invalid(message)) if message.contains("httpconnect")
+        ));
+
+        let mut mux_port = missing_mux.clone();
+        mux_port.name = "mux-port".into();
+        mux_port.multiplexer = "httpconnect".into();
+        mux_port.remote_port = 7000;
+        assert!(matches!(
+            create_tunnel(&c, &mux_port, 1),
+            Err(StoreError::Invalid(message)) if message.contains("shared listener")
+        ));
+
+        let mut encrypted_sudp = nt(&a.id, "encrypted-sudp", 0);
+        encrypted_sudp.kind = "sudp".into();
+        encrypted_sudp.use_compression = true;
+        assert!(matches!(
+            create_tunnel(&c, &encrypted_sudp, 1),
+            Err(StoreError::Invalid(message)) if message.contains("only to TCP streams")
+        ));
+
+        let mut limited_udp = nt(&a.id, "limited-udp", 53);
+        limited_udp.kind = "udp".into();
+        limited_udp.bandwidth_bps = 1;
+        assert!(matches!(
+            create_tunnel(&c, &limited_udp, 1),
+            Err(StoreError::Invalid(message)) if message.contains("does not apply to udp")
+        ));
+        let mut excessive_bandwidth = nt(&a.id, "excessive-bandwidth", 0);
+        excessive_bandwidth.bandwidth_bps = MAX_BANDWIDTH + 1;
+        assert!(matches!(
+            create_tunnel(&c, &excessive_bandwidth, 1),
+            Err(StoreError::Invalid(message)) if message.contains("1 TiB/s")
+        ));
+
+        let mut invalid_protocol = nt(&a.id, "invalid-protocol", 6000);
+        invalid_protocol.proxy_protocol = 3;
+        assert!(matches!(
+            create_tunnel(&c, &invalid_protocol, 1),
+            Err(StoreError::Invalid(message)) if message.contains("proxy_protocol")
+        ));
+
+        let mut secret_port = nt(&a.id, "secret-port", 1);
+        secret_port.kind = "stcp".into();
+        assert!(matches!(
+            create_tunnel(&c, &secret_port, 1),
+            Err(StoreError::Invalid(message)) if message.contains("remote_port must be 0")
+        ));
+
+        let mut https_rewrite = nt(&a.id, "https-rewrite", 0);
+        https_rewrite.kind = "https".into();
+        https_rewrite.custom_domains = vec!["secure.example.test".into()];
+        https_rewrite.host_header_rewrite = "internal.example.test".into();
+        assert!(matches!(
+            create_tunnel(&c, &https_rewrite, 1),
+            Err(StoreError::Invalid(message)) if message.contains("only applies to http")
+        ));
+    }
+
+    #[test]
     fn udp_and_web_tunnels() {
         let c = conn();
         let a = client(&c, "a");
@@ -3415,13 +4042,21 @@ mod tests {
         create_tunnel(&c, &nt(&a.id, "tcp53", 5353), 1).unwrap();
         let mut udp = nt(&a.id, "udp53", 5353);
         udp.kind = "udp".into();
+        udp.max_connections = 3;
         let u = create_tunnel(&c, &udp, 1).unwrap();
-        assert_eq!((u.kind.as_str(), u.remote_port), ("udp", 5353));
+        assert_eq!(
+            (u.kind.as_str(), u.remote_port, u.max_connections),
+            ("udp", 5353, 3)
+        );
         let mut udp2 = nt(&a.id, "udp53b", 5353);
         udp2.kind = "udp".into();
         assert!(
             matches!(create_tunnel(&c, &udp2, 1), Err(StoreError::Conflict(m)) if m.contains("udp tunnel"))
         );
+        let mut sudp = nt(&a.id, "sudp", 0);
+        sudp.kind = "sudp".into();
+        sudp.max_connections = 2;
+        assert_eq!(create_tunnel(&c, &sudp, 2).unwrap().max_connections, 2);
 
         let web = |name: &str, domains: &[&str], sub: &str| NewTunnel {
             client_id: a.id.clone(),
@@ -3438,6 +4073,10 @@ mod tests {
             proxy_protocol: 0,
             bandwidth_bps: 0,
             bandwidth_server: false,
+            max_connections: 0,
+            multiplexer: String::new(),
+            use_encryption: false,
+            use_compression: false,
             lb: Default::default(),
             plugin: None,
         };

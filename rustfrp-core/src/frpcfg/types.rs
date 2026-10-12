@@ -662,6 +662,9 @@ pub struct Proxy {
     /// tcpmux 复用器。
     #[serde(skip_serializing_if = "is_empty_str")]
     pub multiplexer: String,
+    /// RustFRP 扩展：流隧道最大并发连接或 UDP 最大活跃源地址数，0 = 不限。
+    #[serde(rename = "maxConnections", skip_serializing_if = "is_zero")]
+    pub max_connections: i64,
     /// stcp/xtcp/sudp 密钥。
     #[serde(rename = "secretKey", skip_serializing_if = "is_empty_str")]
     pub secret_key: String,
@@ -885,6 +888,9 @@ pub struct ServerConfig {
     /// tcpmux 透传。
     #[serde(rename = "tcpmuxPassthrough", skip_serializing_if = "is_false")]
     pub tcpmux_passthrough: bool,
+    /// RustFRP 扩展：单设备的并发 TCP 连接上限，0 = 不限。
+    #[serde(rename = "maxConnectionsPerClient", skip_serializing_if = "is_zero")]
+    pub max_connections_per_client: i64,
     /// 子域名后缀。
     #[serde(rename = "subDomainHost", skip_serializing_if = "is_empty_str")]
     pub sub_domain_host: String,

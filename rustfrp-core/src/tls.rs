@@ -171,11 +171,46 @@ pub fn app_server_config(id: Identity) -> Result<Arc<ServerConfig>, TunnelError>
 
 /// 应用层（本地插件）客户端配置：不校验证书（与 frp 插件的 `InsecureSkipVerify` 一致），TLS 1.2 / 1.3。
 pub fn app_client_config() -> Result<Arc<ClientConfig>, TunnelError> {
+    app_client_config_pinned(None, None)
+}
+
+/// 管理接口 / 仪表盘使用的 HTTP/1.1 客户端 TLS 配置，可同时固定证书或信任 CA。
+pub fn app_client_config_pinned(
+    trusted: Option<Vec<CertificateDer<'static>>>,
+    pin: Option<&str>,
+) -> Result<Arc<ClientConfig>, TunnelError> {
+    if let Some(pin) = pin {
+        if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(tls_err("TLS pin must be 64 hexadecimal SHA256 characters"));
+        }
+    }
+    let trusted_verifier: Option<Arc<dyn ServerCertVerifier>> = match &trusted {
+        Some(certs) => {
+            let mut roots = RootCertStore::empty();
+            for cert in certs {
+                roots.add(cert.clone()).map_err(tls_err)?;
+            }
+            Some(
+                rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider(),
+                )
+                .build()
+                .map_err(tls_err)?,
+            )
+        }
+        None => None,
+    };
+    let verifier = AcceptAnyApp {
+        provider: provider(),
+        pin: pin.map(str::to_ascii_lowercase),
+        trusted_verifier,
+    };
     let mut cfg = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(tls_err)?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyApp(provider())))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
@@ -183,17 +218,33 @@ pub fn app_client_config() -> Result<Arc<ClientConfig>, TunnelError> {
 
 /// 接受任意证书、同时支持 TLS 1.2 / 1.3 签名校验。
 #[derive(Debug)]
-struct AcceptAnyApp(Arc<CryptoProvider>);
+struct AcceptAnyApp {
+    provider: Arc<CryptoProvider>,
+    pin: Option<String>,
+    trusted_verifier: Option<Arc<dyn ServerCertVerifier>>,
+}
 
 impl ServerCertVerifier for AcceptAnyApp {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if let Some(verifier) = &self.trusted_verifier {
+            verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp, now)?;
+        }
+        if self
+            .pin
+            .as_ref()
+            .is_some_and(|pin| certificate_fingerprint(end_entity) != *pin)
+        {
+            return Err(rustls::Error::General(
+                "server certificate pin mismatch".into(),
+            ));
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -207,7 +258,7 @@ impl ServerCertVerifier for AcceptAnyApp {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -221,12 +272,14 @@ impl ServerCertVerifier for AcceptAnyApp {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -350,6 +403,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_app_client_uses_http11_and_verifies_the_certificate_pin() {
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let pin = certificate_fingerprint(&id.certs[0]);
+        let client = app_client_config_pinned(None, Some(&pin)).unwrap();
+        assert_eq!(client.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(
+            handshake(client, app_server_config(id).unwrap())
+                .await
+                .unwrap(),
+            b"pong"
+        );
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let cert = id.certs[0].clone();
+        let pin = certificate_fingerprint(&cert);
+        let mut tls12 = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(id.certs, id.key)
+            .unwrap();
+        tls12.alpn_protocols = vec![b"http/1.1".to_vec()];
+        assert!(handshake(
+            app_client_config_pinned(Some(vec![cert]), Some(&pin)).unwrap(),
+            Arc::new(tls12)
+        )
+        .await
+        .is_ok());
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        assert!(handshake(
+            app_client_config_pinned(None, Some(&"0".repeat(64))).unwrap(),
+            app_server_config(id).unwrap()
+        )
+        .await
+        .is_err());
+        assert!(app_client_config_pinned(None, Some("invalid")).is_err());
+        assert!(app_client_config_pinned(None, None).is_ok());
+    }
+
+    #[tokio::test]
     async fn verifies_when_ca_is_configured() {
         let id = self_signed(vec!["localhost".into()]).unwrap();
         let ca = vec![id.certs[0].clone()];
@@ -429,6 +521,22 @@ mod tests {
             client_config_pinned(Some(vec![CertificateDer::from(vec![1])]), Some(&pin)).is_err()
         );
         assert!(client_config_pinned(None, None).is_ok());
+
+        let id = self_signed(vec!["localhost".into()]).unwrap();
+        let tls12_pin = certificate_fingerprint(&id.certs[0]);
+        let mut tls12 = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(id.certs, id.key)
+            .unwrap();
+        tls12.alpn_protocols = vec![b"http/1.1".to_vec()];
+        assert!(handshake(
+            client_config_pinned(None, Some(&tls12_pin)).unwrap(),
+            Arc::new(tls12)
+        )
+        .await
+        .is_err());
     }
     #[test]
     fn persisted_pem_roundtrips_identity() {

@@ -31,6 +31,14 @@ pub struct ProxyCfg {
     pub name: String,
     /// 类型：`tcp` / `udp` / `http` / `https`。
     pub kind: String,
+    /// TCPMUX 使用的复用器。
+    pub multiplexer: String,
+    /// 每隧道连接上限。
+    pub max_connections: usize,
+    /// 工作流附加加密。
+    pub use_encryption: bool,
+    /// 工作流压缩。
+    pub use_compression: bool,
     /// 本地目标主机。
     pub local_ip: String,
     /// 本地目标端口。
@@ -210,6 +218,10 @@ pub enum Event {
     },
     /// 管理员要求重启这台设备上的 agent。
     RestartRequested,
+    /// Agent 已通过签名和哈希校验并完成替换，需要退出以使用新二进制。
+    AgentUpdated,
+    /// Controller 认证过的迁移目标，供本机身份目录持久保存。
+    Redirected(rustfrp_core::wire::EdgeRedirect),
     /// 连接断开（随后会重连）。
     Disconnected(String),
 }
@@ -232,6 +244,8 @@ enum SessionEnd {
     Lost { reason: String, logged_in: bool },
     /// 登录被拒。
     Rejected(String),
+    /// Controller 下发了新的 Edge 地址与可信证书指纹。
+    Redirect(rustfrp_core::wire::EdgeRedirect),
 }
 
 fn emit(events: &Option<mpsc::Sender<Event>>, e: Event) {
@@ -296,6 +310,24 @@ pub async fn run_with_reload(
         };
         match end {
             SessionEnd::Cancelled => return Ok(()),
+            SessionEnd::Redirect(target) => {
+                emit(&events, Event::Redirected(target.clone()));
+                let mut next = (*cfg).clone();
+                next.server_addr = target.address;
+                next.server_port = target.port;
+                next.tls_pin = Some(target.tls_fingerprint);
+                next.trusted_ca_pem = None;
+                match build_connector(&next) {
+                    Ok(updated) => {
+                        connector = updated;
+                        cfg = Arc::new(next);
+                        delay = cfg.backoff.0;
+                        log.info("device moved to its assigned edge; reconnecting");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             SessionEnd::Rejected(e) => {
                 log.error(&format!("login to server failed: {e}"));
                 if cfg.login_fail_exit && !ever_logged_in {
@@ -513,6 +545,11 @@ async fn talk(
     {
         Ok(ServerMsg::LoginResp {
             ok: true,
+            redirect: Some(target),
+            ..
+        }) => return SessionEnd::Redirect(target),
+        Ok(ServerMsg::LoginResp {
+            ok: true,
             run_id,
             client_id,
             managed,
@@ -553,6 +590,10 @@ async fn talk(
         let spec = ProxySpec {
             name: p.name.clone(),
             kind: p.kind.clone(),
+            max_connections: p.max_connections,
+            multiplexer: p.multiplexer.clone(),
+            use_encryption: p.use_encryption,
+            use_compression: p.use_compression,
             remote_port: p.remote_port,
             custom_domains: p.custom_domains.clone(),
             subdomain: p.subdomain.clone(),
@@ -647,6 +688,7 @@ async fn talk(
     let mut deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout;
     // 本次会话里第一次见到的重启计数作为基线：之后变大才表示有新的重启请求。
     let mut restart_baseline: Option<u64> = None;
+    let mut update_baseline: Option<u64> = None;
     let end = loop {
         tokio::select! {
             _ = cancel.cancelled() => break SessionEnd::Cancelled,
@@ -659,6 +701,27 @@ async fn talk(
             msg = pong_rx.recv() => match msg {
                 Some(Ok(ServerMsg::Pong)) => deadline = tokio::time::Instant::now() + cfg.heartbeat_timeout,
                 Some(Ok(ServerMsg::Config(set))) => {
+                    if let Some(target) = set.redirect.clone() {
+                        return SessionEnd::Redirect(target);
+                    }
+                    match update_baseline {
+                        None => update_baseline = Some(set.update_seq),
+                        Some(base) if set.update_seq > base => {
+                            update_baseline = Some(set.update_seq);
+                            match crate::updater::update_agent(set.update_version.clone()).await {
+                                Ok(true) => {
+                                    emit(events, Event::AgentUpdated);
+                                    return SessionEnd::Lost {
+                                        reason: "agent update applied; restarting".into(),
+                                        logged_in: true,
+                                    };
+                                }
+                                Ok(false) => log.info(&format!("agent already runs update {}", set.update_version)),
+                                Err(error) => log.error(&format!("agent update failed: {error}")),
+                            }
+                        }
+                        Some(_) => {}
+                    }
                     match restart_baseline {
                         None => restart_baseline = Some(set.restart_seq),
                         Some(base) if set.restart_seq > base => {
@@ -788,6 +851,14 @@ async fn handle_work(
     if t.kind == "udp" {
         return udp_work(stream, &t, cfg).await;
     }
+    let mut stream = rustfrp_core::transform::wrap(
+        Box::new(stream),
+        start.use_encryption,
+        start.use_compression,
+        &start.encryption_key,
+        false,
+    )
+    .map_err(|e| TunnelError::Wire(e.to_string()))?;
     if let Some(plugin) = &t.plugin {
         return match t.limiter {
             Some(l) => {

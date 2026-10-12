@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../core/models.dart';
+import '../../core/app_updater.dart';
+import '../../core/app_version.dart';
 import '../../core/local_agent.dart';
 import '../../core/desktop.dart';
 import '../../core/notification_service.dart';
@@ -755,11 +758,136 @@ class _About extends ConsumerWidget {
           child: Column(
             children: [
               InfoRow('控制器版本', v.isEmpty ? '—' : v),
-              InfoRow('面板版本', '0.1.0'),
+              InfoRow('应用版本', rustfrpAppVersion),
             ],
           ),
         ),
+        const SizedBox(height: 20),
+        const _AppUpdatePanel(),
       ],
+    );
+  }
+}
+
+class _AppUpdatePanel extends ConsumerWidget {
+  const _AppUpdatePanel();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final colors = context.c;
+    if (kIsWeb) {
+      return PanelCard(
+        child: Text(
+          'Web 面板由 Controller 随版本发布更新。',
+          style: Type.body.copyWith(color: colors.text2),
+        ),
+      );
+    }
+    final state = ref.watch(appUpdateProvider);
+    final updater = ref.read(appUpdateProvider.notifier);
+    final status = switch (state.phase) {
+      AppUpdatePhase.checking => '正在检查更新…',
+      AppUpdatePhase.downloading => '正在下载 ${(state.progress * 100).floor()}%',
+      AppUpdatePhase.installing => '正在安装，应用即将重启…',
+      AppUpdatePhase.idle when state.error != null => state.error!,
+      AppUpdatePhase.idle when state.latest != null =>
+        '发现新版本 ${state.latest!.version}',
+      AppUpdatePhase.idle when state.upToDate => '已是最新版本',
+      _ => '尚未检查',
+    };
+    return PanelCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('应用内更新', style: Type.strong.copyWith(color: colors.text1)),
+          const SizedBox(height: 8),
+          Text(status, style: Type.body.copyWith(color: colors.text2)),
+          if (state.mirrorUsed != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              '当前加速源：${state.mirrorUsed}',
+              style: Type.caption.copyWith(color: colors.text3),
+            ),
+          ],
+          if (state.plan?.manualReason != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              state.plan!.manualReason!,
+              style: Type.caption.copyWith(color: colors.text3),
+            ),
+          ],
+          if (state.latest?.notes.trim().isNotEmpty == true) ...[
+            const SizedBox(height: 8),
+            SelectableText(
+              state.latest!.notes.trim(),
+              maxLines: 8,
+              style: Type.caption.copyWith(color: colors.text2),
+            ),
+          ],
+          if (state.phase == AppUpdatePhase.downloading) ...[
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: state.progress),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              LButton(
+                key: const Key('app-update-check'),
+                label: state.phase == AppUpdatePhase.checking ? '检查中…' : '检查更新',
+                icon: LucideIcons.refreshCw,
+                loading: state.phase == AppUpdatePhase.checking,
+                onPressed: state.busy
+                    ? null
+                    : () => updater.check(manual: true),
+              ),
+              if (state.plan?.canInstall == true)
+                LButton(
+                  label: '下载并安装',
+                  icon: LucideIcons.download,
+                  variant: BtnVariant.solid,
+                  loading: state.phase == AppUpdatePhase.installing,
+                  onPressed: state.busy ? null : updater.install,
+                ),
+              if (state.phase == AppUpdatePhase.downloading)
+                LButton(label: '取消', onPressed: updater.cancelDownload),
+              if (updater.canOpenReleasePage)
+                LButton(
+                  label: 'Release 页面',
+                  icon: LucideIcons.externalLink,
+                  onPressed: state.busy ? null : updater.openReleasePage,
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            children: [
+              LButton(
+                label: 'GitHub 官方',
+                compact: true,
+                variant: state.source == AppUpdateSource.github
+                    ? BtnVariant.solid
+                    : BtnVariant.ghost,
+                onPressed: state.busy
+                    ? null
+                    : () => updater.setSource(AppUpdateSource.github),
+              ),
+              LButton(
+                label: '国内加速',
+                compact: true,
+                variant: state.source == AppUpdateSource.mainland
+                    ? BtnVariant.solid
+                    : BtnVariant.ghost,
+                onPressed: state.busy
+                    ? null
+                    : () => updater.setSource(AppUpdateSource.mainland),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

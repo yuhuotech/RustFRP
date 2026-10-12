@@ -45,16 +45,15 @@ Flutter：颜色、字号、圆角沿用 linkory 的 token / 共享控件，acti
 > 详细逐项状态见 `docs/IMPLEMENTATION_STATUS.md`；此处只给概览。
 
 - P00：Cargo workspace、CI、覆盖率门槛工具、Flutter 工程 ✔。
-- P01 隧道核心 ✔：`frpcfg`（含 INI `convert`）；TLS1.3 + yamux + 令牌鉴权 + 重连 + 心跳；client / edge 模式、`verify`、frpc/frps 别名；内存基线（见 `tools/bench/README.md`）。
+- P01 隧道核心 ✔：`frpcfg`（含 INI `convert`）；TLS1.3 + yamux + 令牌鉴权 + 重连 + 心跳；client / edge 模式、`verify`、frpc/frps 别名；TCP/UDP/HTTP/HTTPS、STCP/SUDP、TCPMUX `httpconnect`，内存基线（见 `tools/bench/README.md`）。
   代理类型：**tcp / udp / http（逐请求按 Host + 路径前缀 + routeByHTTPUser 选路，通配、子域名、Host 改写、Basic Auth、requestHeaders）/ https（SNI 透传）**，独立与受管模式都支持。
-  **已实现**：stcp / sudp 与访问者（独立模式用 `[[visitors]]`；受管模式在客户端详情页建「访问者」，目标是同一节点上其他设备的 stcp/sudp 隧道，密钥由 Controller 代为出示，不经 REST 返回）、独立模式本地插件（`socks5` / `http_proxy` / `static_file` / `unix_domain_socket` / `http2https` / `https2http` / `https2https` / `tls2raw`；`virtual_net` 等其余类型进入兼容报告并跳过；`*2*` 类只讲 HTTP/1.1）、健康检查（tcp / http，客户端探测、状态变化通知 Edge，不健康时不接收访问者）与负载均衡组（tcp 共用端口、http/https 共用域名，健康成员间轮转，组密钥校验）、http 的 `responseHeaders.set`（每个最终响应改写，不可改分帧头）、PROXY protocol v1/v2（客户端写给本地服务）、带宽限制（`transport.bandwidthLimit` + `bandwidthLimitMode`，令牌桶，每代理双向共享；tcp/http/https，udp 不支持并提示；面板有 KB/s 字段）。
-  **尚未实现**：xtcp、tcpmux、受管模式下的插件（Controller 暂不存储 / 下发）、加密/压缩。`reload` / `status` / `stop`：独立客户端配置 `webServer.port` 后提供管理接口（`/healthz`、`/api/status`、`/api/reload`、`/api/stop`、`/api/config`，Basic 认证，仅 HTTP），命令行 `frpc reload -c frpc.toml` 经它重读配置并重连；frps 的 dashboard 与 webServer.tls 未实现并在启动日志中提示。`service install|uninstall|status|start|stop` 已实现（命令构造已测，真实 systemctl/launchctl/schtasks 未实机验证）。
-  配置里出现这些时会在兼容报告 / 日志中逐代理列出并跳过。
-- P02 Controller ✔（部分）：SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD 与批量、配置热下发、审计、REST、面板托管、API Token、流量分钟桶与 24h/7d 历史、有界日志环、配置导入预览/导出、在线备份、有界保留清理、脚本托管。
+  **已实现**：stcp / sudp 与访问者（独立模式用 `[[visitors]]`；受管模式在客户端详情页建「访问者」，目标是同一节点上其他设备的 stcp/sudp 隧道，密钥由 Controller 代为出示，不经 REST 返回；Visitor 可选加密/压缩）、TCP/TCPMUX/Visitor 工作流 AES-256-GCM 与有界 LZ4、按客户端/隧道/UDP peer/SUDP Visitor workflow 连接上限、独立模式本地插件（`socks5` / `http_proxy` / `static_file` / `unix_domain_socket` / `http2https` / `https2http` / `https2https` / `tls2raw`；`virtual_net` 等其余类型进入兼容报告并跳过；`*2*` 类只支持 HTTP/1.1）、健康检查与负载均衡组、HTTP 响应头、PROXY protocol v1/v2、令牌桶限速。TCPMUX passthrough、Visitor transforms、UDP/SUDP peer/session 限制均有回环集成测试。
+  **保留边界**：XTCP 与其他兼容报告内标出的未实现插件/字段；`reload` / `status` / `stop` 独立客户端管理接口、frps dashboard、独立 `webServer.tls` / `assetsDir` 均已实现；真实公网部署留待部署验收。`service install|uninstall|status|start|stop` 命令已实现，真实服务管理器实机验收仍待做。
+- P02 Controller ✔（功能代码）：SQLite、管理员 CLI、接入令牌、设备管理、隧道 CRUD 与批量、配置热下发、审计、REST、面板托管、API Token、流量分钟桶与 24h/7d 历史、有界日志环、配置导入预览/导出、在线备份、有界保留清理、脚本托管。
   **独立节点**已实现（`RUSTFRP_NODE_ADDR` 开启节点端口；`rustfrp-agent --mode edge --controller … --enroll-token … --public-host …`，见 `docs/NODES.md`），AT-05 在同机全栈测试中通过；内置节点仍与 Controller 同进程。
   `RUSTFRP_BUILTIN_EDGE=off` 可只做管理面；`RUSTFRP_METRICS_TOKEN` 开启 Prometheus `/metrics`；客户端标签与远程重启（退出码 75，需系统服务托管）已实现。
-  **缺口**：设备跨节点迁移、流量/会话保留天数配置化、控制面 HTTPS 部署闭环。设备详情已显示最近登录 IP（由 Edge 填写，覆盖客户端自报值；外置节点经 `NodeMsg::Online.ip` 上报）。
-- P03 Flutter ✔（部分）：登录、概览（含流量图）、节点、客户端、隧道 CRUD/模板/批量、接入向导、审计、设置（主题/令牌/API Token/管理员）、日志、宽窄屏、深浅色；Web 同源托管并在严格 CSP 下实测。
-  桌面：窗口壳、管理员控制台模式、受管「本机模式」（接入、持久身份、回环控制、本机隧道列表/日志/诊断导出；macOS 实机通过）。
-  **缺口（P05）**：托盘、开机启动、通知、本地配置编辑、独立模式入口、应用内更新、内置 agent、三平台安装包；Linux / Windows 后台进程未实机验收。
-- P07 官网、Release 流水线、签名、安全审计报告 ✘。
+  在线设备跨节点迁移、保留期配置与 Agent 更新命令已实现；跨主机/WAN 迁移和控制面 HTTPS 公网部署验收保留。设备详情的最近登录 IP 由 Edge 填写，覆盖客户端自报值。
+- P03 Flutter ✔（功能代码）：登录、概览（含流量图）、节点、客户端、隧道 CRUD/模板/批量、接入向导、审计、设置（主题/令牌/API Token/管理员）、日志、宽窄屏、深浅色；Web 同源托管并在严格 CSP 下实测。
+  桌面：窗口壳、管理员控制台模式、受管本机模式、独立模式完整 TOML/YAML/JSON 文本编辑（校验后暂存/原子保存）、日志/诊断、托盘、自启动、通知、CA-07 Agent 更新与 D-09 Flutter App 更新代码均已实现并有自动化测试。三平台真实主机验收保留。
+- P07 官网与 Release 构建/签名工作流已实现；官网公网部署、真实签名 Release 所需密钥、公证和正式安全审计报告未完成。
+- 当前验收：`make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 均通过。Core 99.03/97.97/97.16、Server 97.16/95.80/92.88、Flutter 行 97.30 达到历史基线；Agent 97.07/91.40/91.29 中行/函数低于历史基线 98.14/95.36，分支达到 91.10 基线，`make cov` 因此仍失败。其余明确验收保留项见 `docs/IMPLEMENTATION_STATUS.md`。

@@ -10,13 +10,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use rustfrp_agent::client::{self, ClientConfig, Event, ProxyCfg};
-use rustfrp_agent::edge::{Edge, EdgeConfig};
+use rustfrp_agent::edge::{Admission, BoxFut, Edge, EdgeConfig, Policy};
 use rustfrp_agent::log::Logger;
 use rustfrp_core::auth::{auth_key, unix_now};
 use rustfrp_core::mux::{self, MuxConfig, Session, Stream};
 use rustfrp_core::tls;
 use rustfrp_core::wire::{
-    read_frame, write_frame, ClientMsg, Login, ProxySpec, ServerMsg, StartWork, PROTOCOL_VERSION,
+    read_frame, write_frame, ClientMsg, EdgeRedirect, HealthSpec, LbOpts, Login, ProxySpec,
+    ServerMsg, StartWork, PROTOCOL_VERSION,
 };
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,6 +104,130 @@ async fn assert_closed(r: &mut Raw) {
     assert_eq!(n, 0, "edge should close the control stream");
 }
 
+struct RedirectPolicy(EdgeRedirect);
+
+impl Policy for RedirectPolicy {
+    fn login<'a>(&'a self, _login: &'a Login) -> BoxFut<'a, Result<Admission, String>> {
+        let target = self.0.clone();
+        Box::pin(async move { Ok(Admission::Redirect(target)) })
+    }
+}
+
+#[tokio::test]
+async fn login_redirect_reconnects_with_the_assigned_certificate_pin() {
+    let target = Edge::bind(
+        EdgeConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            proxy_bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        },
+        None,
+        Logger::silent(),
+    )
+    .await
+    .unwrap();
+    let target_port = target.local_addr().unwrap().port();
+    let expected = EdgeRedirect {
+        address: "127.0.0.1".into(),
+        port: target_port,
+        tls_fingerprint: target.certificate_fingerprint().into(),
+    };
+    let target_stop = CancellationToken::new();
+    tokio::spawn(target.serve(target_stop.clone()));
+
+    let source = Edge::bind_with_policy(
+        EdgeConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            proxy_bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        },
+        None,
+        std::sync::Arc::new(RedirectPolicy(expected.clone())),
+        Logger::silent(),
+    )
+    .await
+    .unwrap();
+    let source_port = source.local_addr().unwrap().port();
+    let source_stop = CancellationToken::new();
+    tokio::spawn(source.serve(source_stop.clone()));
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn(client::run(
+        ClientConfig {
+            server_addr: "127.0.0.1".into(),
+            server_port: source_port,
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        Logger::silent(),
+        Some(tx),
+        cancel.clone(),
+    ));
+
+    let mut redirected = false;
+    let mut connected = false;
+    while !redirected || !connected {
+        match timeout(T, rx.recv()).await.unwrap().unwrap() {
+            Event::Redirected(target) => {
+                assert_eq!(target, expected);
+                redirected = true;
+            }
+            Event::Connected => connected = true,
+            _ => {}
+        }
+    }
+    cancel.cancel();
+    source_stop.cancel();
+    let _ = timeout(T, run).await;
+
+    let invalid_redirect = EdgeRedirect {
+        address: "127.0.0.1".into(),
+        port: target_port,
+        tls_fingerprint: "not-a-fingerprint".into(),
+    };
+    let invalid_source = Edge::bind_with_policy(
+        EdgeConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            proxy_bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        },
+        None,
+        std::sync::Arc::new(RedirectPolicy(invalid_redirect.clone())),
+        Logger::silent(),
+    )
+    .await
+    .unwrap();
+    let invalid_source_port = invalid_source.local_addr().unwrap().port();
+    let invalid_source_stop = CancellationToken::new();
+    tokio::spawn(invalid_source.serve(invalid_source_stop.clone()));
+    let (tx, mut rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn(client::run(
+        ClientConfig {
+            server_addr: "127.0.0.1".into(),
+            server_port: invalid_source_port,
+            ..Default::default()
+        },
+        Logger::silent(),
+        Some(tx),
+        cancel.clone(),
+    ));
+    assert_eq!(
+        timeout(T, rx.recv()).await.unwrap().unwrap(),
+        Event::Redirected(invalid_redirect)
+    );
+    let error = timeout(T, run).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("TLS pin"));
+    cancel.cancel();
+    invalid_source_stop.cancel();
+    target_stop.cancel();
+}
+
 #[tokio::test]
 async fn edge_rejects_wrong_protocol_version() {
     let (port, stop) = start_edge(EdgeConfig::default()).await;
@@ -119,6 +244,81 @@ async fn edge_rejects_wrong_protocol_version() {
             ok: false, error, ..
         } => assert!(error.contains("unsupported protocol version")),
         other => panic!("{other:?}"),
+    }
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn edge_refuses_tcp_mux_without_listener_or_with_groups_and_health_checks() {
+    let (port, stop) = start_edge(EdgeConfig::default()).await;
+    let mut raw = raw_client(port).await;
+    expect_login_ok(&mut raw).await;
+    write_frame(
+        &mut raw.ctrl,
+        &ClientMsg::NewProxy(Box::new(ProxySpec {
+            name: "mux-disabled".into(),
+            kind: "tcpmux".into(),
+            multiplexer: "httpconnect".into(),
+            ..Default::default()
+        })),
+    )
+    .await
+    .unwrap();
+    let response = timeout(T, read_frame::<_, ServerMsg>(&mut raw.ctrl))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(response, ServerMsg::NewProxyResp { error, .. } if error.contains("tcpmux requires"))
+    );
+    drop(raw);
+    stop.cancel();
+
+    let (port, stop) = start_edge(EdgeConfig {
+        tcpmux_http_connect_port: Some(0),
+        ..Default::default()
+    })
+    .await;
+    let mut raw = raw_client(port).await;
+    expect_login_ok(&mut raw).await;
+    for (name, lb) in [
+        (
+            "mux-group",
+            LbOpts {
+                group: "unsupported".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "mux-health",
+            LbOpts {
+                health: Some(HealthSpec {
+                    kind: "tcp".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+    ] {
+        write_frame(
+            &mut raw.ctrl,
+            &ClientMsg::NewProxy(Box::new(ProxySpec {
+                name: name.into(),
+                kind: "tcpmux".into(),
+                multiplexer: "httpconnect".into(),
+                lb,
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let response = timeout(T, read_frame::<_, ServerMsg>(&mut raw.ctrl))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(response, ServerMsg::NewProxyResp { error, .. } if error.contains("tcpmux does not support"))
+        );
     }
     stop.cancel();
 }
@@ -152,6 +352,8 @@ async fn visitor_streams_with_bad_hellos_are_refused_without_hurting_the_session
             server_name: "nobody".into(),
             timestamp: unix_now(),
             sign: "x".into(),
+            use_encryption: false,
+            use_compression: false,
         },
     )
     .await
@@ -390,6 +592,7 @@ async fn client_handles_an_unexpected_reply_while_registering() {
                 run_id: "r".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -418,6 +621,7 @@ async fn client_notices_when_the_control_stream_ends() {
                 run_id: "r".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -446,6 +650,7 @@ async fn client_notices_when_the_server_closes_the_connection() {
                 run_id: "r".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -472,6 +677,7 @@ async fn client_times_out_when_pongs_never_arrive() {
                 run_id: "r".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -502,6 +708,7 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
                 run_id: "r".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -515,6 +722,7 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
                 run_id: "x".into(),
                 client_id: String::new(),
                 managed: false,
+                redirect: None,
             },
         )
         .await
@@ -527,6 +735,9 @@ async fn client_ignores_stray_messages_and_work_for_unknown_proxies() {
                 proxy: "nope".into(),
                 src: "1.1.1.1:1".into(),
                 dst: String::new(),
+                use_encryption: false,
+                use_compression: false,
+                encryption_key: String::new(),
             },
         )
         .await
@@ -588,6 +799,7 @@ async fn login_rejection_after_a_successful_login_does_not_exit() {
                     run_id: "r".into(),
                     client_id: String::new(),
                     managed: false,
+                    redirect: None,
                 }
             } else {
                 ServerMsg::LoginResp {
@@ -596,6 +808,7 @@ async fn login_rejection_after_a_successful_login_does_not_exit() {
                     run_id: String::new(),
                     client_id: String::new(),
                     managed: false,
+                    redirect: None,
                 }
             };
             write_frame(&mut ctrl, &resp).await.unwrap();

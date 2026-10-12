@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::wire::{ConfigSet, Enroll};
+use crate::wire::{ConfigSet, EdgeRedirect, Enroll};
 
 /// 节点协议版本。
 pub const NODE_PROTOCOL_VERSION: u32 = 1;
@@ -29,6 +29,9 @@ pub struct NodeInfo {
     /// HTTPS 虚拟主机端口。
     #[serde(default)]
     pub vhost_https: Option<u16>,
+    /// TCPMUX HTTP CONNECT 共享端口。
+    #[serde(default)]
+    pub tcpmux_http_connect_port: Option<u16>,
     /// 子域名后缀。
     #[serde(default)]
     pub subdomain_host: String,
@@ -206,6 +209,13 @@ pub enum CtlMsg {
     Kick {
         /// 设备 ID。
         client_id: String,
+    },
+    /// 设备迁移到另一个 Edge；旧节点只发送空代理快照和目标地址。
+    RedirectClient {
+        /// 设备 ID。
+        client_id: String,
+        /// 新节点。
+        target: EdgeRedirect,
     },
     /// 设备接入结果。
     EnrollResp {

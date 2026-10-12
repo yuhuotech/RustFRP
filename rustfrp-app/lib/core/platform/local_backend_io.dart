@@ -132,11 +132,14 @@ class IoLocalBackend implements LocalAgentBackend {
     this.firstLaunch,
     this.removeRegistration,
     this.bundledAgentBinary,
+    RunCommand? runCommand,
     this.startTimeout = const Duration(seconds: 10),
-  }) : _launch = launch ?? launchDetached;
+  }) : _launch = launch ?? launchDetached,
+       _run = runCommand ?? ((exe, args) => Process.run(exe, args));
   @override
   final LocalAgentConfig defaults;
   final LaunchAgent _launch;
+  final RunCommand _run;
   final LaunchAgent? firstLaunch;
   final Future<void> Function(String path)? removeRegistration;
   final String? bundledAgentBinary;
@@ -274,6 +277,77 @@ class IoLocalBackend implements LocalAgentBackend {
     } catch (_) {
       await file.delete();
       rethrow;
+    }
+  }
+
+  @override
+  Future<String> readConfig(LocalAgentConfig config) async {
+    final path = config.configFile.trim();
+    if (path.isEmpty) throw const FormatException('请先填写 frpc 配置文件路径');
+    try {
+      final file = File(path);
+      final length = await file.length();
+      if (length > 1024 * 1024) throw const FormatException('frpc 配置文件超过 1 MiB');
+      return await file.readAsString();
+    } on FileSystemException catch (error) {
+      if (error.osError?.errorCode == 2 || error.osError?.errorCode == 3) {
+        return "# RustFRP 独立模式配置\n# 保存前会运行 Agent verify；将 serverAddr/serverPort 与代理配置填写完整。\n";
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> saveConfig(LocalAgentConfig config, String text) async {
+    final path = config.configFile.trim();
+    final absolute = Platform.isWindows
+        ? RegExp(r'^[A-Za-z]:[\\/]').hasMatch(path)
+        : path.startsWith('/');
+    if (path.isEmpty || !absolute) {
+      throw const FormatException('配置文件路径必须是绝对路径');
+    }
+    if (text.isEmpty || utf8.encode(text).length > 1024 * 1024) {
+      throw const FormatException('配置不能为空且不能超过 1 MiB');
+    }
+    final source = File(path);
+    final configuredExtension = path.split('.').last.toLowerCase();
+    final extension = const {'toml', 'yaml', 'yml', 'json'}.contains(configuredExtension)
+        ? configuredExtension
+        : 'toml';
+    final stage = File('$path.rustfrp-stage-$pid.$extension');
+    final backup = File('$path.rustfrp-rollback-$pid');
+    try {
+      await stage.writeAsString(text, flush: true);
+      if (!Platform.isWindows) {
+        final permission = await _run('/bin/chmod', ['600', stage.path]);
+        if (permission.exitCode != 0) throw const FormatException('无法保护临时配置文件权限');
+      }
+      var binary = config.binary.trim();
+      if (binary.isEmpty) binary = _bundledAgentPath() ?? '';
+      if (binary.isEmpty || !await File(binary).exists()) {
+        await _installBundledAgent(config);
+        binary = config.binary;
+      }
+      final verified = await _run(
+        binary,
+        ['--mode', 'client', 'verify', '-c', stage.path],
+      ).timeout(const Duration(seconds: 20));
+      if (verified.exitCode != 0) {
+        final detail = '${verified.stdout}\n${verified.stderr}'.trim();
+        throw FormatException('frpc 配置校验失败：${detail.isEmpty ? '请检查配置语法和字段' : detail}');
+      }
+      final existed = await source.exists();
+      if (existed) await source.rename(backup.path);
+      try {
+        await stage.rename(source.path);
+      } on FileSystemException {
+        if (existed && await backup.exists()) await backup.rename(source.path);
+        rethrow;
+      }
+      if (await backup.exists()) await backup.delete();
+    } finally {
+      if (await stage.exists()) await stage.delete();
+      if (await backup.exists() && !await source.exists()) await backup.rename(source.path);
     }
   }
 

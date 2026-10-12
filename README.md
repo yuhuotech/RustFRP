@@ -4,31 +4,39 @@ RustFRP 是一个自托管内网穿透系统，包含 Rust 数据面与 Controll
 
 ## 当前进度（2026-10-12）
 
-**V1.0 尚未全部完成，当前工作区包含本轮实现但尚未发布。** 已有 TCP/UDP/HTTP/HTTPS、STCP/SUDP、受管与独立模式、本地/受管插件、健康检查、负载均衡、限速、PROXY protocol、Controller 多节点、流量与日志、配置导入导出、备份及配置化数据保留。桌面托盘、自启动、通知、内置 Agent、独立配置入口，多平台构建工作流、官网源码和 HTTPS 部署模板已加入。
+**本轮指定的遗留功能已全部完成代码实现，并通过自动化回归；V1.0 整体仍未完成交付验收。** 既有 TCP/UDP/HTTP/HTTPS、STCP/SUDP、受管与独立模式、插件、健康检查、负载均衡、限速、PROXY protocol、Controller 多节点、流量与日志、配置导入导出、备份和配置化数据保留均已实现。
 
-### 仍未完成的需求与交付
+### 已完成的遗留功能
 
-- **TCPMUX**（V1.0 P1）、传输 `useEncryption` / `useCompression` 和按客户端/隧道的连接数限制仍未实现；配置会进入兼容报告。
-- **桌面自动更新器**（CA-07）未实现：缺少可信公钥固定、签名校验、原子替换、回滚和 Agent/App 协调升级。
-- **真实三平台验收**未完成：CI 尚未实际产出并安装 macOS、Windows、Linux 发布包；托盘、自启动、通知、后台 Agent 与系统服务仍需目标主机验证。
-- Release 的 Apple 签名/公证与 Ed25519 清单签名需要外部 GitHub Actions 凭据；官网尚未部署，正式域名、证书和反向代理也尚未实地验收。
-- **安全审计报告**、安装器/更新器对可信发布公钥的校验闭环尚未完成。
-- 设备跨节点迁移、完整的桌面本地配置逐项编辑仍未完成；frps dashboard、`webServer.tls` 与 `assetsDir` 运行支持也未实现，均保留兼容提示。
+- TCPMUX `httpconnect` 支持 passthrough，可配置为把完整 CONNECT 请求转发给目标服务。
+- TCP 与 Visitor 工作流可选 AES-256-GCM 加密和有界 LZ4 压缩。
+- 并发限制覆盖客户端、隧道、UDP 活跃源地址和 SUDP Visitor 工作流；面板与 API 可配置。
+- CA-07 Agent 与 D-09 Flutter 桌面 App 更新器支持 Ed25519 签名清单/版本标记校验、摘要校验、下载进度和失败保护。
+- 在线设备跨 Edge 迁移具备审计、旧节点清理、目标证书指纹固定、自动重连和目标持久化。
+- 独立桌面模式可完整编辑 TOML/YAML/JSON 配置文件，保存前用 Agent 校验并原子替换。
+- frps dashboard、`webServer.tls`、`assetsDir` 与独立 frpc 管理 WebServer TLS 已接入运行时。
+
+### 仍未完成的验收
+
+- 真实签名 Release 所需私钥与 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX` 尚未配置；CA-07/D-09 会在缺少可信公钥时 fail closed。
+- 官网/Controller 公网部署、跨主机迁移、Windows/Linux/macOS Intel 实机验收仍未完成。
+- Agent 覆盖率为行/函数/分支 **97.07% / 91.40% / 91.29%**；行/函数仍低于历史基线 **98.14% / 95.36%**，分支已超过 91.10% 基线；Core、Server、Flutter 已达基线。
+- 正式安全审计报告尚未出具；XTCP/P2P、KCP/QUIC、frp 线协议互通、移动端、ACME、多租户计费和 Webhook 告警属于 V1.1/V2。
 
 XTCP/P2P、KCP/QUIC、frp 线协议互通、移动端、ACME、多租户计费和 Webhook 告警属于需求中的 V1.1/V2 范围，不计入本次 V1.0 完成声明。
 
-## 本轮验收（2026-10-12）
+## 本轮整体验收（2026-10-12）
 
-`make lint`、`make test`、`make cov`、Flutter analyze 与 132 项测试、`make app-cov`、`make web-build`、`make e2e`、`make bench-mem` 均通过。`make cov` 按仓库覆盖率检查器通过：
+`make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e` 和 `make bench-mem` 通过。覆盖率如下：
 
 | Crate | 行覆盖率 | 函数覆盖率 | 分支覆盖率 |
 |---|---:|---:|---:|
-| rustfrp-core | 99.19% | 98.04% | 97.44% |
-| rustfrp-agent | 98.10% | 95.40% | 91.49% |
-| rustfrp-server | 97.00% | 95.65% | 93.37% |
-| Flutter App | 97.28% | — | — |
+| rustfrp-core | 99.03% | 97.97% | 97.16% |
+| rustfrp-agent | 97.07% | 91.40% | 91.29% |
+| rustfrp-server | 97.16% | 95.80% | 92.88% |
+| Flutter App | 97.30% | — | — |
 
-Agent 行覆盖率比其 98.14% 基线低 0.04 个百分点；仓库检查器设置 0.05 个百分点容差，因此检查通过。100 条空闲连接 Release RSS 为 Edge 6.78 MiB / Client 7.12 MiB；20 次 512 KiB 回显后的峰值为 7.12 / 7.69 MiB，关闭后 7.14 / 7.70 MiB，低于 10 MiB 上限。真实全栈 e2e 完成 300000 字节回显、管理 API、重连、UDP/HTTP 路由和在线备份检查。Web 与 macOS ARM64 Release 构建成功；Linux/Windows 安装、macOS Intel 安装、真实托盘/系统服务、签名公证与正式 Release 尚未完成。
+Core 行/函数/分支为 99.03% / 97.97% / 97.16%。Server 和 Flutter 达到历史基线；Agent 高于 90% 最低门槛但未达到历史基线，因此 `make cov` 仍失败。100 条空闲连接 Release RSS 为 Edge/Client 6.97/7.41 MiB；20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB，均低于 10 MiB。
 
 权威的逐项状态、质量门槛和验收边界见 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)；接手说明见 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
 

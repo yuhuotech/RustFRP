@@ -51,6 +51,72 @@ pub struct RequestHead {
     pub basic: Option<(String, String)>,
 }
 
+/// CONNECT 预检结果（仅 TCPMUX 使用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectHead {
+    /// HTTP 头长度。
+    pub head_len: usize,
+    /// 小写、无端口的目标域名。
+    pub host: String,
+}
+
+/// 解析 HTTP CONNECT 请求，拒绝重复 Host、正文和目标域名不一致。
+pub fn parse_connect_request(buf: &[u8]) -> Result<Option<ConnectHead>, HeadError> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    let head_len = match req.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => return Ok(None),
+        Err(httparse::Error::TooManyHeaders) => return Err(HeadError::Invalid("too many headers")),
+        Err(_) => return Err(HeadError::Invalid("malformed CONNECT request")),
+    };
+    if !req
+        .method
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("CONNECT")
+    {
+        return Err(HeadError::Unsupported("only CONNECT is accepted"));
+    }
+    if req.version != Some(1) {
+        return Err(HeadError::Invalid("CONNECT requires HTTP/1.1"));
+    }
+    let target = req.path.unwrap_or_default();
+    let (target_host, target_port) = target
+        .rsplit_once(':')
+        .ok_or(HeadError::Invalid("CONNECT target must include a port"))?;
+    if target_host.is_empty()
+        || target_port.is_empty()
+        || !target_port.bytes().all(|b| b.is_ascii_digit())
+        || target_port.parse::<u16>().ok().is_none_or(|p| p == 0)
+    {
+        return Err(HeadError::Invalid("invalid CONNECT target"));
+    }
+    let target_host = host_only(target_host).ok_or(HeadError::Invalid("invalid CONNECT host"))?;
+    let mut host = None;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Err(HeadError::Invalid("duplicate Host"));
+            }
+            host = Some(
+                std::str::from_utf8(h.value)
+                    .ok()
+                    .and_then(host_only)
+                    .ok_or(HeadError::Invalid("invalid Host"))?,
+            );
+        } else if h.name.eq_ignore_ascii_case("content-length")
+            || h.name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            return Err(HeadError::Invalid("CONNECT request body is not supported"));
+        }
+    }
+    let host = host.ok_or(HeadError::Invalid("Host is required"))?;
+    if host != target_host {
+        return Err(HeadError::Invalid("CONNECT target and Host differ"));
+    }
+    Ok(Some(ConnectHead { head_len, host }))
+}
+
 fn token_list_has(value: &[u8], want: &str) -> bool {
     value
         .split(|b| *b == b',')
@@ -741,6 +807,79 @@ fn parse_response_head(buf: &[u8]) -> RespHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tcp_mux_connect_and_rejects_ambiguous_targets() {
+        let request = b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: app.example.com\r\n\r\nhello";
+        let head = parse_connect_request(request).unwrap().unwrap();
+        assert_eq!(head.host, "app.example.com");
+        assert_eq!(request.get(head.head_len..), Some(b"hello".as_slice()));
+        assert!(parse_connect_request(
+            b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: other.example.com\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse_connect_request(
+            b"CONNECT app.example.com:0 HTTP/1.1\r\nHost: app.example.com\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse_connect_request(
+            b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: app.example.com\r\nContent-Length: 1\r\n\r\n"
+        ).is_err());
+        assert!(
+            parse_connect_request(b"CONNECT app.example.com:443 HTTP/1.1\r\n")
+                .unwrap()
+                .is_none()
+        );
+        for bad in [
+            &b"not a request"[..],
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com:443 HTTP/1.0\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT :443 HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com:no HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com:65536 HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: a b\r\n\r\n",
+            b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: app.example.com\r\nHost: app.example.com\r\n\r\n",
+            b"CONNECT app.example.com:443 HTTP/1.1\r\nHost: app.example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ] {
+            assert!(parse_connect_request(bad).is_err(), "{bad:?}");
+        }
+
+        let mut too_many =
+            String::from("CONNECT app.example.com:443 HTTP/1.1\r\nHost: app.example.com\r\n");
+        for _ in 0..MAX_HEADERS {
+            too_many.push_str("X-Test: value\r\n");
+        }
+        too_many.push_str("\r\n");
+        assert!(parse_connect_request(too_many.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn chunked_decoder_leaves_bytes_after_the_terminal_chunk_unconsumed() {
+        let mut decoder = ChunkedScanner::default();
+        let (used, done) = decoder.feed(b"0\r\n\r\nnext-response").unwrap();
+        assert!(done);
+        assert_eq!(&b"0\r\n\r\nnext-response"[..used], b"0\r\n\r\n");
+        let (used, done) = decoder.feed(b"next-response").unwrap();
+        assert!(done);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn malformed_carried_response_headers_are_released_unchanged() {
+        let mut tracker = ResponseTracker::new();
+        tracker.on_request(false);
+        let mut out = Vec::new();
+        tracker.rewrite(b"HTTP/1.1 200 OK\r\nX-Test: value\r\n", &[], &mut out);
+        assert!(out.is_empty());
+        tracker.rewrite(b"Malformed\r\n\r\n", &[], &mut out);
+        assert_eq!(
+            out,
+            b"HTTP/1.1 200 OK\r\nX-Test: value\r\nMalformed\r\n\r\n"
+        );
+        assert!(tracker.is_opaque());
+    }
 
     fn head(s: &str) -> Result<Option<RequestHead>, HeadError> {
         parse_request(s.as_bytes())

@@ -19,6 +19,7 @@ const PROXY_BASE: &[&str] = &[
     "localIP",
     "localPort",
     "plugin",
+    "maxConnections",
 ];
 const HTTP_EXTRA: &[&str] = &[
     "customDomains",

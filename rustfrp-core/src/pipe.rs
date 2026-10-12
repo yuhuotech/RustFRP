@@ -328,6 +328,7 @@ where
         inbound: true,
     };
     tokio::io::AsyncWriteExt::write_all(&mut b, prefix).await?;
+    tokio::io::AsyncWriteExt::flush(&mut b).await?;
     relay(&mut a, &mut b).await
 }
 

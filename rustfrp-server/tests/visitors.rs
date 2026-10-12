@@ -197,6 +197,8 @@ async fn managed_devices_reach_each_other_privately_through_a_visitor() {
                         bind_addr: "127.0.0.1".into(),
                         bind_port: i64::from(port),
                         enabled: true,
+                        use_encryption: true,
+                        use_compression: true,
                     },
                     now,
                 )?;
