@@ -30,8 +30,8 @@ pub enum Mode {
     Reject(String),
     /// 正常会话：下发设备清单；之后转发 `push` 里的消息，并把节点发来的消息记录下来。
     Normal(Vec<NodeDevice>),
-    /// 登录成功并下发清单后立刻断开。
-    DropAfterSnapshot(Vec<NodeDevice>),
+    /// 登录成功并下发清单，收到节点的首帧对账后断开。
+    DropAfterResync(Vec<NodeDevice>),
     /// 登录成功后一言不发（节点应因心跳超时而重连）。
     Silent,
     /// 首次接入：签发节点 ID。
@@ -135,7 +135,7 @@ pub async fn fake_controller(first: Mode, node_pubkey: String) -> Fake {
                         let _ = write_frame(&mut wr, &r).await;
                         return;
                     }
-                    Mode::Normal(d) | Mode::DropAfterSnapshot(d) => d.clone(),
+                    Mode::Normal(d) | Mode::DropAfterResync(d) => d.clone(),
                     Mode::Silent => Vec::new(),
                     Mode::BadHelloReply => {
                         let _ = write_frame(&mut wr, &CtlMsg::Pong).await;
@@ -171,7 +171,10 @@ pub async fn fake_controller(first: Mode, node_pubkey: String) -> Fake {
                     write_frame(&mut wr, &CtlMsg::Device(d)).await.unwrap();
                 }
                 write_frame(&mut wr, &CtlMsg::SnapshotEnd).await.unwrap();
-                if matches!(mode, Mode::DropAfterSnapshot(_)) {
+                if matches!(mode, Mode::DropAfterResync(_)) {
+                    let Ok(NodeMsg::Resync { .. }) = read_frame::<_, NodeMsg>(&mut rd).await else {
+                        return;
+                    };
                     return;
                 }
                 let mut push_rx = push_rx.lock().await;
@@ -551,11 +554,11 @@ pub async fn reconnect_resyncs_and_the_data_plane_keeps_running() {
     let public = free_port();
     let dev = device("dev-1", &dev_key, 1, vec![tcp_proxy("t1", backend, public)]);
     let mut fake = fake_controller(
-        Mode::DropAfterSnapshot(vec![dev.clone()]),
+        Mode::DropAfterResync(vec![dev.clone()]),
         node_key.public_hex(),
     )
     .await;
-    fake.then(Mode::DropAfterSnapshot(vec![dev.clone()]));
+    fake.then(Mode::DropAfterResync(vec![dev.clone()]));
     let mut n = start(
         fake.port,
         node_key.clone(),
@@ -565,8 +568,10 @@ pub async fn reconnect_resyncs_and_the_data_plane_keeps_running() {
         (Duration::from_millis(100), Duration::from_secs(5)),
     )
     .await;
-    // 第一条连接立刻被掐断；设备此时才来登录，用的是节点本地缓存。
+    // 首条控制连接完成对账后断开；随后设备经节点本地名册登录。
+    until(&mut n.events, |e| matches!(e, LinkEvent::Connected)).await;
     until(&mut n.events, |e| matches!(e, LinkEvent::Disconnected(_))).await;
+    wait_for(|| async { n.handle.registry.len() == 1 }).await;
     let (mut crx, ccancel) = spawn_client(client(
         n.handle.edge_addr.port(),
         dev_key.clone(),
