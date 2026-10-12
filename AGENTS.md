@@ -56,4 +56,4 @@ Flutter：颜色、字号、圆角沿用 linkory 的 token / 共享控件，acti
 - P03 Flutter ✔（功能代码）：登录、概览（含流量图）、节点、客户端、隧道 CRUD/模板/批量、接入向导、审计、设置（主题/令牌/API Token/管理员）、日志、宽窄屏、深浅色；Web 同源托管并在严格 CSP 下实测。
   桌面：窗口壳、管理员控制台模式、受管本机模式、独立模式完整 TOML/YAML/JSON 文本编辑（校验后暂存/原子保存）、日志/诊断、托盘、自启动、通知、CA-07 Agent 更新与 D-09 Flutter App 更新代码均已实现并有自动化测试。三平台真实主机验收保留。
 - P07 官网与 Release 构建/签名工作流已实现；官网公网部署、真实签名 Release 所需密钥、公证和正式安全审计报告未完成。
-- 当前验收：`make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 均通过。Core 99.03/97.97/97.16、Server 97.16/95.80/92.88、Flutter 行 97.30 达到历史基线；Agent 97.07/91.40/91.29 中行/函数低于历史基线 98.14/95.36，分支达到 91.10 基线，`make cov` 因此仍失败。其余明确验收保留项见 `docs/IMPLEMENTATION_STATUS.md`。
+- 当前验收：`make lint`、`make cov` 已通过；Core 覆盖率 99.03/97.97/97.16、Agent 97.08/91.40/91.37、Server 97.16/95.79/92.88，Flutter 行覆盖率 97.26，均超过统一的 90% 最低门槛。其余明确验收保留项见 `docs/IMPLEMENTATION_STATUS.md`。

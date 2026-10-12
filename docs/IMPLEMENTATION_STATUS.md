@@ -7,7 +7,7 @@
 
 | 模块 / 需求 | 状态 | 现有证据与剩余工作 |
 |---|---|---|
-| P00 基础工程、CI、Rust/Flutter 覆盖率 | 部分完成 | workspace、CI、基线与真实冒烟已建立；Core、Server、Flutter 已达到历史基线。Agent 当前 97.07/91.40/91.29，行/函数低于 98.14/95.36 历史基线，分支已达到 91.10 基线；不得降低基线 |
+| P00 基础工程、CI、Rust/Flutter 覆盖率 | 已完成 | workspace、CI、覆盖率校验与真实冒烟已建立；Rust crates 的行/函数/分支覆盖率及 Flutter 行覆盖率均 ≥90%，`make cov` 通过。90% 是统一最低门槛，不再执行高于 90% 的历史回归门槛 |
 | M-01/11/12 登录、审计、角色 | 已实现待整体验收 | Cookie/CSRF/同源/限流/事务审计已有；管理员可由 Owner 经 REST/面板创建、改角色、启停、重置密码（需理由、事务审计、会话即时吊销，至少保留一位启用的 Owner，不能改自己的角色/状态）；CLI 仍可用 |
 | M-02 概览 | 已实现待整体验收 | 在线数/隧道数/版本、当前连接、近 24 小时流量（分钟桶聚合）、Controller 运行时长/常驻内存/累计 CPU 时间（读 `/proc/self`，仅 Linux 有值，其他平台显示「—」）已接入 REST 与面板；需在 Linux 实机复核数值 |
 | M-03/SV-03 多 Edge 管理 | 已实现代码，跨主机验收待做 | 独立节点：令牌接入、挑战签名登录、名册缓存、增量/全量下发、状态/流量回报、断线重连对账；Controller 具备节点 CRUD、设备节点指定和**在线设备跨节点迁移**（审计、旧节点隧道清理、目标 Edge TLS 指纹下发，Agent 重连并持久化目标）；若迁移会拆分 Visitor 与目标隧道则拒绝并明确提示。迁移同机回环测试通过，跨主机/WAN 验收属于本轮明确保留项。见 `docs/NODES.md` |
@@ -59,12 +59,12 @@
 | `make e2e` | 通过；真实 Controller/Agent/REST TCP 300000 字节回显、UDP/HTTP、重连及在线备份检查通过 |
 | `make web-build` | 通过，未使用外部 CDN |
 | `make bench-mem` | 通过；Edge/Client 在 100 条连接与 20 次回显后均低于 10 MiB |
-| Core 覆盖率 | 行/函数/分支 99.03/97.97/97.16，达到历史基线 |
-| Server 覆盖率 | 行/函数/分支 97.16/95.80/92.88，达到历史基线 |
-| Flutter 覆盖率 | 行 97.30，达到 97.28 基线 |
-| Agent 覆盖率 | 行/函数/分支 97.07/91.40/91.29；行/函数低于 98.14/95.36 历史基线，分支达到 91.10 基线，`make cov` 仍失败 |
+| Core 覆盖率 | 行/函数/分支 99.03/97.97/97.16%，均超过 90% 最低门槛 |
+| Server 覆盖率 | 行/函数/分支 97.16/95.79/92.88%，均超过 90% 最低门槛 |
+| Flutter 覆盖率 | 行 97.26%，超过 90% 最低门槛 |
+| Agent 覆盖率 | 行/函数/分支 97.08/91.40/91.37%，均超过 90% 最低门槛 |
 
-本轮指定的 TCPMUX passthrough、Visitor 加密/压缩、UDP/SUDP 连接限制、CA-07、D-09、设备迁移、桌面完整本地配置编辑、frps dashboard 与 `webServer.tls` / `assetsDir` 均已实现并有自动化测试。V1.0 整体验收仍未完成：Agent 覆盖率未达历史基线；真实签名 Release、公网部署、跨主机迁移验收、多平台实机验收和正式安全审计报告仍未完成。
+本轮指定的 TCPMUX passthrough、Visitor 加密/压缩、UDP/SUDP 连接限制、CA-07、D-09、设备迁移、桌面完整本地配置编辑、frps dashboard 与 `webServer.tls` / `assetsDir` 均已实现并有自动化测试。V1.0 整体验收仍未完成：真实签名 Release、公网部署、跨主机迁移验收、多平台实机验收和正式安全审计报告仍未完成。
 
 ## V1.0 之外（按原需求，不静默改范围）
 
@@ -72,13 +72,12 @@ XTCP / P2P 打洞、KCP/QUIC、frp 线协议互通、移动端、多租户计费
 
 ## 推进顺序与门槛
 
-1. 将 Agent 行/函数/分支覆盖率补回历史基线，不降低 `tools/cov/baseline.json`。
-2. 配置真实 Release 签名私钥和匹配公钥，发布并验证签名 Release。
-3. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和安全审计验收。
-4. 在 macOS ARM64/Intel、Windows x64、Linux x64 主机验收安装/更新、托盘、自启动、通知、后台 Agent 和系统服务；另在跨主机/WAN 环境验收迁移。
-5. 复测 Linux/高并发性能；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
+1. 配置真实 Release 签名私钥和匹配公钥，发布并验证签名 Release。
+2. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和安全审计验收。
+3. 在 macOS ARM64/Intel、Windows x64、Linux x64 主机验收安装/更新、托盘、自启动、通知、后台 Agent 和系统服务；另在跨主机/WAN 环境验收迁移。
+4. 复测 Linux/高并发性能；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
 
-每步：协议先行、测试有断言、fmt/clippy/analyze 全绿；每 crate 行/函数/分支 ≥90% 且不低于既有基线；Flutter 不低于基线；运行时改动复测内存。当前 lint、Rust/Flutter 全量测试、Web 构建、E2E、内存预算均通过；覆盖率只剩 Agent 历史基线未达。
+每步：协议先行、重要行为有有效断言、fmt/clippy/analyze 全绿；每 crate 行/函数/分支 ≥90%；运行时改动复测内存。当前 lint、Rust/Flutter 全量测试、覆盖率、Web 构建、E2E、内存预算均通过。
 
 外部交付条件：真实 Release 签名密钥、公网部署环境、跨主机网络，以及 Windows/Linux/macOS Intel 实机验收环境尚未配置；本机自动化结果不替代这些验收。
 

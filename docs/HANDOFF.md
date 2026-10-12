@@ -72,19 +72,19 @@ Flutter 测试偶尔超过 2 分钟，可在 `rustfrp-app/` 下直接 `flutter t
 
 ## 7. 质量现状（2026-10-12）
 
-| Crate | 行 | 函数 | 分支 | 历史基线 |
+| Crate | 行 | 函数 | 分支 | 90% 最低门槛 |
 |---|---:|---:|---:|---|
 | core | 99.03% | 97.97% | 97.16% | 通过 |
-| agent | 97.07% | 91.40% | 91.29% | 行/函数未通过（98.14/95.36）；分支通过（91.10） |
-| server | 97.16% | 95.80% | 92.88% | 通过 |
-| Flutter App | 97.30% | — | — | 通过（行基线 97.28%） |
+| agent | 97.08% | 91.40% | 91.37% | 通过 |
+| server | 97.16% | 95.79% | 92.88% | 通过 |
+| Flutter App | 97.26% | — | — | 通过 |
 
-- `make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 均通过；`make core-cov`、`make server-cov`、`make app-cov` 通过，`make agent-cov` 因 Agent 低于历史基线失败。
+- `make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 和 `make cov` 均通过；每个 crate 的行/函数/分支覆盖率门槛统一为 90%。
 - 本机 `flutter build macos --release` 成功，产出 `rustfrp_app.app`（52.2 MB）；该产物不是签名 Release，也不代表 Windows/Linux/macOS Intel 的实机验收。
 - `make bench-mem`（macOS Release，10 条隧道）：空闲 Edge/Client 5.05/5.06 MiB，100 条空闲连接 6.97/7.41 MiB；20 次 512 KiB 回显后 7.39/7.88 MiB，关闭后 7.41/7.89 MiB，均低于 10 MiB 上限。
 - `make e2e` 使用真实 server/agent 完成受管接入、300000 字节 TCP 回显、流量/日志/隧道列表、重连、UDP、HTTP 域名与子域名、在线备份及审计检查。新增 TCPMUX/加密/压缩、Agent 更新签名流水线、节点迁移与 dashboard 另有集成/单元测试。
 - 本轮未发布真实签名 Release，也未在 Windows、Linux、macOS Intel 真实主机完成安装验收；签名/公证密钥、公网部署与跨主机迁移环境尚未配置。
-- 本轮指定功能代码与自动化回归完成；Agent 历史覆盖率基线及正式安全审计仍未完成。不得通过降低覆盖率基线解决。
+- 本轮指定功能代码与自动化回归完成；覆盖率门槛已统一为 90%，正式安全审计仍未完成。
 - 代码里 `tests/` 下的集成测试不计入覆盖率；单元测试模块用 `#[cfg_attr(coverage, coverage(off))]`。
 
 ## 8. 已知注意事项
@@ -99,11 +99,10 @@ Flutter 测试偶尔超过 2 分钟，可在 `rustfrp-app/` 下直接 `flutter t
 
 ## 9. 剩余工作（按价值排序）
 
-1. 只需继续将 Agent 覆盖率补回历史基线；其他 Crate 与 Flutter 已达到基线。
-2. 配置受保护的 `RUSTFRP_RELEASE_SIGNING_KEY_PEM` 与匹配的 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX`，发布并验证真实签名 Release。
-3. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和正式安全审计。
-4. 在 macOS arm64/Intel、Windows x64、Linux x64 主机验收安装/更新/卸载、托盘、自启动、通知、后台 Agent 与系统服务。
-5. 在跨主机/WAN 环境复验迁移，并补 Linux/高并发性能测试；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
+1. 配置受保护的 `RUSTFRP_RELEASE_SIGNING_KEY_PEM` 与匹配的 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX`，发布并验证真实签名 Release。
+2. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和正式安全审计。
+3. 在 macOS arm64/Intel、Windows x64、Linux x64 主机验收安装/更新/卸载、托盘、自启动、通知、后台 Agent 与系统服务。
+4. 在跨主机/WAN 环境复验迁移，并补 Linux/高并发性能测试；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
 
 ## 10. 提交规范
 

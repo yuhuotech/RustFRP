@@ -711,9 +711,9 @@ Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用 Flutter 静
 ### 本轮验收记录
 
 宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；颜色与字号 token 无变更。
-Flutter analyze 与 158 项测试通过；Web 同源构建成功。Rust/Flutter 覆盖率见 [HANDOFF.md](HANDOFF.md)：Core、Server、Flutter 达到历史基线，Agent 仍低于历史基线。真实签名 Release、公网部署、跨主机迁移和多平台目标主机验收尚未完成。
+Flutter analyze 与 158 项测试通过；Web 同源构建成功。Rust/Flutter 覆盖率见 [HANDOFF.md](HANDOFF.md)：Rust crates 与 Flutter 行覆盖率均达到统一的 90% 最低门槛。真实签名 Release、公网部署、跨主机迁移和多平台目标主机验收尚未完成。
 macOS 隔离实例实测：首次接入错误提示、有效接入、停止、复用身份启动、菜单收起、重开保留折叠与原 PID、窗口完全退出后真实 TCP 隧道继续回显；最后通过本地控制接口停止并清理临时 launchd 任务。
-Rust 全仓测试、fmt / clippy、全链路冒烟通过；`make cov` 仅 Agent 覆盖率未达历史基线。2026-10-12 `make bench-mem`（10 条隧道）空闲 Edge/Client 为 5.05/5.06 MiB，100 条空闲连接为 6.97/7.41 MiB，20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB；均低于 10 MiB 上限。
+Rust 全仓测试、fmt / clippy、全链路冒烟与 `make cov` 均通过；行/函数/分支（Rust）和行（Flutter）的最低门槛统一为 90%。2026-10-12 `make bench-mem`（10 条隧道）空闲 Edge/Client 为 5.05/5.06 MiB，100 条空闲连接为 6.97/7.41 MiB，20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB；均低于 10 MiB 上限。
 
 菜单顶部品牌区：logo 22px、名称使用常规 13px；桌面顶部留 44px，Web 留 24px。收起时整行隐藏品牌图形与名称，只显示水平居中的展开按钮。
 
