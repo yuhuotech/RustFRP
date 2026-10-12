@@ -771,7 +771,8 @@ async fn client_rejects_an_invalid_server_name_and_a_failed_dial() {
         login_fail_exit: false,
         ..Default::default()
     };
-    assert!(first_end(cfg).await.contains("invalid server address"));
+    let reason = first_end(cfg).await;
+    assert!(reason.contains("invalid server address"), "{reason}");
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);

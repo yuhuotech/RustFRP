@@ -387,6 +387,9 @@ async fn session_once(
         reason,
         logged_in: false,
     };
+    let Ok(name) = ServerName::try_from(cfg.server_addr.clone()) else {
+        return lost("invalid server address for TLS".into());
+    };
     let tcp = match within(cfg.dial_timeout, "dial server", async {
         Ok(TcpStream::connect((cfg.server_addr.as_str(), cfg.server_port)).await?)
     })
@@ -396,9 +399,6 @@ async fn session_once(
         Err(e) => return lost(e.to_string()),
     };
     let _ = tcp.set_nodelay(true);
-    let Ok(name) = ServerName::try_from(cfg.server_addr.clone()) else {
-        return lost("invalid server address for TLS".into());
-    };
     let tls = match within(cfg.handshake_timeout, "tls handshake", async {
         Ok(connector.clone().connect(name, tcp).await?)
     })
