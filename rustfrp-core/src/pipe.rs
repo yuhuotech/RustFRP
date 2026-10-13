@@ -1,7 +1,7 @@
 //! 双向转发。
 //!
-//! 每个方向使用 8 KiB 缓冲（单连接合计 16 KiB），是「极致省内存」原则下的折中：
-//! 缓冲随连接存在而存在，空闲连接约占 16 KiB + 任务开销。
+//! 双向转发每个方向使用 4 KiB 缓冲（单连接合计 8 KiB），降低百连接场景的常驻内存。
+//! 缓冲随连接存在而存在；插件读循环及限速突发额度仍沿用 8 KiB。
 
 use std::future::Future;
 
@@ -9,6 +9,7 @@ use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite};
 
 /// 每方向缓冲大小。
 pub const BUF_SIZE: usize = 8 * 1024;
+const RELAY_BUF_SIZE: usize = 4 * 1024;
 
 /// 在 `a` 与 `b` 之间双向转发直到任一方关闭，返回 `(a→b 字节数, b→a 字节数)`。
 pub async fn relay<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
@@ -16,7 +17,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    copy_bidirectional_with_sizes(a, b, BUF_SIZE, BUF_SIZE).await
+    copy_bidirectional_with_sizes(a, b, RELAY_BUF_SIZE, RELAY_BUF_SIZE).await
 }
 
 /// 令牌桶限速器：一个代理的所有连接、两个方向共享同一个额度（与 frp 一致）。

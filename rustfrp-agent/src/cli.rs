@@ -186,7 +186,9 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
     if version {
         return Ok(Command::Version);
     }
-    let mode = mode.ok_or("missing --mode <client|edge> (or run as frpc / frps)")?;
+    let mode = mode
+        .or_else(|| admin.map(|_| Mode::Client))
+        .ok_or("missing --mode <client|edge> (or run as frpc / frps)")?;
     if tls_pin.is_some() && controller.is_none() {
         return Err("--tls-pin requires --controller".into());
     }
@@ -252,6 +254,31 @@ pub fn parse_args(argv0: &str, args: &[String]) -> Result<Command, String> {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_admin_commands_default_to_client_as_documented() {
+        for (command, action) in [
+            ("status", AdminAction::Status),
+            ("reload", AdminAction::Reload),
+            ("stop", AdminAction::Stop),
+        ] {
+            let Command::Admin(actual, options) =
+                p("rustfrp-agent", &[command, "-c", "frpc.toml"]).unwrap()
+            else {
+                panic!("expected client administration");
+            };
+            assert_eq!(actual, action);
+            assert_eq!(options.mode, Mode::Client);
+            assert_eq!(options.config, "frpc.toml");
+            assert!(p("frps", &[command, "-c", "frps.toml"]).is_err());
+            assert!(p(
+                "rustfrp-agent",
+                &[command, "--mode", "edge", "-c", "frps.toml"]
+            )
+            .is_err());
+        }
+        assert!(p("rustfrp-agent", &["-c", "frpc.toml"]).is_err());
+    }
 
     #[test]
     fn local_control_options() {

@@ -51,6 +51,8 @@ No signed Release has been published or verified with real Actions credentials
 yet. Configure `RUSTFRP_RELEASE_SIGNING_KEY_PEM` and the matching
 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX` variable before publishing; the workflow checks
 that the public key compiled into the Agent/App matches the signing key. Public
-website deployment, cross-host migration, and multi-platform host acceptance
-also remain deployment tasks; successful CI builds and local loopback tests do
-not establish those acceptance results.
+website deployment and multi-platform Flutter desktop acceptance remain tasks.
+The authorized Linux Controller/Agent deployment, public HTTPS panel and
+cross-host Edge migration passed on 2026-10-13; see
+`docs/WAN_ACCEPTANCE_20261013.md` for exact network scope and remaining limits.
+Those results do not establish a successfully signed Release update.

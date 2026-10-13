@@ -149,7 +149,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                 ],
                 const SizedBox(height: 16),
                 Text(
-                  '管理员账号只能在服务器上用 rustfrp-server admin create 创建。',
+                  '首位管理员需在服务器上用 rustfrp-server admin create 创建；之后由所有者在设置中管理。',
                   textAlign: TextAlign.center,
                   style: Type.caption.copyWith(color: c.text3),
                 ),

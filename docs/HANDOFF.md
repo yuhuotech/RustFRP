@@ -1,6 +1,8 @@
 # RustFRP 交接文档
 
-> 更新于 2026-10-12。进度的权威清单是 `docs/IMPLEMENTATION_STATUS.md`，协作规则见 `AGENTS.md`。本文记录本轮功能实现、整体验收结果及剩余条件。
+> 更新于 2026-10-13。进度的权威清单是 `docs/IMPLEMENTATION_STATUS.md`，协作规则见 `AGENTS.md`。本文记录本轮功能实现、整体验收结果及剩余条件。
+
+本轮已独立部署两台用户主机与 `https://rustfrp.dev99.cn`，完成 Linux Agent/Controller、Web 管理台、跨主机迁移和离线恢复。新增回归修复 CLI 管理命令默认模式、TCPMUX 兼容报告误报，缩小双向缓冲通过 Linux 10 MiB 内存门槛。端口、凭据位置、测试证据、服务和剩余验收见 [双主机验收记录](WAN_ACCEPTANCE_20261013.md)。
 
 ## 1. 仓库状态
 
@@ -64,34 +66,34 @@ CI 将 Rust crates 与 Flutter 的覆盖率校验放在各自的 Job；`make cov
 | 项 | 说明 |
 |---|---|
 | TCPMUX / Visitor 选项 / 连接上限 | TCPMUX passthrough、Visitor `useEncryption/useCompression`、UDP/SUDP `maxConnections` 均已实现并有回环/单元测试；XTCP 属 P2/V1.1 |
-| `frps` dashboard、`webServer.tls` / `assetsDir` | 运行时与自动化测试已实现；公网域名、证书和反向代理部署验收仍待完成 |
-| 设备跨节点迁移 | API、审计、旧节点代理清理、目标 Edge TLS 指纹固定、Agent 重连/持久化均已实现；跨主机/WAN 验收未做 |
+| `frps` dashboard、`webServer.tls` / `assetsDir` | Dashboard 鉴权与 Controller 公网 HTTPS 已在 Linux 实机验证；独立 Dashboard TLS/assetsDir 的公网部署仍待验证 |
+| 设备跨节点迁移 | 已在两台物理主机通过迁移、指纹重连/持久化、AT-05 和流量回报；NAT 侧节点数据面使用现有 Tailscale WAN 私网 |
 | 桌面本地配置编辑 | 完整 TOML/YAML/JSON 文本编辑、Agent 校验、暂存/原子替换和失败保护已实现并有自动化测试；目标主机验收未做 |
 | CA-07 / D-09 更新器 | Agent 与 Flutter App 均有 Ed25519 签名清单/版本标记验证、摘要校验、平台安装/回滚逻辑及自动化测试；签名私钥/公钥变量未配置，真实 Release 未发布 |
-| 官网与部署 | `rustfrp-web/`、Caddy/nginx/Compose/systemd 模板已加入，尚未部署 |
+| 官网与部署 | Linux Controller / Agent / HTTPS 面板已部署；`rustfrp-web/` 官网公网发布仍未完成 |
 | 多平台安装、系统集成与安全 | macOS/Linux/Windows 主机上的安装/更新、托盘、自启动、服务仍需真实验收；Apple 签名/公证、真实签名 Release、供应链加固与正式安全审计报告未完成 |
 
-## 7. 质量现状（2026-10-12）
+## 7. 质量现状（2026-10-13）
 
 | Crate | 行 | 函数 | 分支 | 90% 最低门槛 |
 |---|---:|---:|---:|---|
-| core | 99.03% | 97.97% | 97.16% | 通过 |
-| agent | 97.08% | 91.40% | 91.37% | 通过 |
+| core | 99.03% | 97.97% | 97.15% | 通过 |
+| agent | 97.08% | 91.41% | 91.52% | 通过 |
 | server | 97.16% | 95.79% | 92.88% | 通过 |
 | Flutter App | 97.26% | — | — | 通过 |
 
-- `make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 和 `make cov` 均通过；每个 crate 的行/函数/分支覆盖率门槛统一为 90%。
+- `make lint`、`make test`（601 项）、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 和 `make cov` 均通过；每个 crate 的行/函数/分支覆盖率门槛统一为 90%。
 - 本机 `flutter build macos --release` 成功，产出 `rustfrp_app.app`（52.2 MB）；该产物不是签名 Release，也不代表 Windows/Linux/macOS Intel 的实机验收。
 - `make bench-mem`（macOS Release，10 条隧道）：空闲 Edge/Client 5.05/5.06 MiB，100 条空闲连接 6.97/7.41 MiB；20 次 512 KiB 回显后 7.39/7.88 MiB，关闭后 7.41/7.89 MiB，均低于 10 MiB 上限。
 - `make e2e` 使用真实 server/agent 完成受管接入、300000 字节 TCP 回显、流量/日志/隧道列表、重连、UDP、HTTP 域名与子域名、在线备份及审计检查。新增 TCPMUX/加密/压缩、Agent 更新签名流水线、节点迁移与 dashboard 另有集成/单元测试。
-- 本轮未发布真实签名 Release，也未在 Windows、Linux、macOS Intel 真实主机完成安装验收；签名/公证密钥、公网部署与跨主机迁移环境尚未配置。
+- 2026-10-12 的本地基线没有实机部署；2026-10-13 已完成 Linux Agent/systemd、Controller HTTPS 和双主机迁移，仍未发布真实签名 Release，Windows/Linux/macOS Intel Flutter 桌面完整验收保留。
 - 本轮指定功能代码与自动化回归完成；覆盖率门槛已统一为 90%，正式安全审计仍未完成。
 - 代码里 `tests/` 下的集成测试不计入覆盖率；单元测试模块用 `#[cfg_attr(coverage, coverage(off))]`。
 
 ## 8. 已知注意事项
 
-- 没有在真实 systemctl / launchctl / schtasks、Windows/Linux 桌面主机或多机公网环境验证过；当前自动化测试不能替代这些验收。
-- 节点相关测试只在本机回环上跑过。
+- Linux systemctl / Agent 与双主机公网、Tailscale WAN 节点已实测；launchctl / schtasks 及多平台 Flutter 桌面完整验收仍未完成。
+- 本轮网络验收范围和未复测组合见 `WAN_ACCEPTANCE_20261013.md`，不能外推为正式 Release 或全面安全审计。
 - `*2*` 类插件只支持 HTTP/1.1，不支持 HTTP/2。
 - 为插件启用了 rustls 的 `tls12` 特性（仅应用层配置使用，隧道本身仍是 TLS 1.3）。
 - `rustfrp-protocol/fixtures/edge-test-*.pem` 是测试用自签名证书和私钥，已提交。
@@ -101,9 +103,9 @@ CI 将 Rust crates 与 Flutter 的覆盖率校验放在各自的 Job；`make cov
 ## 9. 剩余工作（按价值排序）
 
 1. 配置受保护的 `RUSTFRP_RELEASE_SIGNING_KEY_PEM` 与匹配的 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX`，发布并验证真实签名 Release。
-2. 部署官网与 Controller，完成公网 HTTPS、Cookie、WebSocket 和正式安全审计。
+2. 发布官网并完成正式安全审计；Controller HTTPS/Cookie 已验。配置下发使用隧道控制流，无 WebSocket。
 3. 在 macOS arm64/Intel、Windows x64、Linux x64 主机验收安装/更新/卸载、托盘、自启动、通知、后台 Agent 与系统服务。
-4. 在跨主机/WAN 环境复验迁移，并补 Linux/高并发性能测试；之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
+4. 补 1000 连接、50 设备、吞吐和延迟专项测试；跨主机迁移、Linux 100 连接内存已验，之后再评估 V1.1 的 XTCP、KCP/QUIC 和协议互通。
 
 ## 10. 提交规范
 

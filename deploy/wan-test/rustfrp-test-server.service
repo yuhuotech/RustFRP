@@ -1,0 +1,28 @@
+[Unit]
+Description=RustFRP WAN test Controller (isolated from frp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustfrp-test
+Group=rustfrp-test
+WorkingDirectory=/var/lib/rustfrp-test
+EnvironmentFile=/etc/rustfrp-test/server.env
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+ExecStart=/opt/rustfrp-test/bin/rustfrp-server run
+Restart=on-failure
+RestartSec=3
+StateDirectory=rustfrp-test
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rustfrp-test
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

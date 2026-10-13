@@ -2,7 +2,9 @@
 
 RustFRP 是一个自托管内网穿透系统，包含 Rust 数据面与 Controller、Flutter Web 管理面板和桌面端。配置层以 frp 配置为兼容目标；RustFRP 的线协议与官方 frp 不互通，迁移时两端都要使用 RustFRP。
 
-## 当前进度（2026-10-12）
+## 当前进度（2026-10-13）
+
+已在 `182.254.220.82` / `172.17.32.251` 独立部署 Linux Controller、Agent 和公网 HTTPS 面板（`https://rustfrp.dev99.cn`），原 frp 不受影响。受管/独立隧道、8 类插件、管理操作、节点跨主机迁移、控制面离线恢复和 Linux systemd 通过真实联调；端口、证据与明确未验收项见 [双主机验收记录](docs/WAN_ACCEPTANCE_20261013.md)。
 
 **本轮指定的遗留功能已全部完成代码实现，并通过自动化回归；V1.0 整体仍未完成交付验收。** 既有 TCP/UDP/HTTP/HTTPS、STCP/SUDP、受管与独立模式、插件、健康检查、负载均衡、限速、PROXY protocol、Controller 多节点、流量与日志、配置导入导出、备份和配置化数据保留均已实现。
 
@@ -19,23 +21,23 @@ RustFRP 是一个自托管内网穿透系统，包含 Rust 数据面与 Controll
 ### 仍未完成的验收
 
 - 真实签名 Release 所需私钥与 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX` 尚未配置；CA-07/D-09 会在缺少可信公钥时 fail closed。
-- 官网/Controller 公网部署、跨主机迁移、Windows/Linux/macOS Intel 实机验收仍未完成。
+- 官网公网部署、Windows/Linux/macOS Intel Flutter 桌面完整实机验收仍未完成；Controller HTTPS、Linux Agent 服务和跨主机迁移已通过本轮指定环境验收。
 - 正式安全审计报告尚未出具；XTCP/P2P、KCP/QUIC、frp 线协议互通、移动端、ACME、多租户计费和 Webhook 告警属于 V1.1/V2。
 
 XTCP/P2P、KCP/QUIC、frp 线协议互通、移动端、ACME、多租户计费和 Webhook 告警属于需求中的 V1.1/V2 范围，不计入本次 V1.0 完成声明。
 
-## 本轮整体验收（2026-10-12）
+## 本轮整体验收（2026-10-13）
 
-`make lint`、`make test`、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 和 `make cov` 通过。覆盖率统一按每 crate 各指标至少 90% 验收，不再要求追平历史高点。覆盖率如下：
+`make lint`、`make test`（601 项）、`make app-test`（158 项）、`make web-build`、`make e2e`、`make bench-mem` 和 `make cov` 通过。覆盖率统一按每 crate 各指标至少 90% 验收，不再要求追平历史高点。覆盖率如下：
 
 | Crate | 行覆盖率 | 函数覆盖率 | 分支覆盖率 |
 |---|---:|---:|---:|
-| rustfrp-core | 99.03% | 97.97% | 97.16% |
-| rustfrp-agent | 97.08% | 91.40% | 91.37% |
+| rustfrp-core | 99.03% | 97.97% | 97.15% |
+| rustfrp-agent | 97.08% | 91.41% | 91.52% |
 | rustfrp-server | 97.16% | 95.79% | 92.88% |
 | Flutter App | 97.26% | — | — |
 
-Core、Agent、Server 的行/函数/分支覆盖率及 Flutter 行覆盖率均达到 90% 门槛，`make cov` 全部通过。100 条空闲连接 Release RSS 为 Edge/Client 6.97/7.41 MiB；20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB，均低于 10 MiB。
+Core、Agent、Server 的行/函数/分支及 Flutter 行覆盖率均达到 90% 门槛。双向每方向 4 KiB 缓冲后，Linux 10 隧道/100 连接 RSS 峰值 Edge/Client 8.91/9.46 MiB，macOS 为 6.64/7.19 MiB，均低于 10 MiB。
 
 权威的逐项状态、质量门槛和验收边界见 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)；接手说明见 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
 

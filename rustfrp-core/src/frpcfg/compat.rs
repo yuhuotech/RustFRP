@@ -178,13 +178,6 @@ pub(crate) fn check_server(s: &ServerConfig, r: &mut CompatReport) {
             "server HTTP plugins are not implemented",
         );
     }
-    if s.tcpmux_http_connect_port > 0 {
-        r.add(
-            Severity::Unsupported,
-            "tcpmuxHTTPConnectPort",
-            "tcpmux is planned for a later phase",
-        );
-    }
     if s.enable_prometheus {
         r.add(
             Severity::Unsupported,
@@ -323,6 +316,17 @@ mod tests {
     }
 
     #[test]
+    fn supported_server_tcpmux_has_no_compatibility_warning() {
+        let mut server = ServerConfig::default();
+        server.complete();
+        server.tcpmux_http_connect_port = 27002;
+        server.tcpmux_passthrough = true;
+        let mut report = CompatReport::default();
+        check_server(&server, &mut report);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+    }
+
+    #[test]
     fn server_issues() {
         let mut s = ServerConfig::default();
         s.complete();
@@ -347,7 +351,6 @@ mod tests {
                 "quicBindPort",
                 "sshTunnelGateway",
                 "httpPlugins",
-                "tcpmuxHTTPConnectPort",
                 "enablePrometheus"
             ]
         );
