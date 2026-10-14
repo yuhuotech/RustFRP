@@ -1,0 +1,16 @@
+{
+  "state_dir": "/var/lib/rustfrp-test-monitor",
+  "services": {
+    "rustfrp-test-server.service": {"rss_mib": 12, "cpu_percent": 10, "threads": 16},
+    "rustfrp-test-node.service": {"rss_mib": 10, "cpu_percent": 10, "threads": 16},
+    "rustfrp-test-standalone-edge.service": {"rss_mib": 10, "cpu_percent": 10, "threads": 16}
+  },
+  "metrics_url": "http://127.0.0.1:28080/metrics",
+  "metrics_env": "/etc/rustfrp-test/server.env",
+  "minimum_metrics": {
+    "rustfrp_clients_online": 1,
+    "rustfrp_nodes_online": 2,
+    "rustfrp_tunnels_running": 7
+  },
+  "echo_address": ["127.0.0.1", 27100]
+}

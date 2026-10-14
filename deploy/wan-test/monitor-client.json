@@ -1,0 +1,9 @@
+{
+  "state_dir": "/var/lib/rustfrp-test-monitor",
+  "services": {
+    "rustfrp-test-client.service": {"rss_mib": 10, "cpu_percent": 10, "threads": 16},
+    "rustfrp-test-lan-node.service": {"rss_mib": 10, "cpu_percent": 10, "threads": 16},
+    "rustfrp-test-standalone-client.service": {"rss_mib": 10, "cpu_percent": 10, "threads": 16}
+  },
+  "echo_address": ["182.254.220.82", 27100]
+}

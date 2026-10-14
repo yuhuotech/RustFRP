@@ -1,0 +1,21 @@
+[Unit]
+Description=RustFRP bounded resource and availability snapshot
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B /opt/rustfrp-test/monitor/sample.py --config /etc/rustfrp-test/monitor.json
+StateDirectory=rustfrp-test-monitor
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rustfrp-test-monitor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=64M
+TasksMax=16
+TimeoutStartSec=45
+StandardOutput=journal
+StandardError=journal
