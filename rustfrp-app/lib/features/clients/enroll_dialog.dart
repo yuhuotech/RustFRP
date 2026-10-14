@@ -14,7 +14,7 @@ import '../../theme/tokens.dart';
 Future<void> showEnrollDialog(BuildContext context) =>
     showDialog<void>(context: context, builder: (_) => const EnrollDialog());
 
-/// 接入新节点（独立 Edge 进程）。
+/// 接入服务端节点（独立 Edge 进程）。
 Future<void> showNodeEnrollDialog(BuildContext context) => showDialog<void>(
   context: context,
   builder: (_) => const EnrollDialog(forNode: true),
@@ -24,7 +24,7 @@ Future<void> showNodeEnrollDialog(BuildContext context) => showDialog<void>(
 class EnrollDialog extends ConsumerStatefulWidget {
   const EnrollDialog({super.key, this.forNode = false});
 
-  /// true = 接入新节点；false = 接入新客户端。
+  /// true = 接入服务端节点；false = 接入新客户端。
   final bool forNode;
   @override
   ConsumerState<EnrollDialog> createState() => _EnrollDialogState();
@@ -64,7 +64,7 @@ class _EnrollDialogState extends ConsumerState<EnrollDialog> {
             _name.text.trim(),
             _ttl,
             widget.forNode
-                ? '通过面板接入新节点「${_name.text.trim()}」'
+                ? '通过面板接入服务端节点「${_name.text.trim()}」'
                 : '通过面板接入新客户端「${_name.text.trim()}」',
             kind: widget.forNode ? 'node' : 'client',
             nodeId: widget.forNode ? '' : _effectiveNodeId(),
@@ -85,14 +85,14 @@ class _EnrollDialogState extends ConsumerState<EnrollDialog> {
     final nodes = ref.watch(nodesProvider).asData?.value ?? const <NodeInfo>[];
     if (r == null) {
       return DialogShell(
-        title: widget.forNode ? '接入新节点' : '接入新客户端',
+        title: widget.forNode ? '接入服务端节点' : '接入新客户端',
         content: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(
               widget.forNode
-                  ? '给这个节点起个名字，然后在它的服务器上执行生成的命令。节点是单独运行的 Edge：控制器离线时，已连接的客户端和隧道继续工作。'
+                  ? '给这个服务端节点起个名字，然后在它的服务器上执行生成的命令。它是单独运行的 Edge：控制器离线时，已连接的客户端和隧道继续工作。'
                   : '给这台机器起个名字，然后复制生成的命令到它的终端里执行。命令里的令牌只能使用一次。',
               style: Type.body.copyWith(color: c.text2),
             ),
@@ -276,7 +276,7 @@ class _EnrollDialogState extends ConsumerState<EnrollDialog> {
       actions: [
         if (joinedNode != null)
           LButton(
-            label: '查看节点',
+            label: '查看服务端节点',
             variant: BtnVariant.solid,
             onPressed: () {
               ref.read(selectedNodeProvider.notifier).select(joinedNode.id);

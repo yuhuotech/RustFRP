@@ -8,6 +8,7 @@ import '../../core/store.dart';
 import '../../shared/format.dart';
 import '../../shared/panel_widgets.dart';
 import '../../shared/widgets.dart';
+import '../../shared/workspace_widgets.dart';
 import '../../theme/tokens.dart';
 import '../shell/shell.dart';
 import '../tunnels/tunnels_view.dart';
@@ -24,6 +25,7 @@ class ClientsList extends ConsumerWidget {
     final role = ref.watch(sessionProvider.select((s) => s.role));
     final selected = ref.watch(selectedClientProvider);
     final clients = ref.watch(clientsProvider);
+    final nodes = ref.watch(nodesProvider).asData?.value ?? const <NodeInfo>[];
     return Column(
       children: [
         if (narrow || showHeader)
@@ -64,6 +66,133 @@ class ClientsList extends ConsumerWidget {
                             onPressed: () => showEnrollDialog(context),
                           )
                         : null,
+                  )
+                : showHeader
+                ? ListView(
+                    padding: const EdgeInsets.all(24),
+                    children: [
+                      PageIntro(
+                        icon: LucideIcons.monitor,
+                        title: '客户端设备',
+                        description: '查看设备连接状态、所属服务端节点与 Agent 版本，点击设备管理隧道和访问者。',
+                        color: c.directText,
+                        badges: [
+                          LBadge('共 ${list.length} 台'),
+                          LBadge(
+                            '${list.where((d) => d.online).length} 台在线',
+                            bg: c.successSoft,
+                            fg: c.successText,
+                          ),
+                        ],
+                      ),
+                      ResourceTable(
+                        columns: const [
+                          ('客户端 / 标签', 4),
+                          ('状态', 2),
+                          ('系统 / Agent', 3),
+                          ('服务端节点', 3),
+                          ('最近连接', 3),
+                          ('操作', 2),
+                        ],
+                        rows: [
+                          for (final d in list)
+                            ResourceRow(
+                              key: Key('client-row-${d.id}'),
+                              onTap: () => ref
+                                  .read(selectedClientProvider.notifier)
+                                  .select(d.id),
+                              cells: [
+                                (
+                                  Row(
+                                    children: [
+                                      DeviceGlyph(
+                                        type: d.os,
+                                        size: 32,
+                                        online: d.online,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: TableText(
+                                          d.name,
+                                          subtitle: d.tags.isEmpty
+                                              ? d.id
+                                              : d.tags.join(' / '),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  4,
+                                ),
+                                (
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: LBadge(
+                                      d.disabled
+                                          ? '已停用'
+                                          : (d.online ? '在线' : '离线'),
+                                      bg: d.disabled
+                                          ? c.bgSubtle
+                                          : (d.online
+                                                ? c.successSoft
+                                                : c.warningSoft),
+                                      fg: d.disabled
+                                          ? c.text2
+                                          : (d.online
+                                                ? c.successText
+                                                : c.warningText),
+                                    ),
+                                  ),
+                                  2,
+                                ),
+                                (
+                                  TableText(
+                                    '${osLabel(d.os)} ${d.arch}',
+                                    subtitle:
+                                        'Agent ${d.version.isEmpty ? '—' : d.version}',
+                                  ),
+                                  3,
+                                ),
+                                (
+                                  TableText(
+                                    d.nodeId.isEmpty
+                                        ? '内置节点'
+                                        : nodes
+                                                  .where(
+                                                    (n) => n.id == d.nodeId,
+                                                  )
+                                                  .firstOrNull
+                                                  ?.name ??
+                                              d.nodeId,
+                                    color: c.directText,
+                                  ),
+                                  3,
+                                ),
+                                (
+                                  TableText(
+                                    d.online
+                                        ? '现在'
+                                        : relativeTime(d.lastSeenAt),
+                                    subtitle: d.lastIp.isEmpty
+                                        ? '暂无登录 IP'
+                                        : d.lastIp,
+                                  ),
+                                  3,
+                                ),
+                                (
+                                  LButton(
+                                    label: '查看详情',
+                                    compact: true,
+                                    onPressed: () => ref
+                                        .read(selectedClientProvider.notifier)
+                                        .select(d.id),
+                                  ),
+                                  2,
+                                ),
+                              ],
+                            ),
+                        ],
+                      ),
+                    ],
                   )
                 : ListView(
                     padding: EdgeInsets.all(showHeader ? 24 : 8),
@@ -626,6 +755,14 @@ class ClientDetail extends ConsumerWidget {
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              PageIntro(
+                icon: DeviceGlyph.iconFor(d.os),
+                title: '设备连接概况',
+                description:
+                    '${osLabel(d.os)} ${d.arch} · Agent ${d.version.isEmpty ? '版本未上报' : d.version} · 当前配置版本 ${d.revision}',
+                color: c.directText,
+                badges: [LBadge('共 ${mine.length} 条隧道')],
+              ),
               Wrap(
                 spacing: 6,
                 runSpacing: 6,
@@ -641,64 +778,83 @@ class ClientDetail extends ConsumerWidget {
                 ],
               ),
               const SizedBox(height: 16),
-              const SectionTitle('设备信息'),
-              PanelCard(
-                child: Column(
-                  children: [
-                    InfoRow('设备 ID', d.id, mono: true),
-                    InfoRow('系统', '${osLabel(d.os)} ${d.arch}'),
-                    InfoRow('Agent 版本', d.version.isEmpty ? '—' : d.version),
-                    InfoRow('接入时间', fullTime(d.createdAt)),
-                    InfoRow(
-                      '最近在线',
-                      d.online ? '现在' : relativeTime(d.lastSeenAt),
-                    ),
-                    InfoRow(
-                      '最近 IP',
-                      d.lastIp.isEmpty ? '—' : d.lastIp,
-                      mono: true,
-                    ),
-                    InfoRow('配置版本', '${d.revision}'),
-                    InfoRow(
-                      '连接数上限',
-                      d.maxConnections == 0 ? '不限' : '${d.maxConnections}',
-                    ),
-                    InfoRow(
-                      '所属节点',
-                      d.nodeId.isEmpty ? '内置节点' : d.nodeId,
-                      mono: d.nodeId.isNotEmpty,
-                    ),
-                    if (isNarrow(context) && canAdmin) ...[
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          LButton(
-                            key: const Key('client-connection-limit'),
-                            label: '连接数上限',
-                            compact: true,
-                            onPressed: () =>
-                                _editConnectionLimit(context, ref, d),
+              DetailGrid(
+                children: [
+                  DetailPanel(
+                    title: '设备信息',
+                    icon: DeviceGlyph.iconFor(d.os),
+                    color: c.directText,
+                    child: Column(
+                      children: [
+                        InfoRow('设备 ID', d.id, mono: true),
+                        InfoRow('系统', '${osLabel(d.os)} ${d.arch}'),
+                        InfoRow(
+                          'Agent 版本',
+                          d.version.isEmpty ? '—' : d.version,
+                        ),
+                        InfoRow('配置版本', '${d.revision}'),
+                        InfoRow(
+                          '连接数上限',
+                          d.maxConnections == 0 ? '不限' : '${d.maxConnections}',
+                        ),
+                        if (isNarrow(context) && canAdmin) ...[
+                          const SizedBox(height: 12),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              LButton(
+                                key: const Key('client-connection-limit'),
+                                label: '连接数上限',
+                                compact: true,
+                                onPressed: () =>
+                                    _editConnectionLimit(context, ref, d),
+                              ),
+                              LButton(
+                                key: const Key('client-migrate-node'),
+                                label: '迁移节点',
+                                compact: true,
+                                onPressed: () => _moveNode(context, ref, d),
+                              ),
+                              if (d.online)
+                                LButton(
+                                  key: const Key('client-update-agent'),
+                                  label: '更新 Agent',
+                                  compact: true,
+                                  onPressed: () =>
+                                      _updateAgent(context, ref, d),
+                                ),
+                            ],
                           ),
-                          LButton(
-                            key: const Key('client-migrate-node'),
-                            label: '迁移节点',
-                            compact: true,
-                            onPressed: () => _moveNode(context, ref, d),
-                          ),
-                          if (d.online)
-                            LButton(
-                              key: const Key('client-update-agent'),
-                              label: '更新 Agent',
-                              compact: true,
-                              onPressed: () => _updateAgent(context, ref, d),
-                            ),
                         ],
-                      ),
-                    ],
-                  ],
-                ),
+                      ],
+                    ),
+                  ),
+                  DetailPanel(
+                    title: '连接与接入',
+                    icon: LucideIcons.network,
+                    color: c.actionText,
+                    child: Column(
+                      children: [
+                        InfoRow(
+                          '所属节点',
+                          d.nodeId.isEmpty ? '内置节点' : d.nodeId,
+                          mono: d.nodeId.isNotEmpty,
+                        ),
+                        InfoRow('接入时间', fullTime(d.createdAt)),
+                        InfoRow(
+                          '最近在线',
+                          d.online ? '现在' : relativeTime(d.lastSeenAt),
+                        ),
+                        InfoRow(
+                          '最近 IP',
+                          d.lastIp.isEmpty ? '—' : d.lastIp,
+                          mono: true,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
               if (isNarrow(context) && role.atLeast(Role.operator)) ...[
                 const SizedBox(height: 12),
@@ -726,6 +882,8 @@ class ClientDetail extends ConsumerWidget {
               const SizedBox(height: 24),
               SectionTitle(
                 '隧道（${mine.length}）',
+                icon: LucideIcons.waypoints,
+                color: c.actionText,
                 trailing: role.atLeast(Role.operator)
                     ? LButton(
                         key: const Key('client-new-tunnel'),

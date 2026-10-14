@@ -186,7 +186,7 @@ void main() {
       final s = FakeServer();
       s.addClient('nas', isOnline: true);
       await Harness.create(tester, s, size: const Size(1200, 1600));
-      await tester.tap(find.byTooltip('隧道'));
+      await tester.tap(find.byTooltip('隧道管理'));
       await settle(tester);
       await tapKey(tester, 'new-tunnel');
       await tester.tap(find.text('选择客户端'));

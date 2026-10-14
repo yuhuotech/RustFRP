@@ -35,7 +35,8 @@ void main() {
       await openClients(tester);
       expect(find.text('nas'), findsOneWidget);
       expect(find.textContaining('已停用'), findsOneWidget);
-      expect(find.textContaining('Linux · 在线'), findsOneWidget);
+      expect(find.textContaining('Linux'), findsOneWidget);
+      expect(find.text('在线'), findsOneWidget);
 
       await tester.tap(find.byKey(Key('client-row-${a['id']}')));
       await settle(tester);
@@ -303,7 +304,7 @@ void main() {
       enabled: false,
     );
     await Harness.create(tester, s);
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     expect(find.text('ssh'), findsOneWidget);
     expect(find.text('listen on port 6001 failed'), findsOneWidget);
@@ -352,7 +353,7 @@ void main() {
     final c = s.addClient('nas', isOnline: true);
     s.addTunnel(c['id']! as String, 'taken', remote: 6000);
     await Harness.create(tester, s);
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     await tapKey(tester, 'new-tunnel');
     expect(find.text('新建隧道'), findsWidgets);
@@ -402,7 +403,7 @@ void main() {
     tester,
   ) async {
     await Harness.create(tester, FakeServer());
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     expect(find.text('先接入一台客户端，再为它创建隧道。'), findsOneWidget);
     final btn = tester.widget<LButton>(find.byKey(const Key('new-tunnel')));
@@ -412,7 +413,7 @@ void main() {
     final c = v.addClient('nas');
     v.addTunnel(c['id']! as String, 'ssh');
     await Harness.create(tester, v);
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     expect(find.text('ssh'), findsOneWidget);
     expect(find.byKey(const Key('new-tunnel')), findsNothing);
@@ -469,7 +470,7 @@ void main() {
       final s = FakeServer();
       final c = s.addClient('nas', isOnline: true);
       await Harness.create(tester, s, size: const Size(1200, 1600));
-      await tester.tap(find.byTooltip('隧道'));
+      await tester.tap(find.byTooltip('隧道管理'));
       await settle(tester);
 
       // UDP
@@ -779,7 +780,7 @@ void main() {
     final a = s.addTunnel(client['id']! as String, 'batch-a');
     final b = s.addTunnel(client['id']! as String, 'batch-b');
     await Harness.create(tester, s, size: const Size(1200, 1000));
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     await tapKey(tester, 'select-tunnel-${a['id']}');
     await tapKey(tester, 'select-tunnel-${b['id']}');
@@ -815,7 +816,7 @@ void main() {
     final s = FakeServer();
     s.addClient('template-device');
     await Harness.create(tester, s, size: const Size(1200, 1100));
-    await tester.tap(find.byTooltip('隧道'));
+    await tester.tap(find.byTooltip('隧道管理'));
     await settle(tester);
     await tapKey(tester, 'new-tunnel');
     for (final entry in [

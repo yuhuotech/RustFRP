@@ -29,7 +29,7 @@ class AppSidebar extends ConsumerWidget {
     required this.onHome,
     this.status,
   });
-  static const expandedWidth = 200.0;
+  static const expandedWidth = 160.0;
   static const collapsedWidth = 72.0;
   final List<SidebarEntry> items, bottomItems;
   final VoidCallback onHome;
@@ -51,7 +51,7 @@ class AppSidebar extends ConsumerWidget {
             child: collapsed
                 ? Center(child: _toggle(ref, collapsed))
                 : Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    padding: const EdgeInsets.only(left: 20, right: 12),
                     child: Row(
                       children: [
                         BrandHomeButton(onPressed: onHome, size: 22),
@@ -67,14 +67,17 @@ class AppSidebar extends ConsumerWidget {
                     ),
                   ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 24),
           Expanded(
             child: SingleChildScrollView(
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Column(
                 children: [
                   for (final item in items)
-                    _MenuItem(item: item, collapsed: collapsed),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: _MenuItem(item: item, collapsed: collapsed),
+                    ),
                 ],
               ),
             ),
@@ -130,10 +133,12 @@ class _MenuItem extends StatelessWidget {
       message: item.label,
       child: HoverRow(
         selected: item.selected,
-        padding: EdgeInsets.symmetric(horizontal: collapsed ? 0 : 8),
+        selectedColor: c.actionSoft,
+        selectedBorderColor: c.action.withValues(alpha: 0.45),
+        padding: EdgeInsets.symmetric(horizontal: collapsed ? 0 : 12),
         onTap: item.onSelect,
         child: SizedBox(
-          height: 28,
+          height: 40,
           child: Row(
             mainAxisAlignment: collapsed
                 ? MainAxisAlignment.center
@@ -142,15 +147,23 @@ class _MenuItem extends StatelessWidget {
               Icon(
                 item.icon,
                 size: 18,
-                color: item.selected ? c.text1 : c.text2,
+                color: switch (item.icon) {
+                  LucideIcons.monitor || LucideIcons.settings => c.directText,
+                  LucideIcons.scrollText => c.warningText,
+                  LucideIcons.waypoints || LucideIcons.server => c.actionText,
+                  _ => item.selected ? c.text1 : c.text2,
+                },
               ),
               if (!collapsed) ...[
-                const SizedBox(width: 8),
+                const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     item.label,
                     style: Type.body.copyWith(
-                      color: item.selected ? c.text1 : c.text2,
+                      color: item.selected ? c.actionText : c.text2,
+                      fontWeight: item.selected
+                          ? FontWeight.w500
+                          : FontWeight.w400,
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),

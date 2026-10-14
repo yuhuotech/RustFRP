@@ -34,10 +34,10 @@ class NavSpec {
 
 const navItems = [
   NavSpec(Section.overview, LucideIcons.layoutDashboard, '概览'),
-  NavSpec(Section.nodes, LucideIcons.server, '节点'),
+  NavSpec(Section.nodes, LucideIcons.server, '节点管理'),
   NavSpec(Section.clients, LucideIcons.monitor, '客户端'),
-  NavSpec(Section.tunnels, LucideIcons.waypoints, '隧道'),
-  NavSpec(Section.audit, LucideIcons.scrollText, '审计', minRole: Role.admin),
+  NavSpec(Section.tunnels, LucideIcons.waypoints, '隧道管理'),
+  NavSpec(Section.audit, LucideIcons.scrollText, '审计日志', minRole: Role.admin),
 ];
 
 /// Root: decides between splash, login and the app shell.
@@ -133,7 +133,7 @@ class _WideLayout extends ConsumerWidget {
                     ref.read(localModeProvider.notifier).select(true),
               ),
             SidebarEntry(
-              label: '设置',
+              label: '系统设置',
               icon: LucideIcons.settings,
               selected: section == Section.settings,
               onSelect: () =>
@@ -197,7 +197,7 @@ class _NarrowLayout extends ConsumerWidget {
     final c = context.c;
     final all = [
       ...items,
-      const NavSpec(Section.settings, LucideIcons.settings, '设置'),
+      const NavSpec(Section.settings, LucideIcons.settings, '系统设置'),
     ];
     final Widget page = switch (section) {
       Section.overview => const OverviewView(),

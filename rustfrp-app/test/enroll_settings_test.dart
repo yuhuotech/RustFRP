@@ -183,10 +183,58 @@ void main() {
     expect(find.textContaining('最近在线'), findsOneWidget);
   });
 
+  for (final (width, columns) in [
+    (1440.0, 6),
+    (1200.0, 3),
+    (390.0, 2),
+    (280.0, 1),
+  ]) {
+    for (final theme in ['light', 'dark']) {
+      testWidgets('overview compact metrics: $width px, $theme', (
+        tester,
+      ) async {
+        await Harness.create(
+          tester,
+          FakeServer(),
+          size: Size(width, 1200),
+          prefs: {'theme_mode': theme},
+        );
+        final cards = [
+          for (final name in [
+            'clients',
+            'tunnels',
+            'tokens',
+            'connections',
+            'traffic-24h',
+            'controller',
+          ])
+            tester.getRect(find.byKey(Key('metric-$name'))),
+        ];
+        for (var i = 0; i < cards.length; i++) {
+          expect(cards[i].height, lessThanOrEqualTo(96));
+          expect(cards[i].height, cards.first.height);
+          expect(cards[i].top, cards[i ~/ columns * columns].top);
+          if (i % columns != 0) {
+            expect(cards[i].left, greaterThan(cards[i - 1].right));
+          } else if (i != 0) {
+            expect(cards[i].top, greaterThan(cards[i - 1].bottom));
+          }
+          expect(cards[i].right, lessThanOrEqualTo(width));
+        }
+        // Long runtime details remain available even when a caption is truncated.
+        expect(
+          find.byTooltip('内存 5.0 MiB · 运行 1 天 1 小时 · CPU 累计 12.3s'),
+          findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+      });
+    }
+  }
+
   testWidgets('node page', (tester) async {
     final s = FakeServer()..publicHost = '';
     await Harness.create(tester, s);
-    await tester.tap(find.byTooltip('节点'));
+    await tester.tap(find.byTooltip('节点管理'));
     await settle(tester);
     expect(find.textContaining('未配置'), findsWidgets);
     await tapKey(tester, 'node-row-builtin');
@@ -238,7 +286,7 @@ void main() {
       },
     ]);
     final h = await Harness.create(tester, s);
-    await tester.tap(find.byTooltip('审计'));
+    await tester.tap(find.byTooltip('审计日志'));
     await settle(tester);
     expect(find.text('创建隧道'), findsOneWidget);
     expect(find.text('权限不足'), findsOneWidget);
@@ -250,7 +298,9 @@ void main() {
     expect(find.text('成功'), findsNWidgets(2));
     expect(find.text('拒绝'), findsOneWidget);
     expect(find.textContaining('理由：需要 SSH'), findsOneWidget);
-    expect(find.textContaining('root · 1.2.3.4 · tunnel t1'), findsOneWidget);
+    expect(find.text('root'), findsOneWidget);
+    expect(find.text('1.2.3.4'), findsOneWidget);
+    expect(find.text('tunnel t1'), findsOneWidget);
     await tester.tap(find.byTooltip('刷新'));
     await settle(tester);
     expect(
@@ -299,7 +349,7 @@ void main() {
       'revoked_at': null,
     });
 
-    await tester.tap(find.byTooltip('设置'));
+    await tester.tap(find.byTooltip('系统设置'));
     await settle(tester);
     expect(find.text('root'), findsWidgets);
     expect(find.text('所有者'), findsWidgets);
@@ -409,7 +459,7 @@ void main() {
       desktopStartupEnabled: () async => false,
       desktopStartupToggle: (enabled) async => expect(enabled, true),
     );
-    await tester.tap(find.byTooltip('设置'));
+    await tester.tap(find.byTooltip('系统设置'));
     await settle(tester);
     await tapKey(tester, 'settings-appearance');
     await settle(tester, 12);
@@ -443,7 +493,7 @@ void main() {
         throw const FileSystemException('settings directory is read-only');
       },
     );
-    await tester.tap(find.byTooltip('设置'));
+    await tester.tap(find.byTooltip('系统设置'));
     await settle(tester);
     await tapKey(tester, 'settings-appearance');
     await settle(tester, 12);
@@ -457,7 +507,7 @@ void main() {
     (tester) async {
       final s = FakeServer(role: 'operator');
       await Harness.create(tester, s);
-      await tester.tap(find.byTooltip('设置'));
+      await tester.tap(find.byTooltip('系统设置'));
       await settle(tester);
       expect(find.byKey(const Key('settings-tokens')), findsNothing);
       expect(find.byKey(const Key('settings-admins')), findsNothing);
@@ -465,7 +515,7 @@ void main() {
 
       final o = FakeServer();
       final h = await Harness.create(tester, o);
-      await tester.tap(find.byTooltip('设置'));
+      await tester.tap(find.byTooltip('系统设置'));
       await settle(tester);
       o.failNext = true;
       await tapKey(tester, 'settings-tokens');
@@ -494,7 +544,7 @@ void main() {
   ) async {
     final s = FakeServer();
     await Harness.create(tester, s, size: const Size(1200, 1000));
-    await tester.tap(find.byTooltip('设置'));
+    await tester.tap(find.byTooltip('系统设置'));
     await settle(tester);
     await tapKey(tester, 'settings-api_tokens');
     expect(find.text('暂无 API Token'), findsOneWidget);
@@ -508,7 +558,8 @@ void main() {
     await tester.enterText(find.byKey(const Key('api-token-name')), 'CI');
     await settle(tester);
     await tapKey(tester, 'api-token-scope');
-    await tapText(tester, '隧道管理');
+    await tester.tap(find.text('隧道管理').last);
+    await settle(tester);
     s.failNext = true;
     await tapKey(tester, 'create-api-token');
     expect(find.text('internal error'), findsOneWidget);
@@ -532,7 +583,7 @@ void main() {
   ) async {
     final s = FakeServer();
     final h = await Harness.create(tester, s, size: const Size(1200, 1000));
-    await tester.tap(find.byTooltip('设置'));
+    await tester.tap(find.byTooltip('系统设置'));
     await settle(tester);
     await tapKey(tester, 'settings-logs');
     expect(find.text('暂无日志'), findsOneWidget);

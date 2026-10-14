@@ -518,6 +518,8 @@ class HoverRow extends StatefulWidget {
     super.key,
     required this.child,
     this.selected = false,
+    this.selectedColor,
+    this.selectedBorderColor,
     this.onTap,
     this.padding,
     this.radius = Radii.control,
@@ -525,6 +527,7 @@ class HoverRow extends StatefulWidget {
   });
   final Widget child;
   final bool selected;
+  final Color? selectedColor, selectedBorderColor;
   final VoidCallback? onTap, onSecondaryTap;
   final EdgeInsets? padding;
   final double radius;
@@ -539,7 +542,9 @@ class _HoverRowState extends State<HoverRow> {
   Widget build(BuildContext context) {
     final c = context.c;
     return MouseRegion(
-      cursor: SystemMouseCursors.click,
+      cursor: widget.onTap == null
+          ? SystemMouseCursors.basic
+          : SystemMouseCursors.click,
       hitTestBehavior: HitTestBehavior.opaque,
       onEnter: (_) {
         if (!_hover) setState(() => _hover = true);
@@ -558,10 +563,17 @@ class _HoverRowState extends State<HoverRow> {
           padding: widget.padding,
           decoration: BoxDecoration(
             color: widget.selected
-                ? c.bgSelected
+                ? (widget.selectedColor ?? c.bgSelected)
                 : (_hover ? c.bgSubtle : Colors.transparent),
             borderRadius: BorderRadius.circular(widget.radius),
           ),
+          foregroundDecoration:
+              widget.selected && widget.selectedBorderColor != null
+              ? BoxDecoration(
+                  borderRadius: BorderRadius.circular(widget.radius),
+                  border: Border.all(color: widget.selectedBorderColor!),
+                )
+              : null,
           child: widget.child,
         ),
       ),
@@ -619,7 +631,14 @@ class PageHeader extends StatelessWidget {
                   ),
                   if (subtitle != null) ...[
                     const SizedBox(width: 8),
-                    Text(subtitle!, style: Type.body.copyWith(color: c.text3)),
+                    Flexible(
+                      child: Text(
+                        subtitle!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Type.body.copyWith(color: c.text3),
+                      ),
+                    ),
                   ],
                 ],
               ),

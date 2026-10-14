@@ -5,6 +5,7 @@ import '../../core/store.dart';
 import '../../shared/format.dart';
 import '../../shared/panel_widgets.dart';
 import '../../shared/widgets.dart';
+import '../../shared/workspace_widgets.dart';
 import '../../theme/tokens.dart';
 
 class ApiTokensView extends ConsumerWidget {
@@ -32,56 +33,83 @@ class ApiTokensView extends ConsumerWidget {
         onRetry: () => ref.invalidate(apiTokensProvider),
         builder: (items) => items.isEmpty
             ? const Text('暂无 API Token')
-            : Column(
-                children: [
+            : ResourceTable(
+                columns: const [
+                  ('令牌名称', 3),
+                  ('权限范围', 2),
+                  ('到期时间', 3),
+                  ('状态', 2),
+                  ('操作', 2),
+                ],
+                rows: [
                   for (final token in items)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: PanelCard(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              token['name'] as String,
-                              style: Type.strong.copyWith(
-                                color: context.c.text1,
-                              ),
-                            ),
-                            Text(
-                              '${token['scope']} · ${fullTime(token['expires_at'] as int)} 到期',
-                              style: Type.caption.copyWith(
-                                color: context.c.text3,
-                              ),
-                            ),
-                            if (token['revoked_at'] != null)
-                              const Text('已撤销')
-                            else
-                              LButton(
-                                key: Key('revoke-api-token-${token['id']}'),
-                                label: '撤销',
-                                onPressed: () async {
-                                  final why = await askReason(
-                                    context,
-                                    title: '撤销 API Token',
-                                    message: '撤销后，使用这个令牌的自动化调用会立即失效。',
-                                    confirm: '撤销',
-                                    destructive: true,
-                                  );
-                                  if (why == null || !context.mounted) return;
-                                  await guarded(context, () async {
-                                    await ref
-                                        .read(apiProvider)
-                                        .revokeApiToken(
-                                          token['id'] as String,
-                                          why,
-                                        );
-                                    ref.invalidate(apiTokensProvider);
-                                  });
-                                },
-                              ),
-                          ],
+                    ResourceRow(
+                      cells: [
+                        (TableText(token['name'] as String), 3),
+                        (
+                          TableText(
+                            token['scope'] as String,
+                            color: context.c.directText,
+                          ),
+                          2,
                         ),
-                      ),
+                        (
+                          TableText(
+                            '${fullTime(token['expires_at'] as int)} 到期',
+                            mono: true,
+                          ),
+                          3,
+                        ),
+                        (
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: LBadge(
+                              token['revoked_at'] != null
+                                  ? '已撤销'
+                                  : ((token['expires_at'] as int) <=
+                                            DateTime.now()
+                                                .millisecondsSinceEpoch
+                                        ? '已过期'
+                                        : '有效'),
+                              bg: token['revoked_at'] != null
+                                  ? context.c.bgSubtle
+                                  : context.c.warningSoft,
+                              fg: token['revoked_at'] != null
+                                  ? context.c.text2
+                                  : context.c.warningText,
+                            ),
+                          ),
+                          2,
+                        ),
+                        (
+                          token['revoked_at'] == null
+                              ? LButton(
+                                  key: Key('revoke-api-token-${token['id']}'),
+                                  label: '撤销',
+                                  onPressed: () async {
+                                    final why = await askReason(
+                                      context,
+                                      title: '撤销 API Token',
+                                      message: '撤销后，使用这个令牌的自动化调用会立即失效。',
+                                      confirm: '撤销',
+                                      destructive: true,
+                                    );
+                                    if (why == null || !context.mounted) return;
+                                    await guarded(context, () async {
+                                      await ref
+                                          .read(apiProvider)
+                                          .revokeApiToken(
+                                            token['id'] as String,
+                                            why,
+                                          );
+                                      ref.invalidate(apiTokensProvider);
+                                    });
+                                  },
+                                )
+                              : const Text('—'),
+                          2,
+                        ),
+                      ],
                     ),
                 ],
               ),

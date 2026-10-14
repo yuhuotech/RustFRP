@@ -42,7 +42,7 @@ Future<void> _openAbout(
       ),
     ],
   );
-  await tester.tap(find.byTooltip('设置'));
+  await tester.tap(find.byTooltip('系统设置'));
   await settle(tester);
   await tapKey(tester, 'settings-about');
 }

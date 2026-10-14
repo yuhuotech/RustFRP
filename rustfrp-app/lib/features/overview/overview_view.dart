@@ -40,16 +40,22 @@ class OverviewView extends ConsumerWidget {
             value: overview,
             onRetry: () => ref.invalidate(overviewProvider),
             builder: (o) => ListView(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(16),
               children: [
                 LayoutBuilder(
                   builder: (context, box) {
-                    final cols = box.maxWidth >= 800 ? 3 : 2;
-                    final w = (box.maxWidth - (cols - 1) * 12) / cols;
+                    final cols = box.maxWidth >= 1040
+                        ? 6
+                        : box.maxWidth >= 560
+                        ? 3
+                        : box.maxWidth >= 300
+                        ? 2
+                        : 1;
+                    final w = (box.maxWidth - (cols - 1) * 8) / cols;
                     Widget m(Widget child) => SizedBox(width: w, child: child);
                     return Wrap(
-                      spacing: 12,
-                      runSpacing: 12,
+                      spacing: 8,
+                      runSpacing: 8,
                       children: [
                         m(
                           MetricCard(
@@ -58,6 +64,7 @@ class OverviewView extends ConsumerWidget {
                             value: '${o.clientsOnline}',
                             hint: '共 ${o.clients} 台',
                             icon: LucideIcons.monitor,
+                            accent: c.direct,
                           ),
                         ),
                         m(
@@ -67,6 +74,7 @@ class OverviewView extends ConsumerWidget {
                             value: '${o.tunnelsRunning}',
                             hint: '共 ${o.tunnels} 条',
                             icon: LucideIcons.waypoints,
+                            accent: c.action,
                           ),
                         ),
                         m(
@@ -75,13 +83,16 @@ class OverviewView extends ConsumerWidget {
                             label: '待使用的接入令牌',
                             value: '${o.tokensPending}',
                             icon: LucideIcons.keyRound,
+                            accent: c.warning,
                           ),
                         ),
                         m(
                           MetricCard(
+                            key: const Key('metric-connections'),
                             label: '当前连接',
                             value: '${o.connections}',
                             icon: LucideIcons.activity,
+                            accent: c.success,
                           ),
                         ),
                         m(
@@ -92,11 +103,11 @@ class OverviewView extends ConsumerWidget {
                             hint:
                                 '↓ ${formatBytes(o.bytes24hIn)} · ↑ ${formatBytes(o.bytes24hOut)}',
                             icon: LucideIcons.chartNoAxesColumn,
+                            accent: c.direct,
                           ),
                         ),
-                        SizedBox(
-                          width: box.maxWidth,
-                          child: MetricCard(
+                        m(
+                          MetricCard(
                             key: const Key('metric-controller'),
                             label: '控制器版本',
                             value: o.version.isEmpty ? '—' : o.version,
@@ -108,16 +119,27 @@ class OverviewView extends ConsumerWidget {
                                 'CPU 累计 ${o.cpuSeconds!.toStringAsFixed(1)}s',
                             ].join(' · '),
                             icon: LucideIcons.server,
+                            accent: c.action,
                           ),
                         ),
                       ],
                     );
                   },
                 ),
-                const SizedBox(height: 24),
+                const SizedBox(height: 16),
                 const TrafficPanel(),
                 const SizedBox(height: 24),
-                const SectionTitle('节点'),
+                SectionTitle(
+                  '服务端节点',
+                  trailing: node.maybeWhen(
+                    data: (n) => LBadge(
+                      n.enabled ? '运行中' : '已停用',
+                      bg: n.enabled ? c.successSoft : c.bgSubtle,
+                      fg: n.enabled ? c.successText : c.text2,
+                    ),
+                    orElse: () => null,
+                  ),
+                ),
                 node.maybeWhen(
                   data: (n) => !n.enabled
                       ? const SizedBox.shrink()

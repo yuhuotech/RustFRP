@@ -39,6 +39,8 @@ class VisitorsSection extends ConsumerWidget {
       children: [
         SectionTitle(
           '访问者（${visitors.length}）',
+          icon: LucideIcons.network,
+          color: c.directText,
           trailing: canEdit
               ? LButton(
                   key: const Key('client-new-visitor'),
@@ -71,6 +73,30 @@ class VisitorsSection extends ConsumerWidget {
                           Text(
                             v.name,
                             style: Type.strong.copyWith(color: c.text1),
+                          ),
+                          const SizedBox(height: 6),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              LBadge(
+                                v.enabled ? '已启用' : '已停用',
+                                bg: v.enabled ? c.successSoft : c.bgSubtle,
+                                fg: v.enabled ? c.successText : c.text2,
+                              ),
+                              if (v.useEncryption)
+                                LBadge(
+                                  '加密',
+                                  bg: c.directSoft,
+                                  fg: c.directText,
+                                ),
+                              if (v.useCompression)
+                                LBadge(
+                                  '压缩',
+                                  bg: c.actionSoft,
+                                  fg: c.actionText,
+                                ),
+                            ],
                           ),
                           const SizedBox(height: 4),
                           Text(

@@ -9,6 +9,7 @@ import '../../core/store.dart';
 import '../../shared/format.dart';
 import '../../shared/panel_widgets.dart';
 import '../../shared/widgets.dart';
+import '../../shared/workspace_widgets.dart';
 import '../../theme/tokens.dart';
 
 Color stateColor(BuildContext context, TunnelState s) {
@@ -73,7 +74,7 @@ class _TunnelsViewState extends ConsumerState<TunnelsView> {
     return Column(
       children: [
         PageHeader(
-          title: '隧道',
+          title: '隧道管理',
           actions: [
             if (role.atLeast(Role.operator))
               LButton(
@@ -178,34 +179,84 @@ class _TunnelsViewState extends ConsumerState<TunnelsView> {
               return ListView(
                 padding: const EdgeInsets.all(24),
                 children: [
-                  for (final t in list)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (role.atLeast(Role.operator))
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 4),
-                              child: LButton(
-                                key: Key('select-tunnel-${t.id}'),
-                                label: selected.contains(t.id) ? '已选择' : '选择',
-                                compact: true,
-                                onPressed: busy
-                                    ? null
-                                    : () => setState(() {
-                                        if (selected.contains(t.id)) {
-                                          selected.remove(t.id);
-                                        } else if (selected.length < 100) {
-                                          selected.add(t.id);
-                                        }
-                                      }),
-                              ),
-                            ),
-                          TunnelCard(tunnel: t),
-                        ],
+                  PageIntro(
+                    icon: LucideIcons.waypoints,
+                    title: '隧道与公网服务',
+                    description: '比较公网入口和本地目标，按状态筛选并管理转发规则。选择多条隧道可批量启用或停用。',
+                    color: c.actionText,
+                    badges: [
+                      LBadge('显示 ${list.length} / ${all.length} 条'),
+                      LBadge(
+                        '${all.where((t) => t.state == TunnelState.running).length} 条运行中',
+                        bg: c.successSoft,
+                        fg: c.successText,
                       ),
-                    ),
+                    ],
+                  ),
+                  if (!isNarrow(context))
+                    ResourceTable(
+                      columns: const [
+                        ('隧道 / 类型', 3),
+                        ('状态', 2),
+                        ('客户端', 2),
+                        ('公网入口 / 本地目标', 5),
+                        ('操作', 3),
+                      ],
+                      rows: [
+                        for (final t in list)
+                          TunnelCard(
+                            tunnel: t,
+                            tableRow: true,
+                            selection: role.atLeast(Role.operator)
+                                ? LButton(
+                                    key: Key('select-tunnel-${t.id}'),
+                                    label: selected.contains(t.id)
+                                        ? '已选择'
+                                        : '选择',
+                                    compact: true,
+                                    onPressed: busy
+                                        ? null
+                                        : () => setState(() {
+                                            if (selected.contains(t.id)) {
+                                              selected.remove(t.id);
+                                            } else if (selected.length < 100) {
+                                              selected.add(t.id);
+                                            }
+                                          }),
+                                  )
+                                : null,
+                          ),
+                      ],
+                    )
+                  else
+                    for (final t in list)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (role.atLeast(Role.operator))
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: LButton(
+                                  key: Key('select-tunnel-${t.id}'),
+                                  label: selected.contains(t.id) ? '已选择' : '选择',
+                                  compact: true,
+                                  onPressed: busy
+                                      ? null
+                                      : () => setState(() {
+                                          if (selected.contains(t.id)) {
+                                            selected.remove(t.id);
+                                          } else if (selected.length < 100) {
+                                            selected.add(t.id);
+                                          }
+                                        }),
+                                ),
+                              ),
+                            TunnelCard(tunnel: t),
+                          ],
+                        ),
+                      ),
                   if (clients.isEmpty)
                     Text('', style: Type.caption.copyWith(color: c.text3)),
                 ],
@@ -250,9 +301,16 @@ String publicAddress(Tunnel t, NodeInfo? node) {
 }
 
 class TunnelCard extends ConsumerWidget {
-  const TunnelCard({super.key, required this.tunnel, this.showClient = true});
+  const TunnelCard({
+    super.key,
+    required this.tunnel,
+    this.showClient = true,
+    this.tableRow = false,
+    this.selection,
+  });
   final Tunnel tunnel;
-  final bool showClient;
+  final bool showClient, tableRow;
+  final Widget? selection;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -274,6 +332,116 @@ class TunnelCard extends ConsumerWidget {
               .firstOrNull;
     final remote = publicAddress(t, node);
     final canEdit = role.atLeast(Role.operator);
+    final controls = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (canEdit) ...[
+          LSwitch(
+            value: t.enabled,
+            onChanged: (v) => guarded(
+              context,
+              () => ref
+                  .read(actionsProvider)
+                  .updateTunnel(
+                    t.id,
+                    enabled: v,
+                    reason: v ? '通过面板启用隧道' : '通过面板停用隧道',
+                  ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          LIconButton(
+            icon: LucideIcons.pencil,
+            tooltip: '编辑',
+            onPressed: () => showTunnelEditor(context, existing: t),
+          ),
+          LIconButton(
+            icon: LucideIcons.trash2,
+            tooltip: '删除',
+            onPressed: () => _delete(context, ref),
+          ),
+        ],
+      ],
+    );
+    final status = LBadge(
+      t.enabled ? t.state.label : '已停用',
+      bg: !t.enabled
+          ? c.bgSubtle
+          : switch (t.state) {
+              TunnelState.running => c.successSoft,
+              TunnelState.error => c.dangerSoft,
+              TunnelState.pending => c.warningSoft,
+              _ => c.bgSubtle,
+            },
+      fg: !t.enabled
+          ? c.text2
+          : switch (t.state) {
+              TunnelState.running => c.successText,
+              TunnelState.error => c.dangerText,
+              TunnelState.pending => c.warningText,
+              _ => c.text2,
+            },
+    );
+    if (tableRow) {
+      return ResourceRow(
+        key: Key('tunnel-${t.id}'),
+        cells: [
+          (
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TableText(t.name),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    LBadge(
+                      t.kind.toUpperCase(),
+                      bg: c.directSoft,
+                      fg: c.directText,
+                    ),
+                    ?selection,
+                  ],
+                ),
+              ],
+            ),
+            3,
+          ),
+          (
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                status,
+                if (t.state == TunnelState.error &&
+                    t.statusError.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  TableText(t.statusError, color: c.dangerText),
+                ],
+              ],
+            ),
+            2,
+          ),
+          (TableText(owner?.name ?? '未知客户端', subtitle: node?.name), 2),
+          (
+            TableText(
+              remote,
+              subtitle: '本地目标 ${t.localIp}:${t.localPort}',
+              color: c.directText,
+              mono: true,
+            ),
+            5,
+          ),
+          (
+            canEdit
+                ? controls
+                : Text('只读', style: Type.caption.copyWith(color: c.text3)),
+            3,
+          ),
+        ],
+      );
+    }
     return PanelCard(
       key: Key('tunnel-${t.id}'),
       child: Column(
@@ -296,46 +464,17 @@ class TunnelCard extends ConsumerWidget {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    LBadge(t.kind.toUpperCase()),
-                    const SizedBox(width: 6),
                     LBadge(
-                      t.enabled ? t.state.label : '已停用',
-                      bg: t.state == TunnelState.error && t.enabled
-                          ? c.dangerSoft
-                          : null,
-                      fg: t.state == TunnelState.error && t.enabled
-                          ? c.dangerText
-                          : null,
+                      t.kind.toUpperCase(),
+                      bg: c.directSoft,
+                      fg: c.directText,
                     ),
+                    const SizedBox(width: 6),
+                    status,
                   ],
                 ),
               ),
-              if (canEdit) ...[
-                LSwitch(
-                  value: t.enabled,
-                  onChanged: (v) => guarded(
-                    context,
-                    () => ref
-                        .read(actionsProvider)
-                        .updateTunnel(
-                          t.id,
-                          enabled: v,
-                          reason: v ? '通过面板启用隧道' : '通过面板停用隧道',
-                        ),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                LIconButton(
-                  icon: LucideIcons.pencil,
-                  tooltip: '编辑',
-                  onPressed: () => showTunnelEditor(context, existing: t),
-                ),
-                LIconButton(
-                  icon: LucideIcons.trash2,
-                  tooltip: '删除',
-                  onPressed: () => _delete(context, ref),
-                ),
-              ],
+              if (canEdit) controls,
             ],
           ),
           const SizedBox(height: 8),

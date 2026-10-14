@@ -95,7 +95,7 @@ void main() {
       s.addClient('nas', isOnline: true);
       await Harness.create(tester, s);
       // Rail items for an owner: overview, nodes, clients, tunnels, audit (+ settings at the bottom).
-      for (final tip in ['概览', '节点', '客户端', '隧道', '审计', '设置']) {
+      for (final tip in ['概览', '节点管理', '客户端', '隧道管理', '审计日志', '系统设置']) {
         expect(find.byTooltip(tip), findsOneWidget, reason: tip);
       }
       // Overview has no list column; clients does.
@@ -104,22 +104,22 @@ void main() {
       await settle(tester);
       expect(find.byKey(const Key('client-row-id1')), findsOneWidget);
       expect(find.text('选择一台客户端'), findsNothing);
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 200);
+      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 160);
       await tapKey(tester, 'client-row-id1');
       expect(find.text('设备信息'), findsOneWidget);
       await tapKey(tester, 'client-back');
       expect(find.byKey(const Key('client-row-id1')), findsOneWidget);
 
-      await tester.tap(find.byTooltip('节点'));
+      await tester.tap(find.byTooltip('节点管理'));
       await settle(tester);
       expect(find.text('内置节点'), findsWidgets);
-      await tester.tap(find.byTooltip('隧道'));
+      await tester.tap(find.byTooltip('隧道管理'));
       await settle(tester);
       expect(find.text('还没有隧道'), findsOneWidget);
-      await tester.tap(find.byTooltip('审计'));
+      await tester.tap(find.byTooltip('审计日志'));
       await settle(tester);
       expect(find.text('暂无审计记录'), findsOneWidget);
-      await tester.tap(find.byTooltip('设置'));
+      await tester.tap(find.byTooltip('系统设置'));
       await settle(tester);
       expect(find.text('账号'), findsWidgets);
       // The logo returns to the overview.
@@ -134,21 +134,33 @@ void main() {
     (tester) async {
       final semantics = tester.ensureSemantics();
       final h = await Harness.create(tester, FakeServer());
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 200);
+      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 160);
       final sidebar = find.byKey(const Key('app-sidebar'));
+      final menuRows = find.descendant(
+        of: sidebar,
+        matching: find.byType(HoverRow),
+      );
+      final overviewRow = tester.getRect(menuRows.at(0));
+      final nodeRow = tester.getRect(menuRows.at(1));
+      expect(overviewRow.height, 40);
+      expect(nodeRow.top - overviewRow.bottom, 6);
       final overviewLabel = tester.widget<Text>(
         find.descendant(of: sidebar, matching: find.text('概览')),
       );
       final clientsLabel = tester.widget<Text>(
         find.descendant(of: sidebar, matching: find.text('客户端')),
       );
-      expect(overviewLabel.style!.fontWeight, FontWeight.w400);
+      expect(overviewLabel.style!.fontWeight, FontWeight.w500);
       expect(clientsLabel.style!.fontWeight, FontWeight.w400);
       final brand = find.descendant(
         of: sidebar,
         matching: find.byType(BrandLogo),
       );
       expect(tester.widget<BrandLogo>(brand).size, 22);
+      final firstMenuIcon = find
+          .descendant(of: menuRows.first, matching: find.byType(Icon))
+          .first;
+      expect(tester.getTopLeft(brand).dx, tester.getTopLeft(firstMenuIcon).dx);
       final title = tester.widget<Text>(
         find.descendant(of: sidebar, matching: find.text('RustFRP')),
       );
@@ -156,6 +168,7 @@ void main() {
       expect(title.style!.fontWeight, FontWeight.w400);
       expect(tester.getTopLeft(brand).dy, greaterThanOrEqualTo(24));
       await tapKey(tester, 'sidebar-toggle');
+      expect(tester.getSize(menuRows.first).height, 40);
       expect(
         find.descendant(of: sidebar, matching: find.byType(BrandLogo)),
         findsNothing,
@@ -174,7 +187,7 @@ void main() {
         h.container.read(prefsProvider).getBool('sidebar_collapsed'),
         true,
       );
-      await tester.tap(find.byTooltip('设置'));
+      await tester.tap(find.byTooltip('系统设置'));
       await settle(tester);
       expect(find.byKey(const Key('settings-appearance')), findsOneWidget);
       final toggleNode = tester.getSemantics(
@@ -184,7 +197,7 @@ void main() {
       toggleNode.owner!.performAction(toggleNode.id, SemanticsAction.tap);
       await settle(tester);
       expect(find.byTooltip('收起菜单'), findsOneWidget);
-      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 200);
+      expect(tester.getSize(find.byKey(const Key('app-sidebar'))).width, 160);
       expect(
         h.container.read(prefsProvider).getBool('sidebar_collapsed'),
         false,
@@ -209,7 +222,7 @@ void main() {
       final s = FakeServer(role: 'viewer');
       s.addClient('nas');
       await Harness.create(tester, s);
-      expect(find.byTooltip('审计'), findsNothing);
+      expect(find.byTooltip('审计日志'), findsNothing);
       expect(
         find.text('接入新客户端'),
         findsNothing,
@@ -238,7 +251,7 @@ void main() {
       s.addTunnel(c['id']! as String, 'ssh');
       await Harness.create(tester, s, size: const Size(390, 800));
       // Bottom bar with all six destinations.
-      for (final label in ['概览', '节点', '客户端', '隧道', '审计', '设置']) {
+      for (final label in ['概览', '节点管理', '客户端', '隧道管理', '审计日志', '系统设置']) {
         expect(find.text(label), findsWidgets, reason: label);
       }
       await tester.tap(find.text('客户端').last);
@@ -252,7 +265,7 @@ void main() {
       await settle(tester, 10);
       expect(find.byKey(Key('client-row-${c['id']}')), findsOneWidget);
 
-      await tester.tap(find.text('隧道').last);
+      await tester.tap(find.text('隧道管理').last);
       await settle(tester);
       expect(find.byKey(const Key('new-tunnel')), findsOneWidget);
       expect(
@@ -260,7 +273,7 @@ void main() {
         findsOneWidget,
         reason: 'narrow screens show the filter chips',
       );
-      await tester.tap(find.text('设置').last);
+      await tester.tap(find.text('系统设置').last);
       await settle(tester);
       await tester.tap(find.byKey(const Key('settings-about')));
       await settle(tester, 10);
@@ -278,7 +291,7 @@ void main() {
         size: const Size(390, 800),
       );
       server.failNext = true;
-      await tester.tap(find.text('节点').last);
+      await tester.tap(find.text('节点管理').last);
       await settle(tester);
       expect(find.text('重试'), findsOneWidget);
       await tester.tap(find.text('重试'));

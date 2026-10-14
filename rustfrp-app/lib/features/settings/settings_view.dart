@@ -14,6 +14,7 @@ import '../../core/store.dart';
 import '../../shared/format.dart';
 import '../../shared/panel_widgets.dart';
 import '../../shared/widgets.dart';
+import '../../shared/workspace_widgets.dart';
 import '../../theme/tokens.dart';
 import '../shell/shell.dart';
 import 'api_tokens_view.dart';
@@ -47,18 +48,33 @@ const settingsPages = [
   SettingsPage('about', LucideIcons.info, '关于'),
 ];
 
+String _settingDescription(String id) => switch (id) {
+  'account' => '查看当前管理员身份、访问角色和控制器连接，管理登录会话。',
+  'appearance' => '选择浅色、深色或跟随系统主题，并管理桌面应用的行为。',
+  'tokens' => '管理客户端和节点的一次性接入凭据，核对有效期并撤销未使用的令牌。',
+  'api_tokens' => '为自动化工具配置独立访问凭据、权限范围和有效期。',
+  'admins' => '管理面板管理员的角色与登录状态，所有修改均记录到审计日志。',
+  'logs' => '查看控制器最近运行日志，定位连接和配置下发问题。',
+  _ => '查看控制器与应用版本，检查可用更新。',
+};
+
+Color _settingColor(BuildContext context, String id) => switch (id) {
+  'tokens' || 'api_tokens' => context.c.warningText,
+  'admins' || 'logs' => context.c.actionText,
+  _ => context.c.directText,
+};
+
 class SettingsList extends ConsumerWidget {
   const SettingsList({super.key, this.narrow = false});
   final bool narrow;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final c = context.c;
     final role = ref.watch(sessionProvider.select((s) => s.role));
     final selected = ref.watch(selectedSettingProvider) ?? 'account';
     return Column(
       children: [
-        if (narrow) const PageHeader(title: '设置'),
+        if (narrow) const PageHeader(title: '系统设置'),
         Expanded(
           child: ListView(
             padding: const EdgeInsets.all(8),
@@ -83,12 +99,15 @@ class SettingsList extends ConsumerWidget {
                     },
                     child: Row(
                       children: [
-                        Icon(p.icon, size: 16, color: c.text2),
+                        ToneGlyph(
+                          icon: p.icon,
+                          color: _settingColor(context, p.id),
+                        ),
                         const SizedBox(width: 10),
                         Expanded(
-                          child: Text(
+                          child: TableText(
                             p.label,
-                            style: Type.body.copyWith(color: c.text1),
+                            subtitle: _settingDescription(p.id),
                           ),
                         ),
                       ],
@@ -118,7 +137,7 @@ class SettingsWorkspace extends ConsumerWidget {
         : 'account';
     return Column(
       children: [
-        const PageHeader(title: '设置'),
+        const PageHeader(title: '系统设置'),
         Align(
           alignment: Alignment.centerLeft,
           child: SingleChildScrollView(
@@ -170,6 +189,12 @@ class SettingsDetail extends ConsumerWidget {
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              PageIntro(
+                icon: p.icon,
+                title: p.label,
+                description: _settingDescription(p.id),
+                color: _settingColor(context, p.id),
+              ),
               switch (p.id) {
                 'appearance' => const _Appearance(),
                 'tokens' => const _Tokens(),
@@ -196,7 +221,10 @@ class _Account extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        PanelCard(
+        DetailPanel(
+          title: '当前登录身份',
+          icon: LucideIcons.user,
+          color: context.c.directText,
           child: Column(
             children: [
               InfoRow('用户名', a?.name ?? '—'),
@@ -235,24 +263,28 @@ class _Appearance extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('主题', style: Type.caption.copyWith(color: context.c.text3)),
-        const SizedBox(height: 6),
-        Wrap(
-          spacing: 8,
-          children: [
-            for (final m in [
-              (ThemeMode.system, '跟随系统'),
-              (ThemeMode.light, '浅色'),
-              (ThemeMode.dark, '深色'),
-            ])
-              LButton(
-                key: Key('theme-${m.$1.name}'),
-                label: m.$2,
-                compact: true,
-                variant: mode == m.$1 ? BtnVariant.solid : BtnVariant.neutral,
-                onPressed: () => ref.read(themeModeProvider.notifier).set(m.$1),
-              ),
-          ],
+        DetailPanel(
+          title: '主题',
+          icon: LucideIcons.palette,
+          color: context.c.directText,
+          child: Wrap(
+            spacing: 8,
+            children: [
+              for (final m in [
+                (ThemeMode.system, '跟随系统'),
+                (ThemeMode.light, '浅色'),
+                (ThemeMode.dark, '深色'),
+              ])
+                LButton(
+                  key: Key('theme-${m.$1.name}'),
+                  label: m.$2,
+                  compact: true,
+                  variant: mode == m.$1 ? BtnVariant.solid : BtnVariant.neutral,
+                  onPressed: () =>
+                      ref.read(themeModeProvider.notifier).set(m.$1),
+                ),
+            ],
+          ),
         ),
         if (isDesktop) ...[
           const SizedBox(height: 20),
@@ -413,66 +445,72 @@ class _Tokens extends ConsumerWidget {
           );
         }
         final now = DateTime.now().millisecondsSinceEpoch;
-        return Column(
-          children: [
+        return ResourceTable(
+          columns: const [
+            ('名称 / 创建人', 3),
+            ('创建时间', 3),
+            ('有效期', 3),
+            ('状态', 2),
+            ('操作', 2),
+          ],
+          rows: [
             for (final t in list)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: PanelCard(
-                  key: Key('token-${t.id}'),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              t.name,
-                              style: Type.strong.copyWith(color: c.text1),
-                            ),
-                            Text(
-                              '${t.createdBy} · ${fullTime(t.createdAt)}',
-                              style: Type.caption.copyWith(color: c.text3),
-                            ),
-                          ],
-                        ),
-                      ),
-                      LBadge(
+              ResourceRow(
+                key: Key('token-${t.id}'),
+                cells: [
+                  (TableText(t.name, subtitle: t.createdBy), 3),
+                  (TableText(fullTime(t.createdAt), mono: true), 3),
+                  (
+                    TableText(
+                      fullTime(t.expiresAt),
+                      subtitle: t.status(now) == 'pending'
+                          ? '剩余 ${remaining(t.expiresAt)}'
+                          : null,
+                    ),
+                    3,
+                  ),
+                  (
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: LBadge(
                         switch (t.status(now)) {
                           'used' => '已使用',
                           'revoked' => '已撤销',
                           'expired' => '已过期',
                           _ => '待使用',
                         },
-                        bg: t.status(now) == 'pending' ? c.actionSoft : null,
-                        fg: t.status(now) == 'pending' ? c.actionText : null,
+                        bg: t.status(now) == 'pending' ? c.warningSoft : null,
+                        fg: t.status(now) == 'pending' ? c.warningText : null,
                       ),
-                      if (t.status(now) == 'pending') ...[
-                        const SizedBox(width: 8),
-                        LButton(
-                          label: '撤销',
-                          compact: true,
-                          onPressed: () async {
-                            final reason = await askReason(
-                              context,
-                              title: '撤销接入令牌',
-                              message: '撤销后，用它生成的安装命令将失效。',
-                              confirm: '撤销',
-                              destructive: true,
-                            );
-                            if (reason == null || !context.mounted) return;
-                            await guarded(
-                              context,
-                              () => ref
-                                  .read(actionsProvider)
-                                  .revokeToken(t.id, reason),
-                            );
-                          },
-                        ),
-                      ],
-                    ],
+                    ),
+                    2,
                   ),
-                ),
+                  (
+                    t.status(now) == 'pending'
+                        ? LButton(
+                            label: '撤销',
+                            compact: true,
+                            onPressed: () async {
+                              final reason = await askReason(
+                                context,
+                                title: '撤销接入令牌',
+                                message: '撤销后，用它生成的安装命令将失效。',
+                                confirm: '撤销',
+                                destructive: true,
+                              );
+                              if (reason == null || !context.mounted) return;
+                              await guarded(
+                                context,
+                                () => ref
+                                    .read(actionsProvider)
+                                    .revokeToken(t.id, reason),
+                              );
+                            },
+                          )
+                        : const Text('—'),
+                    2,
+                  ),
+                ],
               ),
           ],
         );
@@ -527,87 +565,99 @@ class _Admins extends ConsumerWidget {
             ),
           ),
           const SizedBox(height: 12),
-          for (final a in list)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: PanelCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            a.name,
-                            style: Type.strong.copyWith(color: c.text1),
-                          ),
-                        ),
-                        LBadge(a.role.label),
-                        if (a.disabledAt != null) ...[
-                          const SizedBox(width: 6),
-                          LBadge('已禁用', bg: c.dangerSoft, fg: c.dangerText),
-                        ],
-                      ],
+          ResourceTable(
+            columns: const [('管理员', 3), ('角色', 2), ('状态', 2), ('操作', 6)],
+            rows: [
+              for (final a in list)
+                ResourceRow(
+                  cells: [
+                    (
+                      TableText(a.name, subtitle: a.id == me ? '当前登录账号' : null),
+                      3,
                     ),
-                    if (a.id != me) ...[
-                      const SizedBox(height: 8),
+                    (
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: LBadge(
+                          a.role.label,
+                          bg: c.directSoft,
+                          fg: c.directText,
+                        ),
+                      ),
+                      2,
+                    ),
+                    (
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: LBadge(
+                          a.disabledAt != null ? '已禁用' : '已启用',
+                          bg: a.disabledAt != null
+                              ? c.dangerSoft
+                              : c.successSoft,
+                          fg: a.disabledAt != null
+                              ? c.dangerText
+                              : c.successText,
+                        ),
+                      ),
+                      2,
+                    ),
+                    (
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
                         crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
-                          SizedBox(
-                            width: 120,
-                            child: LSelect<Role>(
-                              key: Key('admin-role-${a.name}'),
-                              value: a.role,
-                              options: [
-                                for (final r in Role.values)
-                                  LSelectOption(r, r.label),
-                              ],
-                              onChanged: (r) {
-                                if (r == null || r == a.role) return;
-                                change(
-                                  a,
-                                  role: r,
-                                  title: '修改角色',
-                                  message:
-                                      '把 ${a.name} 的角色改为${r.label}，其现有会话会立即失效。',
-                                );
-                              },
+                          if (a.id != me) ...[
+                            SizedBox(
+                              width: 120,
+                              child: LSelect<Role>(
+                                key: Key('admin-role-${a.name}'),
+                                value: a.role,
+                                options: [
+                                  for (final r in Role.values)
+                                    LSelectOption(r, r.label),
+                                ],
+                                onChanged: (r) {
+                                  if (r == null || r == a.role) return;
+                                  change(
+                                    a,
+                                    role: r,
+                                    title: '修改角色',
+                                    message:
+                                        '把 ${a.name} 的角色改为${r.label}，其现有会话会立即失效。',
+                                  );
+                                },
+                              ),
                             ),
-                          ),
+                            LButton(
+                              key: Key('admin-toggle-${a.name}'),
+                              label: a.disabledAt == null ? '禁用' : '启用',
+                              onPressed: () => change(
+                                a,
+                                disabled: a.disabledAt == null,
+                                title: a.disabledAt == null ? '禁用管理员' : '启用管理员',
+                                message: a.disabledAt == null
+                                    ? '${a.name} 将立即退出并无法登录。'
+                                    : '${a.name} 将可以重新登录。',
+                              ),
+                            ),
+                          ],
                           LButton(
-                            key: Key('admin-toggle-${a.name}'),
-                            label: a.disabledAt == null ? '禁用' : '启用',
-                            onPressed: () => change(
-                              a,
-                              disabled: a.disabledAt == null,
-                              title: a.disabledAt == null ? '禁用管理员' : '启用管理员',
-                              message: a.disabledAt == null
-                                  ? '${a.name} 将立即退出并无法登录。'
-                                  : '${a.name} 将可以重新登录。',
+                            key: Key('admin-passwd-${a.name}'),
+                            label: '重置密码',
+                            onPressed: () => showDialog<void>(
+                              context: context,
+                              builder: (_) => _AdminDialog(target: a),
                             ),
                           ),
                         ],
                       ),
-                    ],
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: LButton(
-                        key: Key('admin-passwd-${a.name}'),
-                        label: '重置密码',
-                        onPressed: () => showDialog<void>(
-                          context: context,
-                          builder: (_) => _AdminDialog(target: a),
-                        ),
-                      ),
+                      6,
                     ),
                   ],
                 ),
-              ),
-            ),
+            ],
+          ),
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
@@ -754,7 +804,10 @@ class _About extends ConsumerWidget {
           style: Type.body.copyWith(color: c.text2),
         ),
         const SizedBox(height: 16),
-        PanelCard(
+        DetailPanel(
+          title: '版本信息',
+          icon: LucideIcons.info,
+          color: c.directText,
           child: Column(
             children: [
               InfoRow('控制器版本', v.isEmpty ? '—' : v),
@@ -934,38 +987,47 @@ class AsyncViewInline<T> extends StatelessWidget {
 class _ControllerLogs extends ConsumerWidget {
   const _ControllerLogs();
   @override
-  Widget build(BuildContext context, WidgetRef ref) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      LButton(
-        label: '刷新',
-        onPressed: () => ref.invalidate(controllerLogsProvider),
-      ),
-      const SizedBox(height: 12),
-      Text(
-        '最近 128 条日志，秘密相关消息已隐藏；刷新获取当前快照。',
-        style: Type.caption.copyWith(color: context.c.text3),
-      ),
-      const SizedBox(height: 12),
-      AsyncViewInline<List<String>>(
-        value: ref.watch(controllerLogsProvider),
-        onRetry: () => ref.invalidate(controllerLogsProvider),
-        builder: (lines) => lines.isEmpty
-            ? const Text('暂无日志')
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  for (final line in lines)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: SelectableText(
-                        line,
-                        style: Type.body.copyWith(color: context.c.text2),
+  Widget build(BuildContext context, WidgetRef ref) => DetailPanel(
+    title: '运行日志快照',
+    icon: LucideIcons.terminal,
+    color: context.c.actionText,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LButton(
+          label: '刷新',
+          onPressed: () => ref.invalidate(controllerLogsProvider),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          '最近 128 条日志，秘密相关消息已隐藏；刷新获取当前快照。',
+          style: Type.caption.copyWith(color: context.c.text3),
+        ),
+        const SizedBox(height: 12),
+        AsyncViewInline<List<String>>(
+          value: ref.watch(controllerLogsProvider),
+          onRetry: () => ref.invalidate(controllerLogsProvider),
+          builder: (lines) => lines.isEmpty
+              ? const Text('暂无日志')
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final line in lines)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: SelectableText(
+                          line,
+                          style: Type.body.copyWith(
+                            color: context.c.text2,
+                            fontFamily: 'monospace',
+                            fontFamilyFallback: Type.monoFallback,
+                          ),
+                        ),
                       ),
-                    ),
-                ],
-              ),
-      ),
-    ],
+                  ],
+                ),
+        ),
+      ],
+    ),
   );
 }

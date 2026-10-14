@@ -19,7 +19,7 @@ class StatusDot extends StatelessWidget {
   );
 }
 
-/// Metric card: big number + caption (+ optional hint line).
+/// Compact metric card with a single detail line and full-text tooltips.
 class MetricCard extends StatelessWidget {
   const MetricCard({
     super.key,
@@ -27,31 +27,73 @@ class MetricCard extends StatelessWidget {
     required this.value,
     this.hint,
     this.icon,
+    this.accent,
   });
   final String label, value;
   final String? hint;
   final IconData? icon;
+  final Color? accent;
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    final tone = accent ?? c.text3;
     return PanelCard(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
               if (icon != null) ...[
-                Icon(icon, size: 16, color: c.text3),
-                const SizedBox(width: 6),
+                Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: tone.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(Radii.control),
+                  ),
+                  child: Icon(icon, size: 14, color: tone),
+                ),
+                const SizedBox(width: 8),
               ],
-              Text(label, style: Type.caption.copyWith(color: c.text3)),
+              Expanded(
+                child: Tooltip(
+                  message: label,
+                  child: Text(
+                    label,
+                    style: Type.caption.copyWith(color: c.text3),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 8),
-          Text(value, style: Type.metric.copyWith(color: c.text1)),
-          // Always reserve the hint line so cards in one row have equal height.
           const SizedBox(height: 4),
-          Text(hint ?? ' ', style: Type.caption.copyWith(color: c.text3)),
+          Tooltip(
+            message: value,
+            child: Text(
+              value,
+              style: Type.metric.copyWith(color: c.text1),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          // Reserve one caption line to keep each row compact and aligned.
+          const SizedBox(height: 2),
+          SizedBox(
+            height: 18,
+            child: Tooltip(
+              message: hint ?? '',
+              child: Text(
+                hint ?? '',
+                style: Type.caption.copyWith(color: c.text3),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -158,14 +200,26 @@ class CopyField extends StatelessWidget {
 
 /// Section heading used inside detail pages.
 class SectionTitle extends StatelessWidget {
-  const SectionTitle(this.text, {super.key, this.trailing});
+  const SectionTitle(
+    this.text, {
+    super.key,
+    this.trailing,
+    this.icon,
+    this.color,
+  });
   final String text;
   final Widget? trailing;
+  final IconData? icon;
+  final Color? color;
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.only(bottom: 8),
     child: Row(
       children: [
+        if (icon != null) ...[
+          Icon(icon, size: 18, color: color ?? context.c.actionText),
+          const SizedBox(width: 8),
+        ],
         Expanded(
           child: Text(
             text,

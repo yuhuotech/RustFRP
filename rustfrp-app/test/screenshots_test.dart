@@ -155,8 +155,47 @@ void main() {
       'ip': '',
     });
 
+    final now = DateTime.now().millisecondsSinceEpoch;
+    s.tokens.addAll([
+      {
+        'id': 'preview-token-1',
+        'name': '上海生产设备',
+        'created_by': 'root',
+        'created_at': now - 60000,
+        'expires_at': now + 3600000,
+        'used_at': null,
+        'revoked_at': null,
+      },
+      {
+        'id': 'preview-token-2',
+        'name': '办公室 MacBook',
+        'created_by': 'ops',
+        'created_at': now - 86400000,
+        'expires_at': now - 3600000,
+        'used_at': now - 86000000,
+        'revoked_at': null,
+      },
+    ]);
+    s.apiTokens.add({
+      'id': 'preview-api',
+      'name': 'CI 部署工具',
+      'scope': 'tunnels',
+      'expires_at': now + 2592000000,
+      'revoked_at': null,
+    });
+    s.controllerLogs = [
+      '[INFO] Controller ready',
+      '[INFO] Client connected',
+      '[INFO] Configuration snapshot sent',
+    ];
+
     for (final theme in ['light', 'dark']) {
-      final h = await Harness.create(tester, s, prefs: {'theme_mode': theme});
+      final h = await Harness.create(
+        tester,
+        s,
+        size: const Size(1440, 900),
+        prefs: {'theme_mode': theme},
+      );
       await tester.pump(const Duration(seconds: 1));
       await shot(tester, dir!, '$theme-overview');
       h.container.read(sidebarCollapsedProvider.notifier).toggle();
@@ -166,19 +205,33 @@ void main() {
       await settle(tester);
       for (final (tip, name) in [
         ('客户端', 'clients'),
-        ('隧道', 'tunnels'),
-        ('审计', 'audit'),
-        ('设置', 'settings'),
+        ('隧道管理', 'tunnels'),
+        ('审计日志', 'audit'),
+        ('系统设置', 'settings'),
       ]) {
         await tester.tap(find.byTooltip(tip));
         await settle(tester, 8);
         if (name == 'clients') {
+          await shot(tester, dir, '$theme-clients-list');
           h.container
               .read(selectedClientProvider.notifier)
               .select(nas['id']! as String);
         }
         await settle(tester, 8);
         await shot(tester, dir, '$theme-$name');
+        if (name == 'settings') {
+          for (final page in [
+            'appearance',
+            'tokens',
+            'api_tokens',
+            'admins',
+            'logs',
+            'about',
+          ]) {
+            await tapKey(tester, 'settings-$page');
+            await shot(tester, dir, '$theme-settings-$page');
+          }
+        }
       }
       final n = await Harness.create(
         tester,
@@ -197,7 +250,7 @@ void main() {
       await tester.ensureVisible(find.text('流量历史'));
       await settle(tester);
       await shot(tester, dir, '$theme-narrow-traffic');
-      await tester.tap(find.text('隧道').last);
+      await tester.tap(find.text('隧道管理').last);
       await settle(tester, 8);
       await shot(tester, dir, '$theme-narrow-tunnels');
       expect(n.server, s);
