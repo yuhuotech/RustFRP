@@ -20,6 +20,7 @@ pub mod hub;
 pub mod maintenance;
 pub mod models;
 pub mod nodes;
+pub mod panel;
 pub mod process;
 pub mod store;
 

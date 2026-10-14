@@ -1096,11 +1096,13 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "bytes",
  "getrandom 0.3.4",
  "http-body-util",
  "rusqlite",
  "rustfrp-agent",
  "rustfrp-core",
+ "rustfrp-ui-assets",
  "serde",
  "serde_json",
  "sha2",
@@ -1109,6 +1111,14 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
+]
+
+[[package]]
+name = "rustfrp-ui-assets"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

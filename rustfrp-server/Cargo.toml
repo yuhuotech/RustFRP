@@ -10,9 +10,15 @@ rust-version.workspace = true
 name = "rustfrp-server"
 path = "src/main.rs"
 
+[features]
+default = []
+embedded-panel = ["rustfrp-ui-assets/embedded"]
+
 [dependencies]
 rustfrp-core = { path = "../rustfrp-core" }
 rustfrp-agent = { path = "../rustfrp-agent" }
+rustfrp-ui-assets = { path = "../rustfrp-ui-assets" }
+bytes.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true

@@ -1,0 +1,6 @@
+{
+  "identifier": "com.rustfrp.desktop.e2e",
+  "productName": "RustFRP E2E",
+  "mainBinaryName": "rustfrp-desktop",
+  "app": { "security": { "capabilities": ["main", "e2e"] } }
+}

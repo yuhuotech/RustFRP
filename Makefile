@@ -75,3 +75,31 @@ app-shots:
 .PHONY: installer-test
 installer-test:
 	python3 tools/installer/test_install.py
+
+# ───────── 原生共享管理 UI / 系统 WebView（迁移期间并行保留旧入口）─────────
+NPM ?= npm
+.PHONY: ui-deps ui-test ui-cov ui-build ui-e2e desktop-test desktop-lint desktop-build desktop-e2e
+ui-deps:
+	cd rustfrp-ui && $(NPM) ci
+ui-test:
+	cd rustfrp-ui && $(NPM) run check && $(NPM) test
+ui-cov:
+	cd rustfrp-ui && $(NPM) run coverage
+ui-build:
+	cd rustfrp-ui && $(NPM) run check && $(NPM) run build && $(NPM) run bench
+# 使用 ./start_dev.sh 在固定 9674 启动隔离测试数据库后执行；需要 release Agent。
+ui-e2e:
+	$(CARGO) build --release -p rustfrp-agent
+	cd rustfrp-ui && $(NPM) run e2e
+desktop-test:
+	$(CARGO) test --manifest-path rustfrp-desktop/Cargo.toml --workspace
+desktop-lint:
+	$(CARGO) fmt --manifest-path rustfrp-desktop/Cargo.toml --all -- --check
+	$(CARGO) clippy --manifest-path rustfrp-desktop/Cargo.toml --all-targets -- -D warnings
+desktop-build: ui-build
+	cd rustfrp-desktop && ../rustfrp-ui/node_modules/.bin/tauri build
+desktop-e2e:
+	$(CARGO) build --release -p rustfrp-agent
+	$(CARGO) build --manifest-path rustfrp-desktop/Cargo.toml
+	$(CARGO) build --manifest-path rustfrp-desktop/Cargo.toml -p rustfrp-desktop-support --example local_probe
+	python3 tools/e2e/native_local.py

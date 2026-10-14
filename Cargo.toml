@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rustfrp-core", "rustfrp-agent", "rustfrp-server"]
+members = ["rustfrp-core", "rustfrp-agent", "rustfrp-server", "rustfrp-ui-assets"]
 
 [workspace.package]
 version = "0.1.0"

@@ -45,7 +45,8 @@ impl LogRing {
             .front()
             .map_or(state.cursor.saturating_add(1), |entry| entry.cursor);
         let gap = after > state.cursor || after.saturating_add(1) < oldest;
-        let start = after.min(state.cursor);
+        // A cursor from the previous process must replay this process's bounded tail.
+        let start = if after > state.cursor { 0 } else { after };
         let lines = state
             .lines
             .iter()
@@ -146,7 +147,10 @@ mod tests {
             ring.snapshot_after(cursor),
             (2, false, vec!["second".into()])
         );
-        assert!(ring.snapshot_after(99).1);
+        assert_eq!(
+            ring.snapshot_after(99),
+            (2, true, vec!["first".into(), "second".into()])
+        );
         for n in 0..CAPACITY {
             ring.push(&n.to_string());
         }

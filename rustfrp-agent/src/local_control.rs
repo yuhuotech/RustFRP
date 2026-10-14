@@ -133,6 +133,8 @@ struct Request {
     command: String,
     #[serde(default)]
     offset: usize,
+    #[serde(default)]
+    after: Option<u64>,
 }
 
 /// 监听器持有端口直到 agent 停止。
@@ -229,7 +231,12 @@ impl LocalControl {
             .await?;
         let request = serde_json::from_slice::<Request>(&bytes);
         let reply = match request {
-            Ok(r) if bytes.len() <= 1024 && bytes.last() == Some(&b'\n') => {
+            Ok(r)
+                if bytes.len() <= 1024
+                    && bytes.last() == Some(&b'\n')
+                    && (r.after.is_none() || r.command == "logs")
+                    && (r.offset == 0 || r.command == "tunnels") =>
+            {
                 if !constant_time_eq(&r.token, &self.token) {
                     serde_json::json!({"error":"unauthorized"})
                 } else {
@@ -250,7 +257,9 @@ impl LocalControl {
                             serde_json::json!({"revision":list.0,"items":items,"next_offset": if end<list.1.len() {Some(end)} else {None}})
                         }
                         "logs" => {
-                            serde_json::json!({"items":self.logs.snapshot(),"capacity":crate::log_ring::CAPACITY,"line_bytes":crate::log_ring::LINE_BYTES})
+                            let (cursor, gap, items) =
+                                self.logs.snapshot_after(r.after.unwrap_or(0));
+                            serde_json::json!({"items":items,"cursor":cursor,"gap":gap,"capacity":crate::log_ring::CAPACITY,"line_bytes":crate::log_ring::LINE_BYTES})
                         }
                         "stop" => serde_json::json!({"ok":true}),
                         _ => serde_json::json!({"error":"invalid_request"}),
@@ -446,6 +455,38 @@ mod tests {
         assert_eq!(
             request(&d, &command("logs")).await["items"],
             serde_json::json!(["test log"])
+        );
+        let tail = request(
+            &d,
+            &format!(
+                "{{\"token\":\"{}\",\"command\":\"logs\",\"after\":1}}\n",
+                d.token
+            ),
+        )
+        .await;
+        assert_eq!(tail["cursor"], 1);
+        assert_eq!(tail["gap"], false);
+        assert_eq!(tail["items"], serde_json::json!([]));
+        let reset = request(
+            &d,
+            &format!(
+                "{{\"token\":\"{}\",\"command\":\"logs\",\"after\":99}}\n",
+                d.token
+            ),
+        )
+        .await;
+        assert_eq!(reset["gap"], true);
+        assert_eq!(reset["items"], serde_json::json!(["test log"]));
+        assert_eq!(
+            request(
+                &d,
+                &format!(
+                    "{{\"token\":\"{}\",\"command\":\"logs\",\"after\":-1}}\n",
+                    d.token
+                )
+            )
+            .await["error"],
+            "invalid_request"
         );
         assert_eq!(
             request(&d, &command("bad")).await["error"],

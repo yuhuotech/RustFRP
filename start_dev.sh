@@ -21,7 +21,7 @@ usage() {
     '  默认：构建 Web 和 Controller，后台启动服务。' \
     '  --skip-build：使用现有构建，快速启动。' \
     '  status / stop：查看状态 / 停止此脚本启动的服务。' \
-    '  可选环境变量：FLUTTER、DEV_EDGE_PORT、DEV_DB。Web 固定使用 9674。' \
+    '  可选环境变量：DEV_EDGE_PORT、DEV_DB。Web 固定使用 9674。' \
     '  首次初始化：创建 preview 管理员，交互输入密码；也可提供 RUSTFRP_ADMIN_PASSWORD。'
 }
 
@@ -111,22 +111,16 @@ done
 command -v curl >/dev/null || die '缺少工具：curl'
 
 if [[ "$ACTION" != --skip-build ]]; then
-  FLUTTER_BIN="${FLUTTER:-flutter}"
-  if ! command -v "$FLUTTER_BIN" >/dev/null; then
-    if [[ -z "${FLUTTER:-}" && -x "$HOME/development/flutter/bin/flutter" ]]; then
-      FLUTTER_BIN="$HOME/development/flutter/bin/flutter"
-    else
-      die '找不到 Flutter；请将其加入 PATH 或设置 FLUTTER=/完整路径/flutter。'
-    fi
-  fi
+  command -v node >/dev/null || die '找不到 Node；请安装开发工具链。'
+  command -v npm >/dev/null || die '找不到 npm；请安装开发工具链。'
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || die '找不到 cargo；请安装 Rust 工具链。'
   printf '[1/3] 构建 Web 面板…\n'
-  (cd rustfrp-app && "$FLUTTER_BIN" build web --no-web-resources-cdn)
+  (cd rustfrp-ui && if [[ ! -d node_modules ]]; then npm ci; fi && npm run check && npm run build)
   printf '[2/3] 构建 Controller…\n'
-  cargo build --release --target-dir "$ROOT/target" -p rustfrp-server
+  cargo build --release --target-dir "$ROOT/target" -p rustfrp-server --features embedded-panel
 fi
-[[ -x "$SERVER" && -f "$ROOT/rustfrp-app/build/web/index.html" ]] || \
+[[ -x "$SERVER" && -f "$ROOT/rustfrp-ui/dist/index.html" ]] || \
   die '缺少构建产物；请先运行 ./start_dev.sh（不带 --skip-build）。'
 mkdir -p "$STATE_DIR" "$(dirname -- "$DB")"
 
@@ -134,7 +128,7 @@ mkdir -p "$STATE_DIR" "$(dirname -- "$DB")"
 RUNNER=(env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=${TMPDIR:-/tmp}" \
   "RUSTFRP_DB=$DB" "RUSTFRP_HTTP=127.0.0.1:$HTTP_PORT" \
   "RUSTFRP_EDGE=127.0.0.1:$EDGE_PORT" 'RUSTFRP_PROXY_BIND=127.0.0.1' \
-  'RUSTFRP_PUBLIC_HOST=127.0.0.1' "RUSTFRP_PANEL_DIR=$ROOT/rustfrp-app/build/web")
+  'RUSTFRP_PUBLIC_HOST=127.0.0.1' "RUSTFRP_PANEL_DIR=$ROOT/rustfrp-ui/dist")
 ADMINS="$("${RUNNER[@]}" "$SERVER" admin list)"
 if [[ -z "$ADMINS" ]]; then
   PASSWORD="${RUSTFRP_ADMIN_PASSWORD:-}"

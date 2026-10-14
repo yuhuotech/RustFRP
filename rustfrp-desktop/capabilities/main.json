@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local bundled RustFRP UI only. No remote pages or generic shell/filesystem permissions.",
+  "windows": ["main"],
+  "permissions": ["allow-controller-request", "allow-controller-cancel", "allow-host-command"]
+}

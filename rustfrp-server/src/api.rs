@@ -429,7 +429,7 @@ async fn login(
     );
     Ok((
         [(header::SET_COOKIE, cookie)],
-        Json(json!({"admin": admin, "csrf": csrf})),
+        Json(json!({"admin": admin, "csrf": csrf, "api":"v1"})),
     )
         .into_response())
 }
@@ -443,7 +443,7 @@ async fn logout(State(st): State<AppState>, a: Auth) -> Result<Response, ApiErro
 }
 
 async fn me(a: Auth) -> Json<serde_json::Value> {
-    Json(json!({"admin": a.admin, "csrf": a.csrf}))
+    Json(json!({"admin": a.admin, "csrf": a.csrf, "api":"v1"}))
 }
 
 // ───────────── 概览 / 节点 ─────────────
@@ -2352,71 +2352,17 @@ async fn revoke_api_token(
 
 // ───────────── 静态面板与安全头 ─────────────
 
-fn content_type(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json",
-        "wasm" => "application/wasm",
-        "png" => "image/png",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "woff2" => "font/woff2",
-        _ => "application/octet-stream",
-    }
-}
-
-/// 把请求路径映射为面板目录内的相对文件；拒绝路径穿越。
-fn panel_relative(path: &str) -> Option<String> {
-    let rel = path.trim_start_matches('/');
-    if rel.is_empty() {
-        return Some("index.html".into());
-    }
-    let ok = rel.split('/').all(|seg| {
-        !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\') && !seg.contains('\0')
-    });
-    ok.then(|| rel.to_string())
-}
-
 async fn panel(State(st): State<AppState>, req: Request) -> Response {
-    let not_found =
-        || ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found").into_response();
-    let Some(dir) = &st.cfg.panel_dir else {
-        return not_found();
-    };
     if req.uri().path().starts_with("/api/") {
-        return not_found();
+        return ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found").into_response();
     }
-    let Some(rel) = panel_relative(req.uri().path()) else {
-        return not_found();
-    };
-    let try_read =
-        |rel: String| async move { tokio::fs::read(dir.join(&rel)).await.map(|b| (rel, b)) };
-    // 单页应用：不存在且不带扩展名的路径回落到 index.html。
-    let found = match try_read(rel.clone()).await {
-        Ok(v) => Some(v),
-        Err(_) if !rel.contains('.') => try_read("index.html".into()).await.ok(),
-        Err(_) => None,
-    };
-    let Some((rel, bytes)) = found else {
-        return not_found();
-    };
-    let cache = if rel == "index.html" {
-        "no-cache"
-    } else {
-        "public, max-age=3600"
-    };
-    (
-        [
-            (header::CONTENT_TYPE, content_type(&rel)),
-            (header::CACHE_CONTROL, cache),
-        ],
-        bytes,
+    crate::panel::serve(
+        st.cfg.panel_dir.as_deref(),
+        req.uri().path(),
+        req.method(),
+        req.headers(),
     )
-        .into_response()
+    .await
 }
 
 async fn security_headers(req: Request, next: Next) -> Response {
@@ -2426,7 +2372,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let set = |h: &mut HeaderMap, k: &'static str, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));
     };
-    set(h, "content-security-policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'");
+    set(h, "content-security-policy", "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");
     set(h, "x-frame-options", "DENY");
@@ -2517,6 +2463,7 @@ pub struct Empty {}
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+    use crate::panel::{content_type, relative_path as panel_relative};
 
     #[test]
     fn process_metric_lines_include_optional_linux_measurements_only_when_present() {

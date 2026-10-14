@@ -239,11 +239,13 @@ async fn login_logout_cycle_and_guards() {
     );
     let csrf = v["csrf"].as_str().unwrap().to_string();
     assert_eq!(v["admin"]["name"], "boss");
+    assert_eq!(v["api"], "v1");
     let sess = Sess {
         cookie: cookie.split(';').next().unwrap().to_string(),
         csrf,
     };
     let (st, v) = r.get("/api/v1/auth/me", &sess).await;
+    assert_eq!(v["api"], "v1");
     assert_eq!(
         (st, v["admin"]["role"].as_str()),
         (StatusCode::OK, Some("owner"))
@@ -1077,10 +1079,13 @@ async fn panel_static_files_spa_fallback_and_traversal() {
     }
 
     let no_panel = rig().await;
-    assert_eq!(
-        no_panel.req(Method::GET, "/", None, None).await.0,
-        StatusCode::NOT_FOUND
-    );
+    let (status, _, body) = no_panel.req(Method::GET, "/", None, None).await;
+    if cfg!(feature = "embedded-panel") {
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_str().unwrap_or("").contains("RustFRP"));
+    } else {
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = r.hub.online_ids();
 }

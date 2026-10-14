@@ -1,0 +1,6 @@
+{
+  "identifier": "e2e",
+  "description": "Only the separately built native-e2e application can call this fixed integration harness.",
+  "windows": ["main"],
+  "permissions": ["allow-native-test-config", "allow-native-test-report"]
+}

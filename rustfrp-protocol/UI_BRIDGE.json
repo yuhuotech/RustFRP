@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "api": "v1",
+  "session_api_field": "api",
+  "legacy_session_api": "v1",
+  "max_request_bytes": 2097152,
+  "max_response_bytes": 8388608,
+  "operations": {
+    "login": ["POST", "/auth/login"], "me": ["GET", "/auth/me"], "logout": ["POST", "/auth/logout"],
+    "overview": ["GET", "/overview"], "traffic": ["GET", "/traffic"], "node": ["GET", "/node"], "nodes": ["GET", "/nodes"],
+    "patchNode": ["PATCH", "/nodes/{id}"], "deleteNode": ["DELETE", "/nodes/{id}"],
+    "clients": ["GET", "/clients"], "client": ["GET", "/clients/{id}"], "patchClient": ["PATCH", "/clients/{id}"],
+    "deleteClient": ["DELETE", "/clients/{id}"], "kickClient": ["POST", "/clients/{id}/kick"],
+    "restartClient": ["POST", "/clients/{id}/restart"], "migrateClient": ["POST", "/clients/{id}/migrate"],
+    "updateClient": ["POST", "/clients/{id}/update"],
+    "previewConfig": ["POST", "/clients/{id}/config/preview"], "importConfig": ["POST", "/clients/{id}/config/import"],
+    "exportConfig": ["GET", "/clients/{id}/config/export"],
+    "tunnels": ["GET", "/tunnels"], "tunnel": ["GET", "/tunnels/{id}"], "createTunnel": ["POST", "/tunnels"],
+    "patchTunnel": ["PATCH", "/tunnels/{id}"], "deleteTunnel": ["DELETE", "/tunnels/{id}"], "batchTunnels": ["POST", "/tunnels/batch"],
+    "visitors": ["GET", "/visitors"], "createVisitor": ["POST", "/visitors"], "patchVisitor": ["PATCH", "/visitors/{id}"], "deleteVisitor": ["DELETE", "/visitors/{id}"],
+    "enrollTokens": ["GET", "/enroll-tokens"], "createEnrollToken": ["POST", "/enroll-tokens"], "revokeEnrollToken": ["DELETE", "/enroll-tokens/{id}"],
+    "apiTokens": ["GET", "/api-tokens"], "createApiToken": ["POST", "/api-tokens"], "revokeApiToken": ["POST", "/api-tokens/{id}/revoke"],
+    "admins": ["GET", "/admins"], "createAdmin": ["POST", "/admins"], "patchAdmin": ["PATCH", "/admins/{id}"],
+    "audit": ["GET", "/audit"], "logs": ["GET", "/logs"]
+  }
+}
