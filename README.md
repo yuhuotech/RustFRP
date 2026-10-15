@@ -6,7 +6,7 @@ RustFRP 是一个自托管内网穿透系统，包含 Rust 数据面与 Controll
 
 已在 `182.254.220.82` / `172.17.32.251` 独立部署 Linux Controller、Agent 和公网 HTTPS 面板（`https://rustfrp.dev99.cn`），原 frp 不受影响。受管/独立隧道、8 类插件、管理操作、节点跨主机迁移、控制面离线恢复和 Linux systemd 通过真实联调；端口、证据与明确未验收项见 [双主机验收记录](docs/WAN_ACCEPTANCE_20261013.md)。
 
-**管理 UI 已切换为 Web 与 Tauri 桌面共用的原生 HTML/CSS/TypeScript。** 本地 macOS 与 Linux ARM64 虚拟机的桌面 E2E、三引擎浏览器 E2E、全栈验收和所有覆盖率门槛均通过；Flutter 工程、依赖和构建入口已删除。Windows/物理 Linux 实机、桌面进程树内存对照和真实签名 Release 尚未取得；macOS 窗口恢复 p95 为 532ms，高于计划建议的 200ms。逐项证据见 [`UI 重构验收清单`](docs/UI_REFACTOR_STATUS.md)。
+**管理 UI 已切换为 Web 与 Tauri 桌面共用的原生 HTML/CSS/TypeScript。** 本地 macOS 与 Linux ARM64 虚拟机的桌面 E2E、三引擎浏览器 E2E、全栈验收和所有覆盖率门槛均通过；Flutter 工程、依赖和构建入口已删除。Windows/物理 Linux 实机、桌面进程树内存对照和真实签名 Release 尚未取得；macOS 窗口恢复 p95 为 517ms，高于计划建议的 200ms。逐项证据见 [`UI 重构验收清单`](docs/UI_REFACTOR_STATUS.md)。
 
 ### 已完成的遗留功能
 

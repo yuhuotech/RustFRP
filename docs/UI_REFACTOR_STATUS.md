@@ -51,7 +51,7 @@
 - 菜单展开/收起使用 SVG 侧栏轮廓与方向图标，保持 20×24px 点击区域，配有随状态变化的 tooltip、可访问名称和 `aria-expanded`。三引擎展开/收起、浅/深截图在 `rustfrp-ui/test-results/prototype-*/sidebar-*.png`。
 - `make ui-test ui-cov ui-build ui-e2e` 通过：104 个行为测试、三引擎 30 项 E2E；本轮 UI 行/函数/分支为 99.23% / 93.76% / 90.43%。活动资源 gzip 合计 52,692 字节、首屏 15,865 字节，通过预算。
 - `make desktop-test desktop-lint desktop-e2e` 通过。桌面覆盖率单测通过；原生 WebView 复验发现 macOS 会暂停隐藏前注册的动画帧回调。把两帧检查移至窗口恢复后注册，重跑通过 30 次循环、会话/页面恢复、单实例、后台 Agent 存活和退出后转发；`target/ui/native-window-e2e.json` 中引导接入、无令牌重启和凭据保护均为 true。隐藏启动另由隔离启动用例覆盖。
-- 更新后的 `tools/cov/desktop.py --report-only` 覆盖门槛通过：桌面壳 98.93% / 100% / 100%，支持库 95.82% / 93.23% / 90.36%。未调整门槛或排除项；下表其余 crate 保留上一轮整仓结果。
+- 最终 `make cov` 全部通过：桌面壳 98.93% / 100% / 100%，支持库 95.82% / 93.23% / 90.36%；共享 UI 99.23% / 93.76% / 90.43%。未调整门槛或排除项；其他 crate 结果见下表。
 - 本地构建、ad-hoc 签名校验通过；修正版已安装到 `/Applications/RustFRP.app`，旧包备份在 `target/delivery/RustFRP-before-menu-icons-sjnl_hj_/RustFRP.app`，独立交付包在 `target/delivery/menu-icons-20261015/RustFRP.app`。用户偏好与身份目录保留。
 
 最近一次 `make cov` 的 lcov 门槛结果：
@@ -73,7 +73,7 @@
 - Controller：同一 50/500 压力样本的 RSS 为 28,508,160 字节。该数据不等价于空闲典型场景 ≤12 MiB，也没有单独量出静态托管稳态增量。
 - Agent/Edge：10 隧道/100 连接的本机基准峰值 Client 7.14 MiB、Edge 6.70 MiB，低于 10 MiB。
 - macOS `.app` 构建包约 11.06 MiB；旧 Flutter macOS 应用包约 50 MiB。它们是安装包体积，不是桌面进程内存对照。
-- macOS release 优化构建的真实系统 WebView 完成 30 次窗口隐藏/恢复；从恢复操作到 WebView 可见并完成两帧渲染的 p95 为 532ms。计划建议值是 200ms，这项尚未达标；数据在 `target/ui/native-window-e2e.json`。窗口交互以外的本地反馈 p95 26ms 已通过浏览器测量。
+- macOS release 优化构建的真实系统 WebView 完成 30 次窗口隐藏/恢复；从恢复操作到 WebView 可见并完成两帧渲染的 p95 为 517ms。计划建议值是 200ms，这项尚未达标；数据在 `target/ui/native-window-e2e.json`。窗口交互以外的本地反馈 p95 26ms 已通过浏览器测量。
 - Ubuntu 24.04 ARM64 容器中的 WebKitGTK/Xvfb release E2E 完成相同的 30 次窗口循环、敏感凭据保护、窗口释放/恢复、单实例和 Agent 退出后转发；首帧 p95 为 52ms。隔离覆盖结果：桌面宿主 99.47/100/100、支持库 96.03/93.20/90.69（行/函数/分支）。
 - 删除 Tauri `Show` 路径上的 `unminimize` 没有降低 macOS p95，且可能改变其他平台的最小化恢复语义；该试验已撤回，交付代码保留 show/unminimize/focus。
 - 桌面 WebView、Tauri 宿主、辅助进程和 Agent 的同场景 RSS/PSS/物理占用比较尚未完成；不能据包体积推断内存下降比例。

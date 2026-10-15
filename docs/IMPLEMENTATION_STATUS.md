@@ -9,7 +9,7 @@
 
 | 模块 / 需求 | 状态 | 现有证据与剩余工作 |
 |---|---|---|
-| 管理 UI 重构（2026-10-14） | 本机自动化验收通过，外部条件保留 | `rustfrp-ui/` 是 Web/桌面共享 HTML/CSS/TypeScript；Tauri 提供系统 WebView 与 typed IPC；Flutter 工程/依赖/入口已删除。本机质量门槛、E2E 和覆盖率通过；跨平台实机、桌面内存对照、真实签名 Release 与 532ms 窗口恢复 p95 见 `docs/UI_REFACTOR_STATUS.md` |
+| 管理 UI 重构（2026-10-14） | 本机自动化验收通过，外部条件保留 | `rustfrp-ui/` 是 Web/桌面共享 HTML/CSS/TypeScript；Tauri 提供系统 WebView 与 typed IPC；Flutter 工程/依赖/入口已删除。本机质量门槛、E2E 和覆盖率通过；跨平台实机、桌面内存对照、真实签名 Release 与 517ms 窗口恢复 p95 见 `docs/UI_REFACTOR_STATUS.md` |
 | P00 基础工程、CI 与覆盖率 | 已完成 | Rust workspace、CI、覆盖率校验与真实冒烟已建立；各现行 crate 行/函数/分支最低门槛为 90%。此前 Flutter 覆盖率仅作为历史记录 |
 | M-01/11/12 登录、审计、角色 | 已实现待整体验收 | Cookie/CSRF/同源/限流/事务审计已有；管理员可由 Owner 经 REST/面板创建、改角色、启停、重置密码（需理由、事务审计、会话即时吊销，至少保留一位启用的 Owner，不能改自己的角色/状态）；CLI 仍可用 |
 | M-02 概览 | 已实现待整体验收 | 在线数/隧道数/版本、当前连接、近 24 小时流量（分钟桶聚合）、Controller 运行时长/常驻内存/累计 CPU 时间（读 `/proc/self`，仅 Linux 有值，其他平台显示「—」）已接入 REST 与面板；需在 Linux 实机复核数值 |
