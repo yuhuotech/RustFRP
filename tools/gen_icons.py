@@ -14,7 +14,6 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 BRAND = ROOT / 'assets/brand'
-APP = ROOT / 'rustfrp-app'
 SVG = BRAND / 'rustfrp-logo.svg'
 NS = '{http://www.w3.org/2000/svg}'
 ET.register_namespace('', NS[1:-1])
@@ -36,24 +35,8 @@ def main():
     for size in (16, 32, 64, 128, 256, 512, 1024):
         image = render(source, size)
         save_png(image, BRAND / f'rustfrp-logo-{size}.png')
-        save_png(image, APP / f'macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_{size}.png')
-        if size in (128, 512):
-            save_png(image, APP / f'assets/brand/rustfrp-logo-{size}.png')
-    save_png(render(source, 32), APP / 'web/favicon.png')
-    tree = ET.fromstring(source)
-    background = tree.find(f'{NS}rect')
-    background.set('rx', '0')
-    mask_mark = tree.find(f'{NS}g')
-    tree.remove(mask_mark)
-    safe_area = ET.SubElement(tree, f'{NS}g',
-                              {'transform': 'translate(76.8 76.8) scale(.85)'})
-    safe_area.append(mask_mark)
-    full_bleed = ET.tostring(tree)
-    for size in (192, 512):
-        save_png(render(source, size), APP / f'web/icons/Icon-{size}.png')
-        # The complete mark fits within the central 80%-diameter safe circle.
-        save_png(render(full_bleed, size), APP / f'web/icons/Icon-maskable-{size}.png')
-    render(source, 256).save(APP / 'windows/runner/resources/app_icon.ico',
+    render(source, 1024).save(BRAND / 'rustfrp-logo.icns')
+    render(source, 256).save(BRAND / 'rustfrp-logo.ico',
                             sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
     for suffix, color in (('', '#65A30D'), ('-white', '#FFFFFF'), ('-black', '#111827')):
         mark_tree = ET.Element(f'{NS}svg', {'width': '1024', 'height': '1024',
@@ -63,7 +46,7 @@ def main():
         mark.set('fill', color)
         mark_tree.append(mark)
         (BRAND / f'rustfrp-mark{suffix}.svg').write_bytes(ET.tostring(mark_tree) + b'\n')
-    print('Regenerated brand, Flutter, Web/PWA, macOS and Windows icons.')
+    print('Regenerated canonical brand, macOS ICNS and Windows ICO icons.')
 
 
 if __name__ == '__main__':

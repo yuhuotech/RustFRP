@@ -155,15 +155,21 @@ pub fn migrate(root: &Path, paths: &[PathBuf]) -> Result<Option<Value>, Error> {
     Ok(None)
 }
 pub fn current(root: &Path) -> Result<(), Error> {
-    let platform = Platform::current();
-    let home = std::env::var_os(if platform == Platform::Windows {
+    current_with(root, Platform::current(), |key| std::env::var_os(key))
+}
+fn current_with(
+    root: &Path,
+    platform: Platform,
+    variable: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), Error> {
+    let home = variable(if platform == Platform::Windows {
         "USERPROFILE"
     } else {
         "HOME"
     })
     .map(PathBuf::from)
     .ok_or_else(|| Error::io("无法确定旧偏好用户目录"))?;
-    let data = std::env::var_os(if platform == Platform::Windows {
+    let data = variable(if platform == Platform::Windows {
         "APPDATA"
     } else {
         "XDG_DATA_HOME"
@@ -245,6 +251,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(migrated, json!({"theme":"light","local_mode":true}));
+        current(&root).unwrap();
+        assert_eq!(settings::load(&root).unwrap(), migrated);
         assert!(decode(&path, b"not plist").is_err());
         assert!(decode(&path, b"<plist version=\"1.0\"><array/></plist>").is_err());
         assert_eq!(read(&home.join("missing")).unwrap(), None);
@@ -265,5 +273,67 @@ mod tests {
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(read(&link).is_err());
         }
+    }
+    #[test]
+    fn conversion_accepts_unprefixed_keys_and_object_local_configuration_and_detects_backup_conflicts(
+    ) {
+        let configuration = json!({
+            "binary": "/existing/agent",
+            "stateDir": "/existing/identity",
+            "controller": "host:7000",
+            "name": "桌面",
+            "configFile": "",
+            "caFile": "",
+            "tlsPin": ""
+        });
+        let converted = convert(&json!({
+            "server_url": "http://127.0.0.1:9674",
+            "theme_mode": "light",
+            "local_agent": configuration,
+            "notifications_enabled": true
+        }))
+        .unwrap();
+        assert_eq!(converted["controller_url"], "http://127.0.0.1:9674");
+        assert_eq!(converted["local"], configuration);
+        assert_eq!(converted["notifications"], true);
+
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("legacy.json");
+        let root = directory.path().join("new");
+        std::fs::write(&legacy, r#"{"theme_mode":"light"}"#).unwrap();
+        migrate(&root, std::slice::from_ref(&legacy)).unwrap();
+        std::fs::remove_file(root.join("preferences.json")).unwrap();
+        std::fs::write(root.join("preferences.legacy-backup.json"), "different").unwrap();
+        assert!(migrate(&root, std::slice::from_ref(&legacy)).is_err());
+
+        let json_path = directory.path().join("legacy.json");
+        assert_eq!(
+            decode(&json_path, br#"{"theme_mode":"dark"}"#).unwrap()["theme_mode"],
+            "dark"
+        );
+        assert!(decode(&json_path, b"not-json").is_err());
+    }
+
+    #[test]
+    fn current_selects_platform_home_and_data_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("user");
+        let data = directory.path().join("data");
+        assert!(
+            current_with(directory.path(), Platform::Windows, |key| match key {
+                "USERPROFILE" => Some(home.as_os_str().to_owned()),
+                "APPDATA" => Some(data.as_os_str().to_owned()),
+                _ => None,
+            })
+            .is_ok()
+        );
+        assert!(
+            current_with(directory.path(), Platform::Linux, |key| match key {
+                "HOME" => Some(home.as_os_str().to_owned()),
+                _ => None,
+            })
+            .is_ok()
+        );
+        assert!(current_with(directory.path(), Platform::Windows, |_| None).is_err());
     }
 }

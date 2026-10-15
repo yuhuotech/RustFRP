@@ -18,6 +18,7 @@ pub struct Runtime {
     local_reads: Semaphore,
     system: System,
     version: String,
+    startup: Option<startup::Startup>,
 }
 impl Runtime {
     pub fn new(system: System, version: &str) -> Result<Self, Error> {
@@ -34,7 +35,17 @@ impl Runtime {
             local_reads: Semaphore::new(2),
             system,
             version: version.into(),
+            startup: None,
         })
+    }
+    pub fn with_startup(
+        system: System,
+        version: &str,
+        startup: startup::Startup,
+    ) -> Result<Self, Error> {
+        let mut runtime = Self::new(system, version)?;
+        runtime.startup = Some(startup);
+        Ok(runtime)
     }
     pub async fn preferences(&self) -> Value {
         self.preferences.lock().await.clone()
@@ -240,8 +251,9 @@ impl Runtime {
                     None
                 };
                 let executable = self.system.shell.clone();
+                let supplied = self.startup.clone();
                 tokio::task::spawn_blocking(move || {
-                    let startup = startup::current(&executable)?;
+                    let startup = supplied.map_or_else(|| startup::current(&executable), Ok)?;
                     let enabled = match enabled {
                         Some(enabled) => startup.set(enabled, &startup::TaskScheduler)?,
                         None => startup.enabled(&startup::TaskScheduler)?,
@@ -321,6 +333,45 @@ fn argument<'a>(value: &'a Value, key: &str) -> Result<&'a str, Error> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn injected_startup_roundtrips_through_commands_without_replacing_the_users_definition() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("startup-home");
+        let legacy = home.join(".config/autostart/rustfrp.desktop");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"existing application").unwrap();
+        let mut startup = startup::Startup::isolated(home, root.path().join("app"));
+        startup.platform = startup::Platform::Linux;
+        let isolated = startup.path();
+        let app = Runtime::with_startup(
+            System {
+                root: root.path().join("preferences"),
+                shell: root.path().join("app"),
+                bundled_agent: None,
+            },
+            "startup-test",
+            startup,
+        )
+        .unwrap();
+        assert_eq!(app.command("startup", json!({})).await.unwrap(), false);
+        assert_eq!(
+            app.command("setStartup", json!({"enabled":true}))
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(app.command("startup", json!({})).await.unwrap(), true);
+        assert!(isolated.is_file());
+        assert_eq!(
+            app.command("setStartup", json!({"enabled":false}))
+                .await
+                .unwrap(),
+            false
+        );
+        assert_eq!(app.command("startup", json!({})).await.unwrap(), false);
+        assert!(!isolated.exists());
+        assert_eq!(std::fs::read(legacy).unwrap(), b"existing application");
+    }
+    #[tokio::test]
     async fn failed_controller_preference_commit_preserves_transport_and_os_update_commands_remain_typed(
     ) {
         let root = tempfile::tempdir().unwrap();
@@ -383,6 +434,166 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[tokio::test]
+    async fn local_read_commands_share_authenticated_status_logs_and_tunnels_without_leaking_secrets(
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let app = runtime(root.path());
+        let state = root.path().join("agent-state");
+        let binary = root.path().join("rustfrp-agent");
+        app.command(
+            "savePreferences",
+            json!({"local":{"binary":binary,"stateDir":state,"controller":"edge.example:7000","name":"native"}}),
+        )
+        .await
+        .unwrap();
+
+        let discovery = state.join("control.json");
+        std::fs::create_dir_all(state).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            &discovery,
+            json!({"version":1,"port":port,"token":"a".repeat(64),"controller":"edge.example:7000"}).to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&discovery, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let status = json!({"version":1,"pid":42,"connected":true,"revision":3,"proxies":1,"agent_version":"0.1.0","traffic":{"bytes_in":0,"bytes_out":12,"connections":1}});
+        let tunnel = json!({"revision":3,"items":[{"id":"tcp","kind":"tcp","local_ip":"127.0.0.1","local_port":8080,"remote_port":6000}],"next_offset":null});
+        let logs = json!({"items":["agent ready","token=private"],"cursor":43,"gap":false});
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..6 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let reply = match request["command"].as_str().unwrap() {
+                    "status" => &status,
+                    "tunnels" => &tunnel,
+                    "logs" => &logs,
+                    command => panic!("unexpected local command: {command}"),
+                };
+                reader
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+
+        assert_eq!(
+            app.command("localStatus", json!({})).await.unwrap()["pid"],
+            42
+        );
+        assert_eq!(
+            app.command("localTunnels", json!({})).await.unwrap()["items"][0]["id"],
+            "tcp"
+        );
+        assert_eq!(
+            app.command("localLogs", json!({"after":42})).await.unwrap()["cursor"],
+            43
+        );
+        let exported = app.command("exportDiagnostics", json!({})).await.unwrap();
+        let path = PathBuf::from(exported["path"].as_str().unwrap());
+        let report = std::fs::read_to_string(path).unwrap();
+        assert!(report.contains("agent ready"));
+        assert!(report.contains("[redacted]"));
+        assert!(!report.contains("token=private"));
+        let attempted = app
+            .command(
+                "savePreferences",
+                json!({"local":{"binary":binary,"stateDir":root.path().join("other-state"),"controller":"other.example:7000","name":"native"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(attempted.message.contains("先停止本机 Agent"));
+        assert_eq!(
+            app.preferences().await["local"]["controller"],
+            "edge.example:7000"
+        );
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[0]["token"], "a".repeat(64));
+        assert_eq!(requests[2]["after"], 42);
+
+        app.command(
+            "savePreferences",
+            json!({"local":{"binary":binary,"stateDir":root.path().join("other-state"),"controller":"other.example:7000","name":"native"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.preferences().await["local"]["controller"],
+            "other.example:7000"
+        );
+
+        let active_state = root.path().join("other-state");
+        std::fs::create_dir_all(&active_state).unwrap();
+        let active_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let active_port = active_listener.local_addr().unwrap().port();
+        let active_discovery = active_state.join("control.json");
+        std::fs::write(
+            &active_discovery,
+            json!({"version":1,"port":active_port,"token":"b".repeat(64),"controller":"other.example:7000"}).to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&active_discovery, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let active = tokio::spawn(async move {
+            let (socket, _) = active_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let result = reader
+                .get_mut()
+                .write_all(
+                    b"{\"version\":1,\"pid\":7,\"connected\":true,\"revision\":0,\"proxies\":0}\n",
+                )
+                .await;
+            assert!(result.is_ok());
+        });
+        let error = app
+            .command(
+                "savePreferences",
+                json!({"local":{"binary":binary,"stateDir":root.path().join("third-state"),"controller":"third.example:7000","name":"native"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("先停止本机 Agent"));
+        assert_eq!(
+            app.preferences().await["local"]["controller"],
+            "other.example:7000"
+        );
+        active.await.unwrap();
+
+        assert_eq!(
+            app.command("localStatus", json!({})).await.unwrap(),
+            Value::Null
+        );
+        assert!(app.command("notACommand", json!({})).await.is_err());
+        assert!(app.command("info", json!([])).await.is_err());
+        assert!(app
+            .command("info", json!({"large":"x".repeat(2 * 1024 * 1024)}))
+            .await
+            .is_err());
+    }
     #[tokio::test]
     async fn preferences_commands_are_private_persisted_and_do_not_store_secrets_or_unknown_capabilities(
     ) {
@@ -402,6 +613,9 @@ mod tests {
         .await
         .unwrap();
         assert!(!app.keep_in_tray());
+        let preferences = app.preferences.lock().await;
+        assert!(app.keep_in_tray());
+        drop(preferences);
         assert_eq!(
             app.command("preferences", json!({})).await.unwrap()["theme"],
             "dark"

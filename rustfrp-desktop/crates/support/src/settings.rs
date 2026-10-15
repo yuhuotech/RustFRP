@@ -111,6 +111,15 @@ fn save_with(root: &Path, value: &Value, replace: &dyn Replace) -> Result<(), Er
 mod tests {
     use super::*;
     #[test]
+    fn missing_preferences_default_cleanly_and_controller_urls_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(load(directory.path()).unwrap(), json!({}));
+        assert!(validate(&json!({"controller_url":""})).is_ok());
+        assert!(validate(&json!({"controller_url":"https://controller.example/panel"})).is_ok());
+        assert!(validate(&json!({"controller_url":"file:///etc/passwd"})).is_err());
+    }
+
+    #[test]
     fn preferences_are_private_atomic_and_never_accept_tokens_or_passwords() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("desktop");

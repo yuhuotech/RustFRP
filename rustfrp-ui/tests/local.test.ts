@@ -6,6 +6,7 @@ import type { Context, Page } from '../src/app/context';
 import type { HostAction } from '../src/platform/host';
 import { localConfigEditor, localSettings } from '../src/features/local-config';
 import { localPage } from '../src/features/local';
+import { connectComputer } from '../src/features/local-connect';
 import fixture from '../../rustfrp-protocol/fixtures/local-status.json';
 
 const active: { context: Context; page?: Page }[] = [];
@@ -90,7 +91,7 @@ describe('local status reads stay bounded and platform-aware', () => {
     expect(page.element.textContent).toContain('进程 PID'); expect(page.element.textContent).toContain(String(fixture.pid)); const panel = page.element.querySelector('.panel'); await page.refresh(); expect(page.element.querySelector('.panel')).toBe(panel);
   });
   it('shows missing discovery without inventing a healthy status, and Web never calls private control', async () => {
-    const native = harness(); const page = localPage(native.context); active.find(item => item.context === native.context)!.page = page; document.body.append(page.element); await page.refresh(); expect(page.element.textContent).toContain('未发现本机 Agent'); expect(document.querySelector('[data-testid=local-config-edit]')).not.toBeNull();
+    const native = harness(); const page = localPage(native.context); active.find(item => item.context === native.context)!.page = page; document.body.append(page.element); await page.refresh(); expect(page.element.textContent).toContain('本机 Agent 未启动'); expect(document.querySelector('[data-testid=local-config-edit]')).not.toBeNull();
     const browser = harness(false); const web = localPage(browser.context); active.find(item => item.context === browser.context)!.page = web; await web.refresh(); expect(web.element.textContent).toContain('需要桌面客户端'); expect(browser.call).not.toHaveBeenCalled();
   });
 });
@@ -142,3 +143,56 @@ describe('native Agent actions and applied data', () => {
   });
 });
 function recordLocal(prefs: RecordValue): RecordValue { return prefs.local as RecordValue; }
+
+describe('guided computer connection', () => {
+  const node = { id: '', name: '本地服务端', online: true, public_host: '127.0.0.1', edge_port: 17000, tls_fingerprint: 'ab'.repeat(32) };
+  function owner(h: ReturnType<typeof harness>) {
+    h.context.admin = { id: 'a', name: 'preview', role: 'owner', disabled_at: null };
+    return vi.spyOn(h.context.api, 'request').mockImplementation(async operation => operation === 'nodes' ? [node] : { token: 'one-time-test-token' });
+  }
+  it('offers a working first connection instead of disabled controls and hides irrelevant tabs', async () => {
+    const h = harness(); delete h.prefs.local; await mounted(h);
+    expect(document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.disabled).toBe(false);
+    expect(document.querySelector('[data-testid=local-start]')!.textContent).toBe('连接此电脑');
+    expect(document.querySelector<HTMLElement>('[data-testid=local-tab-status]')!.parentElement!.hidden).toBe(true);
+    click('local-login-entry'); expect(h.context.logout).toHaveBeenCalledOnce();
+    click('local-start'); await vi.waitFor(() => expect(document.querySelector('dialog')).not.toBeNull());
+    expect(document.querySelector('details')?.open).toBe(false);
+    click('local-login'); expect(h.context.logout).toHaveBeenCalledTimes(2); expect(document.querySelector('dialog')).toBeNull();
+  });
+  it('keeps custom paths and certificates through collapsed advanced settings and validates manual input', async () => {
+    const h = harness(); recordLocal(h.prefs).configFile = ''; recordLocal(h.prefs).caFile = '/custom/ca'; recordLocal(h.prefs).tlsPin = 'ff';
+    await localSettings(h.context); const advanced = document.querySelector('details')!;
+    expect(advanced.open).toBe(false); expect(advanced.contains(document.querySelector('[name=binary]'))).toBe(true);
+    field('controller', ''); submit(); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toContain('请填写管理员提供的接入地址'));
+    field('controller', 'host:17000'); submit(); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
+    expect(h.calls.find(([action]) => action === 'savePreferences')?.[1]).toMatchObject({ local: { binary: '/test/agent', stateDir: '/test/state', caFile: '/custom/ca', tlsPin: 'ff' } });
+  });
+  it('selects a config file with the native picker and retains the path on cancellation', async () => {
+    const h = harness(); await localSettings(h.context); h.call.mockResolvedValueOnce('/picked/frpc.toml'); click('local-pick-config');
+    await vi.waitFor(() => expect(document.querySelector<HTMLInputElement>('[name=configFile]')!.value).toBe('/picked/frpc.toml'));
+    expect(h.call).toHaveBeenCalledWith('pickFile', { kind: 'config' }); h.call.mockResolvedValueOnce(null); click('local-pick-config'); await Promise.resolve();
+    expect(document.querySelector<HTMLInputElement>('[name=configFile]')!.value).toBe('/picked/frpc.toml');
+  });
+  it('automatically configures the selected node, audits enrollment and consumes the token without persisting it', async () => {
+    const h = harness(); delete h.prefs.local; const api = owner(h);
+    await connectComputer(h.context); field('name', '我的电脑'); submit(); submit();
+    await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
+    expect(api).toHaveBeenCalledWith('createEnrollToken', { body: { kind: 'client', name: '我的电脑', node_id: '', ttl_minutes: 5, reason: '通过桌面客户端接入此电脑' } });
+    expect(h.call).toHaveBeenCalledWith('savePreferences', { local: { binary: '/test/agent', stateDir: '/test/state', name: '我的电脑', controller: '127.0.0.1:17000', tlsPin: node.tls_fingerprint, caFile: '', configFile: '' } });
+    expect(h.call.mock.calls.filter(([action]) => action === 'localStart')).toEqual([['localStart', { enrollToken: 'one-time-test-token' }]]);
+    expect(JSON.stringify(h.call.mock.calls.filter(([action]) => action === 'savePreferences'))).not.toContain('one-time-test-token');
+  });
+  it('does not create credentials for unavailable nodes and supports IPv6 with existing defaults', async () => {
+    const h = harness(); const api = owner(h); api.mockResolvedValueOnce([{ ...node, online: false }, { ...node, disabled_at: 10 }]);
+    await expect(connectComputer(h.context)).rejects.toThrow('没有可接入的在线节点'); expect(h.calls.some(([action]) => action === 'savePreferences')).toBe(false);
+    api.mockResolvedValueOnce([{ ...node, public_host: '::1' }]); await connectComputer(h.context); submit(); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
+    expect(h.calls.find(([action]) => action === 'savePreferences')?.[1]).toMatchObject({ local: { controller: '[::1]:17000', binary: '/test/agent', stateDir: '/test/state' } });
+  });
+  it('retains a failed start as uncertain and prevents issuing a second credential', async () => {
+    const h = harness(); const api = owner(h); const base = h.call.getMockImplementation()!;
+    h.call.mockImplementation((action, args) => action === 'localStart' ? Promise.reject(new Error('连接中断')) : base(action, args));
+    await connectComputer(h.context); submit(); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toContain('不要重复提交'));
+    submit(); expect(api.mock.calls.filter(([operation]) => operation === 'createEnrollToken')).toHaveLength(1);
+  });
+});

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 
 // Firefox 157 resolves macOS app data separately from -profile (upstream #42768).
 // Keep automation state separate from the user's Firefox profile without widening permissions.
-const firefoxState = resolve('../target/ui/firefox-state');
+const firefoxState = resolve(import.meta.dirname, '../target/ui/firefox-state');
 if (process.platform === 'darwin') mkdirSync(firefoxState, { recursive: true });
 const firefoxLaunch = process.platform === 'darwin' ? { env: { ...process.env, CFFIXED_USER_HOME: firefoxState } } : {};
 

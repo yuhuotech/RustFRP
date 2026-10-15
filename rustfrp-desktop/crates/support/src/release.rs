@@ -219,6 +219,8 @@ mod tests {
         assert!(authenticate(b"", signature.as_ref(), &public).is_err());
         assert!(authenticate(manifest.as_bytes(), signature.as_ref(), "bad key").is_err());
         assert!(signed_version(manifest.as_bytes(), marker, "v1.2.4").is_err());
+        assert!(signed_version(manifest.as_bytes(), b"", "v1.2.3").is_err());
+        assert!(signed_version(manifest.as_bytes(), &[b'x'; 129], "v1.2.3").is_err());
         assert!(signed_version(manifest.as_bytes(), b"v0.0.0\n", "v1.2.3").is_err());
         for malformed in [
             format!("{} app.zip\n{} app.zip", "ab".repeat(32), "ab".repeat(32)),
@@ -244,9 +246,18 @@ mod tests {
         assert!(newest(b"[]", "owner/repo").unwrap().is_none());
         assert!(newest(b"{}", "owner/repo").is_err());
         assert!(newest(b"bad", "owner/repo").is_err());
-        for repo in ["", "../repo", "one", "a/b/c", "a/with space"] {
+        for repo in [
+            "",
+            "../repo",
+            "one",
+            "a/b/c",
+            "a/with space",
+            &format!("{}/repo", "x".repeat(101)),
+        ] {
             assert!(repository(repo).is_err());
         }
+        assert!(hex(&"g".repeat(64), 32).is_err());
+        assert!(hex(&"a".repeat(63), 32).is_err());
         for feed in [
             serde_json::json!([{ "tag_name":"v1.0.0"}]),
             serde_json::json!([{ "tag_name":"v1.0.0","assets":[{"name":"../app.zip","size":42}]}]),
@@ -254,7 +265,70 @@ mod tests {
         ] {
             assert!(newest(feed.to_string().as_bytes(), "a/b").is_err());
         }
+        for name in [
+            String::new(),
+            ".".into(),
+            "..".into(),
+            "bad/name".into(),
+            "x".repeat(129),
+        ] {
+            let feed =
+                serde_json::json!([{ "tag_name":"v1.0.0","assets":[{"name":name,"size":1}] }]);
+            assert!(newest(feed.to_string().as_bytes(), "a/b").is_err());
+        }
         assert!(version("v1.2.3").unwrap() > version("1.2.3-beta.1").unwrap());
         assert!(version(&"x".repeat(129)).is_err());
+        assert!(newest(
+            &serde_json::json!([{"tag_name":format!("v{}", "1".repeat(128)),"assets":[]}])
+                .to_string()
+                .into_bytes(),
+            "a/b"
+        )
+        .unwrap()
+        .is_none());
+        assert!(newest(&vec![0; 2 * 1024 * 1024 + 1], "a/b").is_err());
+        assert!(newest(
+            &serde_json::to_vec(&[serde_json::json!({
+                "tag_name": "v1_0_0",
+                "assets": []
+            })])
+            .unwrap(),
+            "a/b"
+        )
+        .unwrap()
+        .is_none());
+    }
+    #[test]
+    fn release_parser_rejects_bounded_malformed_candidates_before_selecting_a_valid_one() {
+        let mut too_many = Vec::new();
+        for _ in 0..101 {
+            too_many.push(serde_json::json!({
+                "tag_name": "v1.0.0",
+                "assets": []
+            }));
+        }
+        assert!(newest(serde_json::to_vec(&too_many).unwrap().as_slice(), "a/b").is_err());
+        for release in [
+            serde_json::json!({"tag_name":"v1.0.0","assets":[{}]}),
+            serde_json::json!({"tag_name":"v1.0.0","assets":[{"name":"app.zip"}]}),
+            serde_json::json!({"tag_name":"v1.0.0","assets":[{"name":"app.zip","size":1},{"name":"app.zip","size":2}]}),
+            serde_json::json!({"tag_name":"v1.0.0","assets":[{"name":"app/zip","size":1}]}),
+        ] {
+            assert!(newest(serde_json::to_vec(&[release]).unwrap().as_slice(), "a/b").is_err());
+        }
+        let mut too_many_assets = Vec::new();
+        for index in 0..65 {
+            too_many_assets.push(serde_json::json!({"name":format!("asset-{index}"),"size":1}));
+        }
+        assert!(newest(
+            serde_json::to_vec(&[
+                serde_json::json!({"tag_name":"v1.0.0","assets":too_many_assets})
+            ])
+            .unwrap()
+            .as_slice(),
+            "a/b"
+        )
+        .is_err());
+        assert!(newest(b"[]", "invalid/repo/").is_err());
     }
 }

@@ -2,7 +2,7 @@
 """校验 lcov 覆盖率是否达标（行 / 函数 / 分支），低于门槛或低于基线则失败。
 
 用法：check_lcov.py <lcov.info> [--min 90] [--name core] [--baseline tools/cov/baseline.json] [--update-baseline]
-分支数据（BRF/BRH）不存在时（如 Dart 的 lcov），分支项显示 n/a 并跳过门槛。
+分支数据（BRF/BRH）不存在时，分支项显示 n/a 并跳过门槛。
 """
 import argparse
 import json
@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--rebaseline", action="store_true", help="重设基线：仍须满足门槛，但忽略「低于旧基线」（新增模块时在同一提交里使用，并在提交信息说明原因）")
     ap.add_argument("--list-gaps", action="store_true")
+    ap.add_argument("--require-all", action="store_true", help="缺少行、函数或分支数据也失败，用于 Rust 和共享 UI")
     a = ap.parse_args()
 
     tot, per_file = parse(a.lcov)
@@ -61,6 +62,8 @@ def main():
 
     failed = []
     for k, v in cur.items():
+        if a.require_all and v is None:
+            failed.append(f"{k} 缺少覆盖率数据")
         if v is not None and v < a.min:
             failed.append(f"{k} {v:.2f}% < {a.min}%")
 

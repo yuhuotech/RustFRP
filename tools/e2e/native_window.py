@@ -15,6 +15,41 @@ import urllib.request
 from native_local import AGENT, ROOT, forwarded, probe, stop_owned, wait, Echo
 
 
+def startup_probe(executable, base_env, folder, output, mode, startup_hidden=True):
+    report = folder / f"{mode}.json"
+    env = {**base_env, "RUSTFRP_NATIVE_E2E_MODE": mode, "RUSTFRP_NATIVE_E2E_REPORT": str(report)}
+    env.pop("RUSTFRP_DESKTOP_STATE_DIR", None)
+    env.pop("LOCALAPPDATA", None)
+    home = folder / f"{mode}-home"
+    home.mkdir(mode=0o700)
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    if mode == "isolated-startup":
+        env["RUSTFRP_DESKTOP_STATE_DIR"] = str(folder / "isolated-state")
+    if mode == "no-tray-startup":
+        env["RUSTFRP_NATIVE_E2E_NO_TRAY"] = "1"
+    with output.open("a") as log:
+        command = [str(executable)] + (["--startup-to-tray"] if startup_hidden else [])
+        app = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if report.exists():
+                    evidence = json.loads(report.read_text())
+                    assert evidence.get("passed") and evidence.get("stage") == mode, evidence
+                    assert app.wait(timeout=5) == 0
+                    return evidence
+                if app.poll() is not None:
+                    raise AssertionError(f"{mode} startup probe exited before reporting")
+                time.sleep(0.1)
+            raise AssertionError(f"{mode} startup probe timed out")
+        finally:
+            if app.poll() is None:
+                app.terminate()
+                try: app.wait(timeout=5)
+                except subprocess.TimeoutExpired: app.kill(); app.wait(timeout=5)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: native_window.py <native-e2e application executable>")
@@ -38,14 +73,23 @@ def main():
     token=api("POST","/enroll-tokens",{"name":name,"ttl_minutes":5,"reason":"Actual WebView E2E"})
     with tempfile.TemporaryDirectory(prefix="rustfrp-native-window-") as temporary, socketserver.TCPServer(("127.0.0.1",0), Echo) as echo:
         folder=Path(temporary)
-        root=folder/"desktop"
-        root.mkdir(mode=0o700)
-        local={"binary":str(root/"bin"/AGENT.name),"stateDir":str(folder/"agent"),"controller":f"127.0.0.1:{node['edge_port']}","tlsPin":node["tls_fingerprint"],"name":name}
+        home=folder/"home"
+        home.mkdir(mode=0o700)
+        root=home/".rustfrp"/"native-desktop"
+        root.mkdir(parents=True,mode=0o700)
+        missing_supervisor=subprocess.run([str(executable),"--agent-supervisor",str(folder/"missing-job.json")],capture_output=True,text=True,timeout=10)
+        assert missing_supervisor.returncode!=0 and "后台" in missing_supervisor.stderr
+        extra_supervisor=subprocess.run([str(executable),"--agent-supervisor",str(folder/"missing-job.json"),"unexpected"],capture_output=True,text=True,timeout=10)
+        assert extra_supervisor.returncode!=0 and "参数" in extra_supervisor.stderr
+        relative_state = subprocess.run([str(executable)], env={**os.environ, "RUSTFRP_DESKTOP_STATE_DIR": "relative"}, capture_output=True, text=True, timeout=10)
+        assert relative_state.returncode != 0 and "绝对路径" in relative_state.stderr
+        local={"binary":str(root/"bin"/AGENT.name),"stateDir":str(folder/"agent"),"name":name}
         preferences=root/"preferences.json"
         preferences.write_text(json.dumps({"local":local,"controller_url":"http://127.0.0.1:9674","notifications":False,"lightweight":True}))
         if os.name!="nt": preferences.chmod(0o600)
         report=folder/"report.json"
-        env={**os.environ,"RUSTFRP_DESKTOP_STATE_DIR":str(root),"RUSTFRP_E2E_PASSWORD":password,"RUSTFRP_NATIVE_E2E_TOKEN":token["token"],"RUSTFRP_NATIVE_E2E_NAME":name,"RUSTFRP_NATIVE_E2E_REPORT":str(report)}
+        env={**os.environ,"HOME":str(home),"LOCALAPPDATA":str(home),"USERPROFILE":str(home),"RUSTFRP_E2E_PASSWORD":password,"RUSTFRP_NATIVE_E2E_TOKEN":token["token"],"RUSTFRP_NATIVE_E2E_NAME":name,"RUSTFRP_NATIVE_E2E_REPORT":str(report)}
+        env.pop("RUSTFRP_DESKTOP_STATE_DIR",None)
         thread=threading.Thread(target=echo.serve_forever,daemon=True); thread.start()
         evidence={}
         single_instance=False
@@ -53,7 +97,7 @@ def main():
         output=ROOT/"target/ui/native-window.log"
         output.parent.mkdir(parents=True,exist_ok=True)
         with output.open("w") as log:
-            app=subprocess.Popen([str(executable)],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
+            app=subprocess.Popen([str(executable),"--startup-to-tray"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
             try:
                 deadline=time.monotonic()+200
                 previous=""
@@ -94,6 +138,10 @@ def main():
                 for item in api("GET","/api-tokens"):
                     if item["name"]==name and item.get("revoked_at") is None: api("POST",f"/api-tokens/{item['id']}/revoke",{"reason":"Native window E2E credential cleanup"})
                 echo.shutdown()
+        evidence["relative_state_rejected"] = True
+        evidence["isolated_startup"] = startup_probe(executable, env, folder, output, "isolated-startup")
+        evidence["home_startup"] = startup_probe(executable, env, folder, output, "home-startup", startup_hidden=False)
+        evidence["no_tray_startup"] = startup_probe(executable, env, folder, output, "no-tray-startup")
     (ROOT/"target/ui/native-window-e2e.json").write_text(json.dumps(evidence,indent=2)+"\n")
     print(json.dumps(evidence,indent=2))
 

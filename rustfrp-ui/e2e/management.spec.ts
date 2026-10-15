@@ -1,6 +1,6 @@
 import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createConnection, createServer } from 'node:net';
@@ -43,7 +43,7 @@ test('real agents, TCP forwarding, CRUD, visitors, import/export, credentials an
     const node = await (await context.request.get('/api/v1/node')).json();
     for (let index = 0; index < 2; index++) {
       const name = `UI-${suffix}-${index}`; const enrollment = await token(context.request, csrf, name);
-      const agent = spawn(resolve('../target/release/rustfrp-agent'), ['--mode', 'client', '--controller', `127.0.0.1:${node.edge_port}`, '--enroll-token', enrollment.token, '--name', name, '--state-dir', join(folder, `agent-${index}`), '--local-control', join(folder, `agent-${index}`, 'control.json'), '--tls-pin', node.tls_fingerprint], { stdio: 'ignore' });
+      const agent = spawn(resolve(import.meta.dirname, '../../target/release', process.platform === 'win32' ? 'rustfrp-agent.exe' : 'rustfrp-agent'), ['--mode', 'client', '--controller', `127.0.0.1:${node.edge_port}`, '--enroll-token', enrollment.token, '--name', name, '--state-dir', join(folder, `agent-${index}`), '--local-control', join(folder, `agent-${index}`, 'control.json'), '--tls-pin', node.tls_fingerprint], { stdio: 'ignore' });
       agents.push(agent);
       let clientId = '';
       await expect.poll(async () => { const list = await (await context.request.get('/api/v1/clients')).json(); const client = list.find((client: { name: string; online: boolean; id: string }) => client.name === name && client.online); clientId = client?.id ?? ''; return !!client; }, { timeout: 15000 }).toBe(true);
@@ -87,5 +87,181 @@ test('real agents, TCP forwarding, CRUD, visitors, import/export, credentials an
     for (const agent of agents) await stop(agent);
     for (const id of clients) await context.request.delete(`/api/v1/clients/${id}?reason=UI%20E2E%20cleanup`, { headers: { 'x-csrf-token': csrf } });
     await new Promise<void>(resolve => echo.close(() => resolve())); await rm(folder, { recursive: true, force: true });
+  }
+});
+
+test('independent node enrollment, management and removal use the real Controller and Agent', async ({ page, context }, testInfo) => {
+  test.setTimeout(90000);
+  const suffix = `${testInfo.project.name}-${Date.now()}`;
+  const name = `独立节点-${suffix}`;
+  const renamed = `已修改节点-${suffix}`;
+  const folder = await mkdtemp(join(tmpdir(), 'rustfrp-node-ui-e2e-'));
+  const errors: string[] = [];
+  let csrf = '';
+  let tokenId = '';
+  let nodeId = '';
+  let edge: ChildProcess | undefined;
+  page.on('pageerror', error => errors.push(error.message));
+  try {
+    await login(page);
+    csrf = (await (await context.request.get('/api/v1/auth/me')).json()).csrf;
+    const builtin = await (await context.request.get('/api/v1/node')).json();
+    await nav(page, '节点管理');
+    const tokenResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/enroll-tokens') && response.request().method() === 'POST');
+    await page.getByTestId('new-node').click();
+    await page.getByLabel('节点名称', { exact: true }).fill(name);
+    await page.getByLabel('操作理由', { exact: true }).fill('独立节点接入 E2E');
+    await page.getByTestId('dialog-submit').click();
+    const enrollment = await (await tokenResponse).json();
+    tokenId = enrollment.id;
+    expect(enrollment.kind).toBe('node');
+    expect(enrollment.commands.direct).toContain('--mode edge');
+    expect(enrollment.commands.direct).toContain('--tls-pin');
+    await expect(page.locator('dialog').getByLabel('direct', { exact: true })).toHaveValue(/--mode edge/);
+
+    const config = join(folder, 'edge.toml');
+    const edgePort = await new Promise<number>((resolve, reject) => {
+      const listener = createServer();
+      listener.once('error', reject);
+      listener.listen(0, '127.0.0.1', () => {
+        const address = listener.address();
+        if (!address || typeof address === 'string') { listener.close(); reject(new Error('missing independent edge port')); return; }
+        listener.close(error => error ? reject(error) : resolve(address.port));
+      });
+    });
+    await writeFile(config, `bindAddr = "127.0.0.1"\nbindPort = ${edgePort}\nproxyBindAddr = "127.0.0.1"\n`);
+    edge = spawn(resolve(import.meta.dirname, '../../target/release', process.platform === 'win32' ? 'rustfrp-agent.exe' : 'rustfrp-agent'), [
+      '--mode', 'edge', '--controller', enrollment.commands.controller, '--enroll-token', enrollment.token,
+      '--name', name, '--public-host', '127.0.0.1', '--state-dir', join(folder, 'node-state'),
+      '--tls-pin', builtin.tls_fingerprint, '-c', config,
+    ], { stdio: 'ignore' });
+
+    let registered: { id: string; name: string; online: boolean; disabled_at: number | null; clients: number } | undefined;
+    await expect.poll(async () => {
+      const nodes = await (await context.request.get('/api/v1/nodes')).json();
+      registered = nodes.find((item: typeof registered) => item?.name === name && item.online);
+      return !!registered;
+    }, { timeout: 20000 }).toBe(true);
+    nodeId = registered!.id;
+    await expect(page.getByRole('button', { name: '查看已接入资源', exact: true })).toBeEnabled({ timeout: 15000 });
+    await page.getByRole('button', { name: '查看已接入资源', exact: true }).click();
+    await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+
+    await page.getByTestId('rename-node').click();
+    await page.getByLabel('名称', { exact: true }).fill(renamed);
+    await save(page, '重命名独立节点 E2E');
+    await expect.poll(async () => {
+      const nodes = await (await context.request.get('/api/v1/nodes')).json();
+      return nodes.find((item: { id: string }) => item.id === nodeId)?.name;
+    }).toBe(renamed);
+
+    await page.getByTestId('toggle-node').click();
+    await save(page, '停用独立节点 E2E');
+    await expect.poll(async () => {
+      const nodes = await (await context.request.get('/api/v1/nodes')).json();
+      return nodes.find((item: { id: string }) => item.id === nodeId)?.disabled_at != null;
+    }).toBe(true);
+    await stop(edge);
+    await page.getByTestId('delete-node').click();
+    await save(page, '删除独立节点 E2E');
+    await expect.poll(async () => {
+      const nodes = await (await context.request.get('/api/v1/nodes')).json();
+      return nodes.some((item: { id: string }) => item.id === nodeId);
+    }).toBe(false);
+    nodeId = '';
+    const actions = (await (await context.request.get('/api/v1/audit?limit=100')).json()).map((entry: { action: string }) => entry.action);
+    expect(actions).toContain('node_token.create');
+    expect(actions).toContain('node.enroll');
+    expect(actions).toContain('node.update');
+    expect(actions).toContain('node.delete');
+    expect(errors).toEqual([]);
+  } finally {
+    if (edge) await stop(edge);
+    if (!nodeId && csrf) {
+      const nodes = await (await context.request.get('/api/v1/nodes')).json();
+      nodeId = nodes.find((item: { id: string; name: string }) => item.name === name || item.name === renamed)?.id ?? '';
+    }
+    if (nodeId) {
+      const headers = { 'x-csrf-token': csrf };
+      await context.request.patch(`/api/v1/nodes/${nodeId}`, { headers, data: { disabled: true, reason: '独立节点 E2E 清理' } });
+      await context.request.delete(`/api/v1/nodes/${nodeId}?reason=independent%20node%20E2E%20cleanup`, { headers });
+    }
+    if (tokenId) await context.request.delete(`/api/v1/enroll-tokens/${tokenId}?reason=independent%20node%20E2E%20cleanup`, { headers: { 'x-csrf-token': csrf } });
+    await rm(folder, { recursive: true, force: true });
+  }
+});
+
+test('all supported tunnel kinds save through the real Controller from the shared editor', async ({ page, context }, testInfo) => {
+  test.setTimeout(90000);
+  const suffix = `${testInfo.project.name}-${Date.now()}`;
+  const name = `全部类型-${suffix}`;
+  const folder = await mkdtemp(join(tmpdir(), 'rustfrp-tunnel-types-e2e-'));
+  const tunnels: string[] = [];
+  let csrf = '';
+  let clientId = '';
+  let agent: ChildProcess | undefined;
+  try {
+    await login(page);
+    csrf = (await (await context.request.get('/api/v1/auth/me')).json()).csrf;
+    const node = await (await context.request.get('/api/v1/node')).json();
+    const enrollment = await token(context.request, csrf, name);
+    agent = spawn(resolve(import.meta.dirname, '../../target/release', process.platform === 'win32' ? 'rustfrp-agent.exe' : 'rustfrp-agent'), [
+      '--mode', 'client', '--controller', `127.0.0.1:${node.edge_port}`, '--enroll-token', enrollment.token,
+      '--name', name, '--state-dir', join(folder, 'client-state'), '--tls-pin', node.tls_fingerprint,
+    ], { stdio: 'ignore' });
+    await expect.poll(async () => {
+      const items = await (await context.request.get('/api/v1/clients')).json();
+      const found = items.find((item: { name: string; online: boolean; id: string }) => item.name === name && item.online);
+      clientId = found?.id ?? '';
+      return !!found;
+    }, { timeout: 15000 }).toBe(true);
+
+    await nav(page, '客户端');
+    await page.getByTestId(`detail-${clientId}`).click();
+    for (const kind of ['tcp', 'udp', 'http', 'https', 'stcp', 'sudp', 'tcpmux']) {
+      await page.getByTestId('client-new-tunnel').click();
+      const dialog = page.locator('dialog');
+      await dialog.getByLabel('类型', { exact: true }).selectOption(kind);
+      const tunnelName = `${kind}-${suffix}`;
+      await dialog.getByLabel('名称', { exact: true }).fill(tunnelName);
+      await dialog.getByLabel('本地端口', { exact: true }).fill('8080');
+      await dialog.getByLabel('启用隧道', { exact: true }).uncheck();
+      if (['http', 'https', 'tcpmux'].includes(kind)) {
+        await dialog.getByLabel('自定义域名', { exact: true }).fill(`${kind}-${suffix}.e2e.example.test`);
+      }
+      if (kind === 'http') {
+        await dialog.getByLabel('改写 Host', { exact: true }).fill('backend.internal');
+        await dialog.getByLabel('路径前缀', { exact: true }).fill('/api');
+        await dialog.getByLabel('Basic Auth 用户名', { exact: true }).fill('e2e-user');
+        await dialog.getByLabel('Basic Auth 密码', { exact: true }).fill('e2e-password');
+        await dialog.getByLabel('按 Basic 用户名选路', { exact: true }).fill('e2e-route');
+        await dialog.getByLabel('请求头', { exact: true }).fill('X-E2E-Request: request');
+        await dialog.getByLabel('响应头', { exact: true }).fill('X-E2E-Response: response');
+      }
+      await dialog.getByLabel('操作理由', { exact: true }).fill(`验证 ${kind.toUpperCase()} 配置`);
+      await page.getByTestId('dialog-submit').click();
+      await expect(dialog).toHaveCount(0);
+      let tunnel: { id: string; kind: string; enabled: boolean; custom_domains?: string[]; http_password_set?: boolean; http_password?: string; request_headers?: object; response_headers?: object } | undefined;
+      await expect.poll(async () => {
+        const values = await (await context.request.get(`/api/v1/tunnels?client_id=${clientId}`)).json();
+        tunnel = values.find((item: { name: string }) => item.name === tunnelName);
+        return tunnel?.kind;
+      }).toBe(kind);
+      expect(tunnel?.enabled).toBe(false);
+      if (kind === 'http') {
+        expect(tunnel?.custom_domains).toContain(`${kind}-${suffix}.e2e.example.test`);
+        expect(tunnel?.http_password_set).toBe(true);
+        expect(tunnel?.http_password).toBeUndefined();
+        expect(tunnel?.request_headers).toEqual({ 'X-E2E-Request': 'request' });
+        expect(tunnel?.response_headers).toEqual({ 'X-E2E-Response': 'response' });
+      }
+      if (tunnel) tunnels.push(tunnel.id);
+    }
+    await expect(page.getByTestId('page-title')).toHaveText('客户端');
+  } finally {
+    if (agent) await stop(agent);
+    for (const id of tunnels) await context.request.delete(`/api/v1/tunnels/${id}?reason=tunnel%20kind%20E2E%20cleanup`, { headers: { 'x-csrf-token': csrf } });
+    if (clientId) await context.request.delete(`/api/v1/clients/${clientId}?reason=tunnel%20kind%20E2E%20cleanup`, { headers: { 'x-csrf-token': csrf } });
+    await rm(folder, { recursive: true, force: true });
   }
 });

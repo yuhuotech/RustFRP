@@ -52,6 +52,17 @@ describe('shared application lifecycle', () => {
     expect(requests).toHaveLength(0); expect(document.querySelector('[data-section=clients]')).toBeNull(); app.navigate('nodes'); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('本机模式');
     app.navigate('settings', 'desktop'); await vi.waitFor(() => expect(document.body.textContent).toContain('后台 Agent 独立于窗口运行'));
   });
+  it('returns from local mode to login without a server request and offers the local Controller address', async () => {
+    const host: Host = { desktop: true, call: vi.fn(async action => action === 'preferences' ? { local_mode: true } : null), request: vi.fn() };
+    const { app, requests } = harness('owner', false, host); await app.start();
+    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-login-entry]')).not.toBeNull());
+    document.querySelector<HTMLButtonElement>('[data-testid=local-login-entry]')!.click();
+    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull());
+    expect(requests).toHaveLength(0);
+    document.querySelector<HTMLButtonElement>('[data-testid=login-local-controller]')!.click();
+    expect(document.querySelector<HTMLInputElement>('#login-server')!.value).toBe('http://127.0.0.1:9674');
+    expect(document.activeElement).toBe(document.querySelector('#login-name'));
+  });
   it('rejects inherited or malformed restored routes and ignores late page loading after disposal', async () => {
     const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() };
     localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'toString' })); const first = harness('viewer', true, host); await first.app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));

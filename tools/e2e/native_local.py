@@ -19,7 +19,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "target" / "release" / ("rustfrp-agent.exe" if os.name == "nt" else "rustfrp-agent")
-SHELL = ROOT / "rustfrp-desktop" / "target" / "debug" / ("rustfrp-desktop.exe" if os.name == "nt" else "rustfrp-desktop")
+SHELL = Path(os.environ["RUSTFRP_DESKTOP_SHELL"]) if "RUSTFRP_DESKTOP_SHELL" in os.environ else ROOT / "rustfrp-desktop" / "target" / "debug" / ("rustfrp-desktop.exe" if os.name == "nt" else "rustfrp-desktop")
 PROBE = Path(os.environ["RUSTFRP_DESKTOP_PROBE"]) if "RUSTFRP_DESKTOP_PROBE" in os.environ else ROOT / "rustfrp-desktop" / "target" / "debug" / "examples" / ("local_probe.exe" if os.name == "nt" else "local_probe")
 BASE = "http://127.0.0.1:9674"
 

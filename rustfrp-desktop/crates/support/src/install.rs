@@ -12,7 +12,7 @@ pub enum Method {
     Mac { bundle: PathBuf },
     Tar { root: PathBuf, relative: PathBuf },
     Deb { executable: PathBuf },
-    Windows,
+    Windows { executable: PathBuf },
     Manual,
 }
 #[derive(Clone, Debug)]
@@ -82,7 +82,9 @@ pub fn plan(
             Plan {
                 asset: Some(asset.into()),
                 manual: None,
-                method: Method::Windows,
+                method: Method::Windows {
+                    executable: executable.into(),
+                },
             }
         }
         Platform::Linux => {
@@ -128,21 +130,23 @@ pub fn plan(
 pub fn writable(path: &Path) -> bool {
     tempfile::NamedTempFile::new_in(path).is_ok()
 }
-pub fn current(executable: &Path, assets: &[String]) -> Plan {
-    let platform = Platform::current();
-    let installed = if platform == Platform::Windows {
+fn installed(platform: Platform, executable: &Path) -> bool {
+    if platform == Platform::Windows {
         executable.parent().is_some_and(|parent| {
             parent.join("unins000.exe").is_file() || parent.join("uninstall.exe").is_file()
         })
     } else {
         executable.starts_with("/usr/lib/rustfrp/app")
             || executable == Path::new("/usr/bin/rustfrp_app")
-    };
+    }
+}
+pub fn current(executable: &Path, assets: &[String]) -> Plan {
+    let platform = Platform::current();
     plan(
         platform,
         std::env::consts::ARCH,
         executable,
-        installed,
+        installed(platform, executable),
         assets,
         writable,
     )
@@ -215,7 +219,7 @@ pub trait Driver {
         deadline: Duration,
     ) -> Result<process::Output, Error>;
     fn shell(&self, path: &Path) -> Result<(), Error>;
-    fn windows(&self, package: &Path) -> Result<(), Error>;
+    fn windows(&self, package: &Path, executable: &Path) -> Result<(), Error>;
 }
 struct Native;
 impl Driver for Native {
@@ -230,10 +234,10 @@ impl Driver for Native {
     fn shell(&self, path: &Path) -> Result<(), Error> {
         spawn_script(path)
     }
-    fn windows(&self, package: &Path) -> Result<(), Error> {
+    fn windows(&self, package: &Path, executable: &Path) -> Result<(), Error> {
         #[cfg(not(windows))]
         {
-            let _ = package;
+            let _ = (package, executable);
             Err(Error::invalid("Windows 安装程序仅可在 Windows 上运行"))
         }
         #[cfg(windows)]
@@ -247,7 +251,7 @@ impl Driver for Native {
                 .create_new(true)
                 .open(&script)
                 .map_err(Error::io_context("无法保存 Windows 安装接续文件"))?;
-            file.write_all(b"param([string]$Package,[int]$ParentPid)\n$ErrorActionPreference='Stop'\nfor($i=0;$i -lt 100 -and (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 300}\nif(Get-Process -Id $ParentPid -ErrorAction SilentlyContinue){exit 1}\ntry{$result=Start-Process -FilePath $Package -ArgumentList @('/S') -PassThru -Wait;exit $result.ExitCode}finally{Remove-Item -LiteralPath (Split-Path -Parent $Package) -Recurse -Force}\n").and_then(|()|file.sync_all()).map_err(Error::io_context("无法保存 Windows 安装接续文件"))?;
+            file.write_all(b"param([string]$Package,[string]$Application,[int]$ParentPid)\n$ErrorActionPreference='Stop'\nfor($i=0;$i -lt 100 -and (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 300}\nif(Get-Process -Id $ParentPid -ErrorAction SilentlyContinue){exit 1}\ntry{$directory=Split-Path -Parent $Application;$result=Start-Process -FilePath $Package -ArgumentList @('/S',\"/D=$directory\") -PassThru -Wait;if($result.ExitCode -eq 0){Start-Process -FilePath $Application};exit $result.ExitCode}finally{Remove-Item -LiteralPath (Split-Path -Parent $Package) -Recurse -Force}\n").and_then(|()|file.sync_all()).map_err(Error::io_context("无法保存 Windows 安装接续文件"))?;
             let mut command = Command::new("powershell.exe");
             command
                 .args([
@@ -260,6 +264,8 @@ impl Driver for Native {
                 .arg(&script)
                 .arg("-Package")
                 .arg(package)
+                .arg("-Application")
+                .arg(executable)
                 .arg("-ParentPid")
                 .arg(std::process::id().to_string())
                 .stdin(Stdio::null())
@@ -291,7 +297,7 @@ pub fn handoff_with(plan: &Plan, package: &Path, driver: &impl Driver) -> Result
         .parent()
         .ok_or_else(|| Error::invalid("更新包路径无效"))?;
     match &plan.method {
-        Method::Windows => driver.windows(package),
+        Method::Windows { executable } => driver.windows(package, executable),
         Method::Manual => Err(Error::invalid("此安装方式需手动更新")),
         method => {
             let (stage,body)=match method {
@@ -368,7 +374,7 @@ mod tests {
         fail_shell: bool,
         shells: Mutex<Vec<String>>,
         stages: Mutex<Vec<PathBuf>>,
-        windows: Mutex<Vec<PathBuf>>,
+        windows: Mutex<Vec<(PathBuf, PathBuf)>>,
     }
     impl Recorded {
         fn new(shape: Shape) -> Self {
@@ -417,7 +423,11 @@ mod tests {
                     Shape::MissingDirectory => std::fs::remove_dir(&stage).unwrap(),
                     #[cfg(unix)]
                     Shape::SymlinkExecutable => {
-                        let path = stage.join("RustFRP.app/Contents/MacOS/rustfrp_app");
+                        let path = if program.ends_with("tar") {
+                            stage.join("rustfrp-linux-x86_64/app/rustfrp_app")
+                        } else {
+                            stage.join("RustFRP.app/Contents/MacOS/rustfrp_app")
+                        };
                         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                         std::os::unix::fs::symlink("/bin/sh", path).unwrap();
                     }
@@ -451,8 +461,11 @@ mod tests {
                 Ok(())
             }
         }
-        fn windows(&self, package: &Path) -> Result<(), Error> {
-            self.windows.lock().unwrap().push(package.into());
+        fn windows(&self, package: &Path, executable: &Path) -> Result<(), Error> {
+            self.windows
+                .lock()
+                .unwrap()
+                .push((package.into(), executable.into()));
             Ok(())
         }
     }
@@ -584,6 +597,8 @@ mod tests {
             Shape::Empty,
             Shape::ExtractionFailure,
             Shape::ExtractionError,
+            #[cfg(unix)]
+            Shape::SymlinkExecutable,
         ] {
             let (plan, package) = fixture(
                 directory.path(),
@@ -647,14 +662,31 @@ mod tests {
         assert!(scripts.first().unwrap().contains("pkexec dpkg -i"));
         assert!(scripts.first().unwrap().contains("DEBIAN_FRONTEND"));
         drop(scripts);
-        let (plan, package) = fixture(directory.path(), Method::Windows);
+        let application = directory.path().join("installed app/rustfrp_app.exe");
+        let (plan, package) = fixture(
+            directory.path(),
+            Method::Windows {
+                executable: application.clone(),
+            },
+        );
         let driver = Recorded::new(Shape::Empty);
         handoff_with(&plan, &package, &driver).unwrap();
-        assert_eq!(*driver.windows.lock().unwrap(), vec![package.clone()]);
+        assert_eq!(
+            *driver.windows.lock().unwrap(),
+            vec![(package.clone(), application.clone())]
+        );
         assert!(driver.shells.lock().unwrap().is_empty());
         assert!(handoff_with(&plan, &directory.path().join("missing"), &driver).is_err());
         assert!(handoff_with(&plan, Path::new("relative"), &driver).is_err());
         assert!(handoff_with(&plan, directory.path(), &driver).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = directory.path().join("valid-install.sh");
+            std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            spawn_script(&script).unwrap();
+        }
         #[cfg(unix)]
         {
             let link = directory.path().join("symlink");
@@ -662,7 +694,7 @@ mod tests {
             assert!(handoff_with(&plan, &link, &driver).is_err());
         }
         #[cfg(not(windows))]
-        assert!(Native.windows(&package).is_err());
+        assert!(Native.windows(&package, &application).is_err());
         let (plan, package) = fixture(directory.path(), Method::Manual);
         assert!(handoff(&plan, &package).is_err());
     }
@@ -783,6 +815,81 @@ mod tests {
         )
         .manual
         .is_some());
+        assert!(plan(
+            Platform::Linux,
+            "x86_64",
+            Path::new("/"),
+            false,
+            &assets,
+            |_| true
+        )
+        .manual
+        .is_some());
+        assert!(plan(
+            Platform::Linux,
+            "x86_64",
+            Path::new("/app"),
+            false,
+            &assets,
+            |_| true
+        )
+        .manual
+        .is_some());
+        assert!(current(Path::new("/nonstandard/not-in-a-bundle"), &assets)
+            .manual
+            .is_some());
+        assert!(
+            current(Path::new("/usr/lib/rustfrp/app/rustfrp_app"), &assets)
+                .manual
+                .is_some()
+        );
+        assert!(current(Path::new("/usr/bin/rustfrp_app"), &assets)
+            .manual
+            .is_some());
+        assert!(plan(
+            Platform::Mac,
+            "arm64",
+            Path::new("/Applications/RustFRP.app/Contents/MacOS/app\n"),
+            false,
+            &assets,
+            |_| true
+        )
+        .manual
+        .is_some());
+        assert!(plan(
+            Platform::Mac,
+            "arm64",
+            Path::new(
+                "/private/var/folders/AppTranslocation/RustFRP.app/Contents/MacOS/rustfrp_app"
+            ),
+            false,
+            &assets,
+            |_| true
+        )
+        .manual
+        .is_some());
+        assert!(matches!(
+            plan(
+                Platform::Linux,
+                "x86_64",
+                Path::new("/opt/rustfrp/app/rustfrp_app"),
+                true,
+                &["rustfrp-linux-x86_64.tar.gz".into()],
+                |_| true
+            )
+            .method,
+            Method::Tar { .. }
+        ));
+        assert!(plan(
+            Platform::Linux,
+            "x86_64",
+            Path::new("/opt/rustfrp/app/rustfrp_app"),
+            true,
+            &[],
+            |_| true
+        )
+        .manual
+        .is_some());
         assert!(matches!(
             plan(
                 Platform::Windows,
@@ -793,7 +900,7 @@ mod tests {
                 |_| true
             )
             .method,
-            Method::Windows
+            Method::Windows { executable } if executable == Path::new("/installed/app.exe")
         ));
         assert!(plan(
             Platform::Windows,
@@ -816,6 +923,16 @@ mod tests {
         .manual
         .is_some());
         assert!(plan(
+            Platform::Windows,
+            "x86_64",
+            Path::new("/installed/app.exe"),
+            true,
+            &[],
+            |_| true
+        )
+        .manual
+        .is_some());
+        assert!(plan(
             Platform::Linux,
             "x86_64",
             Path::new("relative"),
@@ -828,6 +945,35 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         assert!(writable(directory.path()));
         assert!(!writable(&directory.path().join("missing")));
+        assert!(!installed(
+            Platform::Windows,
+            Path::new("/portable/rustfrp_app.exe")
+        ));
+        let uninstall = directory.path().join("uninstall.exe");
+        std::fs::write(&uninstall, b"uninstaller").unwrap();
+        assert!(installed(
+            Platform::Windows,
+            &directory.path().join("rustfrp_app.exe")
+        ));
+        std::fs::remove_file(uninstall).unwrap();
+        let old_uninstall = directory.path().join("unins000.exe");
+        std::fs::write(&old_uninstall, b"uninstaller").unwrap();
+        assert!(installed(
+            Platform::Windows,
+            &directory.path().join("rustfrp_app.exe")
+        ));
+        assert!(installed(
+            Platform::Linux,
+            Path::new("/usr/lib/rustfrp/app/rustfrp_app")
+        ));
+        assert!(installed(
+            Platform::Linux,
+            Path::new("/usr/bin/rustfrp_app")
+        ));
+        assert!(!installed(
+            Platform::Mac,
+            Path::new("/Applications/RustFRP.app/Contents/MacOS/rustfrp_app")
+        ));
     }
     #[test]
     #[cfg(unix)]

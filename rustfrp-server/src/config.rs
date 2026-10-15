@@ -32,7 +32,7 @@ pub struct Config {
     pub public_host: String,
     /// 面板对外访问地址（含协议），用于生成安装脚本命令；空则不生成。
     pub public_url: String,
-    /// Flutter Web 面板静态目录；空则不托管。
+    /// 共享 Web UI 静态目录；空则不托管。
     pub panel_dir: Option<PathBuf>,
     /// Cookie 是否加 Secure（经 HTTPS 访问时必须开启）。
     pub secure_cookie: bool,

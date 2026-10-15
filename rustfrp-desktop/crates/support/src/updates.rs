@@ -472,6 +472,12 @@ impl Updates {
         })
         .await
     }
+    /// Skip the background check when release verification is disabled or another update is active.
+    pub async fn check_native_if_idle(&self, choice: &str) {
+        if self.status().disabled.is_none() && !self.busy() {
+            let _ = self.check_native(choice).await;
+        }
+    }
     pub async fn install(
         &self,
         source: &impl Source,
@@ -773,6 +779,29 @@ mod tests {
         package: Vec<u8>,
         requests: Mutex<Vec<String>>,
         failed: bool,
+        file_failed: bool,
+    }
+    struct Oversized;
+    impl Source for Oversized {
+        async fn bytes(
+            &self,
+            _: &str,
+            limit: usize,
+            _: &CancellationToken,
+        ) -> Result<Vec<u8>, Error> {
+            Ok(vec![b'x'; limit + 1])
+        }
+
+        async fn file(
+            &self,
+            _: &str,
+            _: &Path,
+            _: u64,
+            _: &CancellationToken,
+            _: &Updates,
+        ) -> Result<(), Error> {
+            Err(Error::io("unexpected fixture download"))
+        }
     }
     impl Source for Feed {
         async fn bytes(
@@ -802,7 +831,7 @@ mod tests {
         ) -> Result<(), Error> {
             live(token)?;
             self.requests.lock().unwrap().push(url.into());
-            if self.failed || url.starts_with("https://broken.example/") {
+            if self.failed || self.file_failed || url.starts_with("https://broken.example/") {
                 tokio::fs::write(path, b"partial").await.unwrap();
                 return Err(Error::io("fixture failed download"));
             }
@@ -867,6 +896,7 @@ mod tests {
                 package: package.to_vec(),
                 requests: Mutex::new(Vec::new()),
                 failed: false,
+                file_failed: false,
             },
         )
     }
@@ -882,7 +912,9 @@ mod tests {
         install::Plan {
             asset: Some("package.zip".into()),
             manual: None,
-            method: install::Method::Windows,
+            method: install::Method::Windows {
+                executable: "/installed/app.exe".into(),
+            },
         }
     }
     #[tokio::test]
@@ -938,8 +970,11 @@ mod tests {
             "hash",
             "incomplete",
             "oversized",
+            "zero-size",
             "missing",
             "installer",
+            "download-failed",
+            "download-too-large",
         ] {
             let (config, mut feed) = fixture();
             let updates = updater(config, root.path());
@@ -970,13 +1005,29 @@ mod tests {
                         serde_json::to_vec(&value).unwrap(),
                     );
                 }
+                "zero-size" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(feed.entries.get("releases?per_page=100").unwrap())
+                            .unwrap();
+                    value[0]["assets"][0]["size"] = serde_json::json!(0);
+                    feed.entries.insert(
+                        "releases?per_page=100".into(),
+                        serde_json::to_vec(&value).unwrap(),
+                    );
+                }
                 _ => {}
+            }
+            if attack == "download-failed" {
+                feed.file_failed = true;
             }
             let installer = Install {
                 count: AtomicUsize::new(0),
                 fail: attack == "installer",
             };
             updates.check("github", &feed, plan).await.unwrap();
+            if attack == "download-too-large" {
+                feed.package.push(b'!');
+            }
             assert!(
                 updates.install(&feed, &installer).await.is_err(),
                 "{attack}"
@@ -1112,6 +1163,7 @@ mod tests {
             package: Vec::new(),
             requests: Mutex::new(Vec::new()),
             failed: false,
+            file_failed: false,
         };
         let (config, _) = fixture();
         let updates = updater(config, root.path());
@@ -1121,6 +1173,86 @@ mod tests {
             .unwrap()
             .latest
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_update_fetch_rejects_oversized_responses_and_stops_before_network_when_cancelled(
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (config, _) = fixture();
+        let updates = updater(config, root.path());
+        let token = CancellationToken::new();
+        assert_eq!(
+            updates
+                .get(
+                    &Oversized,
+                    "https://github.com/owner/project/releases",
+                    8,
+                    &token
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            updates
+                .get(
+                    &Oversized,
+                    "https://github.com/owner/project/releases",
+                    8,
+                    &cancelled
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "update_cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_update_checks_skip_disabled_and_busy_installers() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, _) = fixture();
+        let disabled = Updates::new(
+            Config {
+                key: String::new(),
+                ..config.clone()
+            },
+            "0.1.0",
+            root.path().join("disabled"),
+            root.path().join("app"),
+        );
+        assert!(disabled.status().disabled.is_some());
+        disabled.check_native_if_idle("invalid").await;
+        assert_eq!(disabled.status().phase, "idle");
+
+        let updates = updater(config, root.path());
+        let gate = updates.gate.lock().await;
+        assert!(updates.busy());
+        updates.check_native_if_idle("invalid").await;
+        assert_eq!(updates.status().phase, "idle");
+        drop(gate);
+        assert!(!updates.busy());
+        updates.check_native_if_idle("invalid").await;
+        assert_eq!(updates.status().phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn native_installer_keeps_manual_plans_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::write(&package, b"verified bytes").unwrap();
+        let plan = install::Plan {
+            asset: None,
+            manual: Some("manual update required".into()),
+            method: install::Method::Manual,
+        };
+        let error = NativeInstaller.apply(&plan, &package).await.unwrap_err();
+        assert_eq!(error.code, "invalid_request");
     }
     struct Waiting {
         started: tokio::sync::Notify,

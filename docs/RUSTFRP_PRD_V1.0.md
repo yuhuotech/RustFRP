@@ -1,8 +1,10 @@
 # RustFRP 需求说明书（PRD）V1.0
 
+> **2026-10-14 架构决策修订**：G6 的 Flutter 单工程已由 `docs/UI_REFACTOR_PLAN_20261014.md` 替换为 `rustfrp-ui/` 原生 HTML/CSS/TypeScript + Tauri 系统 WebView；Web 与桌面共用同一 UI 构建。本文中 Flutter/Dart 工程、平台导入和构建描述为历史方案，不再是当前实现要求；当前实施/验收见 `docs/UI_REFACTOR_STATUS.md`。
+
 > 状态：草案，待评审　｜　编制日期：2026-10-11
 > 配套文档：[技术设计文档](RUSTFRP_TECH_DESIGN_V1.0.md)（架构、UI、Model、目录）
-> 参考项目：`/data/www/linkory/`（Monorepo 结构、Flutter 多端、UI 规范）；功能参考：[fatedier/frp](https://github.com/fatedier/frp)
+> 参考项目：`/data/www/linkory/`（Monorepo 结构与 UI 规范）；功能参考：[fatedier/frp](https://github.com/fatedier/frp)
 > 项目名称：**RustFRP**（已确定）；主域名 `rustfrp.com`（含 `www.`）；代码前缀 `rustfrp-`。
 > 两条最高优先级的整体设计原则见 [技术设计文档 §0](RUSTFRP_TECH_DESIGN_V1.0.md)：**极致省内存（典型场景 ≈10 MB）**、**配置层完全兼容 frp**。
 
@@ -31,15 +33,15 @@ frp 是最常用的内网穿透工具，但存在几个痛点：
 | G3 | **集中管理**：一个管理面板管理所有服务端节点和客户端，配置在面板里改、自动下发、热生效 | 不登录任何机器即可新增/修改/停用隧道 |
 | G4 | **一行命令接入新机器**：面板生成安装命令，粘贴到目标机器执行即可接入 | 接入耗时 < 1 分钟 |
 | G5 | **三个桌面系统都有原生客户端**：macOS / Linux / Windows | 三平台安装包 + 实机验证 |
-| G6 | **一套 Flutter 代码做 Web 管理面板和桌面客户端**，UI 沿用 linkory 风格，主色换成草绿色 | 同一 `rustfrp-app` 工程产出 web / macos / linux / windows |
+| G6（2026-10-14 修订） | **一套原生 HTML/CSS/TypeScript UI 用于 Web 管理面板和桌面客户端**，桌面由 Tauri 系统 WebView 承载 | `rustfrp-ui/` 同一构建由 Controller 托管并嵌入 Tauri 包 |
 | G7 | **官方网站**：产品介绍、下载、文档入口 | 站点上线，下载链接指向 Release |
 
 ### 1.3 非目标（V1.0 不做）
 
 - **不要求线上协议与官方 frp 互通**。协议可自研（见技术文档 §4.1），官方 frpc 不能直连 RustFRP 服务端，反之亦然；**但配置层必须完全兼容**（G8），迁移时两端一起换成 RustFRP 即可。可选的「frp 线协议兼容模式」放 V1.1 评估（便于灰度迁移）。
-- **不做 Android / iOS 客户端**（Flutter 架构保留这条路，V2.0 评估）。
+- **不做 Android / iOS 客户端**，V2.0 再评估。
 - **不做多租户 SaaS 计费**。V1.0 面向「个人 / 小团队自建」。
-- **不做 Flutter 之外的独立 Web 管理前端**（linkory 里的 React 管理后台不照搬）。
+- Web 与桌面只维护一套共享 DOM 管理 UI，不维护第二套业务前端。
 - KCP / QUIC 传输：配置项会被**识别并给出明确提示**，V1.0 不实现（回落 TCP），QUIC 在 V1.1 评估。
 
 ---
@@ -69,7 +71,7 @@ frp 是最常用的内网穿透工具，但存在几个痛点：
 flowchart LR
   subgraph Panel["管理面（部署在服务端）"]
     C["rustfrp-server<br/>Controller + 内置 Edge"]
-    UI["Flutter Web 管理面板<br/>（由 Controller 托管）"]
+    UI["共享 DOM 管理面板<br/>（由 Controller 托管）"]
     C --- UI
   end
   E2["Edge 节点 B<br/>rustfrp-agent --mode edge"]
@@ -89,8 +91,8 @@ flowchart LR
 | **Controller（`rustfrp-server`）** | 管理面：账号、节点、客户端、隧道、审计、配置下发；**默认内置一个 Edge**，单机部署一个二进制就够用 |
 | **Edge（服务端 Agent）** | 数据面：监听公网端口、接受客户端隧道连接、转发流量，相当于 frps。可独立部署到更多 VPS，由 Controller 统一管理 |
 | **Client Agent（客户端 Agent）** | 运行在内网机器上，相当于 frpc。无界面，可作为系统服务常驻 |
-| **桌面客户端** | Flutter 桌面应用（macOS / Linux / Windows），管理本机 Client Agent，也可以连接 Controller 作为管理控制台 |
-| **管理面板（Web）** | 同一个 Flutter 工程编译为 Web，由 Controller 托管，管理所有节点和客户端 |
+| **桌面客户端** | Tauri + 系统 WebView（macOS / Linux / Windows），管理本机 Client Agent，也可连接 Controller 作为管理控制台 |
+| **管理面板（Web）** | `rustfrp-ui/` 原生 HTML/CSS/TypeScript，由 Controller 托管并与桌面共用 |
 | **官方网站** | 静态站点，介绍、下载、文档 |
 
 > `rustfrp-agent` 是**同一个二进制**，通过 `--mode client|edge` 区分角色，减少发布物和维护量。
@@ -230,7 +232,7 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 | 每增加 1 个空闲并发连接 | ≤ **16 KB** | — |
 | 单连接峰值缓冲 | ≤ **32 KB** | — |
 
-实现手段（详见技术文档 §8）：Rust 无 GC；`mimalloc`/`jemalloc` 可选并调小 arena；Tokio 工作线程数按核数封顶；连接缓冲按需分配并池化；Linux 上 `splice` 零拷贝；SQLite 缓存页上限；Flutter Web 静态文件走磁盘 + 预压缩，不常驻内存；二进制裁剪 feature。
+实现手段（详见技术文档 §8）：Rust 无 GC；`mimalloc`/`jemalloc` 可选并调小 arena；Tokio 工作线程数按核数封顶；连接缓冲按需分配并池化；Linux 上 `splice` 零拷贝；SQLite 缓存页上限；共享 UI 静态文件走磁盘/rodata + 预压缩，不常驻堆；二进制裁剪 feature。
 
 ### 6.2 性能
 
@@ -264,7 +266,7 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 
 ### 6.6 可维护性
 
-- 所有协议结构以 `rustfrp-protocol/` 为唯一来源，Rust 与 Dart 用同一组 JSON fixtures 做一致性测试。
+- 所有协议结构以 `rustfrp-protocol/` 为唯一来源，Rust 与 TypeScript UI 用同一组 JSON fixtures 做一致性测试。
 - 每个子目录独立构建、独立测试，根 Makefile 统一入口。
 - 界面文案中文为主，暂不做英文版，仅预留 i18n 结构。
 
@@ -272,7 +274,7 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 
 ## 7. UI 要求（摘要，详见技术文档 §5）
 
-1. **整体沿用 linkory 的 UI 规范**（源自 cc-switch v7 设计系统）：三栏布局、token 化的颜色/字号/圆角、共享控件、深浅色、窄屏单栏 + 底部导航。
+1. **整体沿用 linkory 的 UI 规范**（源自 cc-switch v7 设计系统）：可折叠菜单 + 内容工作区的两栏布局、token 化的颜色/字号/圆角、共享 DOM 组件、深浅色、窄屏单栏 + 底部导航。
 2. **主色由橙色改为草绿色**，其余 token（中性色、语义色、字号、圆角、间距、控件尺寸）保持不变。
 3. 一个视图最多一个实心主色按钮；无渐变、无大面积彩色块。
 4. 未登录 / 空状态都要有「说明 + 入口」，不出现空白页。
@@ -284,10 +286,10 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P00 工程初始化** | Monorepo、Cargo workspace、协议目录、CI、Makefile、Flutter 工程 + 主题 token（草绿） | `make test` 通过；空壳 UI 可在 web / macos 运行 |
+| **P00 工程初始化** | Monorepo、Cargo workspace、协议目录、CI、Makefile、共享 UI 与主题 token（草绿） | `make test` 通过；空壳 UI 可在 Web / Tauri 窗口运行 |
 | **P01 隧道核心** | 协议、TLS 多路复用、tcp/udp 代理、Edge+Client 最小闭环（本地配置文件驱动） | 两进程跑通 SSH 穿透；内存达标雏形 |
 | **P02 管理面** | Controller、SQLite、设备接入、配置下发与热更新、管理员与审计、REST + WS | CLI 即可完成「加节点、加客户端、加隧道」 |
-| **P03 Web 面板** | Flutter Web：登录、概览、节点、客户端、隧道、接入向导 | 全流程只靠面板完成 |
+| **P03 Web 面板** | 共享 DOM UI：登录、概览、节点、客户端、隧道、接入向导 | 全流程只靠面板完成 |
 | **P04 HTTP/HTTPS 与域名** | vhost 路由、子域名、证书、Basic Auth、PROXY protocol | S1 场景验收 |
 | **P05 桌面客户端** | 托管本机 agent、托盘、开机启动、控制台模式、三平台打包 | 三系统实机安装验证 |
 | **P06 高级代理** | stcp / sudp / tcpmux、健康检查、负载均衡、限速、插件 | 与 frp 功能对照表 P0/P1 全绿 |
@@ -323,7 +325,7 @@ rustfrp-agent reload -c ./frpc.toml            # 等价 frpc reload
 | R9 | **完全兼容的工作量与长尾**：frp 字段多、版本演进快 | 以 frp 官方示例与测试配置为兼容性测试集；按版本跟踪；`verify` 明确列出差异 |
 | R10 | **10 MB 与功能全的冲突**（TLS、HTTP 路由、SQLite 都有基础开销） | 先做 P01 内存基线实测，若典型场景超 10 MB，按 feature 裁剪并在评审中调整口径 |
 | R2 | **主色草绿与语义色 success（绿）撞色** | 主色取偏黄的草绿（lime 系，色相约 84°），success 保留偏蓝的绿（约 142°）；状态必须带圆点/图标/文字，不只靠颜色；评审后可微调 success |
-| R3 | Flutter Web 首屏体积大（CanvasKit/Wasm） | 面板是登录后使用的工具，可接受；用 `--wasm` 构建 + 预压缩 + 缓存头；官网用纯静态 HTML，不用 Flutter |
+| R3 | Web 资源增长导致冷启动变慢 | 入口资源按预算构建、非首屏页面分块加载，并在 CI 检查 gzip 体积和真实浏览器首屏 |
 | R4 | 「极致省内存」与「功能全」冲突（如 QUIC、ACME 会增加依赖） | 重功能用 Cargo feature 开关，默认发布版裁剪；每个 PR 跑内存基准 |
 | R5 | Windows 服务 / macOS launchd 的权限与签名成本 | P05 提前验证；macOS 需要 Apple 开发者账号 |
 | R6 | 公网暴露面板的安全风险 | 默认面板仅监听内网/127.0.0.1，需要显式开启公网并强制 HTTPS |

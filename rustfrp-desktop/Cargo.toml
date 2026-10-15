@@ -28,6 +28,9 @@ tempfile = "3"
 [build-dependencies]
 tauri-build = { version = "=2.7.2", features = [] }
 
+[dev-dependencies]
+tauri = { version = "=2.12.3", features = ["test"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }

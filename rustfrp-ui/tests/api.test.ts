@@ -106,6 +106,9 @@ describe('desktop and browser adapters', () => {
     await host.call('openUrl', { url: 'https://example.com' }); expect(open).toHaveBeenCalledWith('https://example.com/', '_blank', 'noopener,noreferrer');
     await expect(host.call('openUrl', { url: 'javascript:alert(1)' })).rejects.toThrow('不支持');
     await expect(host.call('localStart')).rejects.toThrow('桌面客户端');
-    await expect(host.request()).rejects.toThrow('同源 HTTP'); expect(await host.call('info')).toMatchObject({ desktop: false });
+    await expect(host.request()).rejects.toThrow('同源 HTTP'); expect(await host.call('info')).toMatchObject({ desktop: false, version: 'development' });
+    const version = document.createElement('meta'); version.name = 'rustfrp-ui-version'; version.content = '1.2.3'; document.head.append(version);
+    expect(await host.call('info')).toMatchObject({ version: '1.2.3' });
+    version.content = ''; expect(await host.call('info')).toMatchObject({ version: 'development' }); version.remove();
   });
 });

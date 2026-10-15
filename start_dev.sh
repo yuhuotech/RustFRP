@@ -11,6 +11,7 @@ LOG_FILE="$STATE_DIR/server.log"
 SERVER="$ROOT/target/release/rustfrp-server"
 HTTP_PORT=9674
 EDGE_PORT="${DEV_EDGE_PORT:-17000}"
+NODE_PORT="${DEV_NODE_PORT:-17001}"
 DB="${DEV_DB:-$ROOT/target/panel-preview.db}"
 URL="http://localhost:$HTTP_PORT"
 
@@ -21,7 +22,7 @@ usage() {
     '  默认：构建 Web 和 Controller，后台启动服务。' \
     '  --skip-build：使用现有构建，快速启动。' \
     '  status / stop：查看状态 / 停止此脚本启动的服务。' \
-    '  可选环境变量：DEV_EDGE_PORT、DEV_DB。Web 固定使用 9674。' \
+    '  可选环境变量：DEV_EDGE_PORT、DEV_NODE_PORT、DEV_DB。Web 固定使用 9674。' \
     '  首次初始化：创建 preview 管理员，交互输入密码；也可提供 RUSTFRP_ADMIN_PASSWORD。'
 }
 
@@ -103,11 +104,13 @@ if [[ "$ACTION" == status ]]; then
   exit 0
 fi
 
-for port in "$HTTP_PORT" "$EDGE_PORT"; do
+for port in "$HTTP_PORT" "$EDGE_PORT" "$NODE_PORT"; do
   [[ "$port" =~ ^[0-9]+$ && ${#port} -le 5 ]] || die "无效端口：$port"
   ((10#$port >= 1 && 10#$port <= 65535)) || die "端口超出范围：$port"
 done
 [[ "$HTTP_PORT" != "$EDGE_PORT" ]] || die 'Web 和 Edge 不能使用相同端口。'
+[[ "$HTTP_PORT" != "$NODE_PORT" ]] || die 'Web 和节点接入不能使用相同端口。'
+[[ "$EDGE_PORT" != "$NODE_PORT" ]] || die 'Edge 和节点接入不能使用相同端口。'
 command -v curl >/dev/null || die '缺少工具：curl'
 
 if [[ "$ACTION" != --skip-build ]]; then
@@ -127,7 +130,8 @@ mkdir -p "$STATE_DIR" "$(dirname -- "$DB")"
 # 只传入本地开发配置，避免继承终端中的生产环境 RUSTFRP_* 设置。
 RUNNER=(env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=${TMPDIR:-/tmp}" \
   "RUSTFRP_DB=$DB" "RUSTFRP_HTTP=127.0.0.1:$HTTP_PORT" \
-  "RUSTFRP_EDGE=127.0.0.1:$EDGE_PORT" 'RUSTFRP_PROXY_BIND=127.0.0.1' \
+  "RUSTFRP_EDGE=127.0.0.1:$EDGE_PORT" "RUSTFRP_NODE_ADDR=127.0.0.1:$NODE_PORT" \
+  'RUSTFRP_PROXY_BIND=127.0.0.1' \
   'RUSTFRP_PUBLIC_HOST=127.0.0.1' "RUSTFRP_PANEL_DIR=$ROOT/rustfrp-ui/dist")
 ADMINS="$("${RUNNER[@]}" "$SERVER" admin list)"
 if [[ -z "$ADMINS" ]]; then
@@ -151,6 +155,9 @@ stop_http_owner
 if lsof -nP -iTCP:"$EDGE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   die "Edge 端口 $EDGE_PORT 已被其他服务占用；可用 DEV_EDGE_PORT 指定其他端口。"
 fi
+if lsof -nP -iTCP:"$NODE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  die "节点接入端口 $NODE_PORT 已被其他服务占用；可用 DEV_NODE_PORT 指定其他端口。"
+fi
 
 printf '[3/3] 启动本地服务…\n'
 nohup "${RUNNER[@]}" "$SERVER" run > "$LOG_FILE" 2>&1 < /dev/null &
@@ -162,8 +169,8 @@ for ((i = 0; i < 100; i++)); do
     die "服务启动失败，请查看 $LOG_FILE"
   fi
   if curl --fail --silent --max-time 1 "$URL/" > /dev/null; then
-    printf '\n已启动：%s\n管理员：\n%s\n数据库：%s\n日志：%s\n停止：./start_dev.sh stop\n修改 UI 后重启脚本并在浏览器按 ⌘⇧R / Ctrl+Shift+R 强制刷新。\n' \
-      "$URL" "$ADMINS" "$DB" "$LOG_FILE"
+    printf '\n已启动：%s\n管理员：\n%s\n独立节点接入端口：127.0.0.1:%s\n数据库：%s\n日志：%s\n停止：./start_dev.sh stop\n修改 UI 后重启脚本并在浏览器按 ⌘⇧R / Ctrl+Shift+R 强制刷新。\n' \
+      "$URL" "$ADMINS" "$NODE_PORT" "$DB" "$LOG_FILE"
     if [[ -z "$ADMINS" ]]; then printf 'preview（密码为首次启动时设置的密码）\n'; fi
     exit 0
   fi

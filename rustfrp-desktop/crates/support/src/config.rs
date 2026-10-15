@@ -28,6 +28,12 @@ fn file_bytes(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     }
     Ok(Some(bytes))
 }
+fn ensure_original(path: &Path, original: &str) -> Result<(), Error> {
+    if file_bytes(path)?.map_or_else(String::new, |bytes| hash(&bytes)) != original {
+        return Err(Error::invalid("配置保存期间文件已变化，请重新读取"));
+    }
+    Ok(())
+}
 fn check_path(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() || path.as_os_str().len() > 4096 || path.file_name().is_none() {
         return Err(Error::invalid("配置文件须使用绝对路径"));
@@ -264,9 +270,7 @@ pub fn save(
     drop(file);
     // Recheck immediately before replacement, including symlink and concurrent changes.
     check_path(path)?;
-    if file_bytes(path)?.map_or_else(String::new, |bytes| hash(&bytes)) != original {
-        return Err(Error::invalid("配置保存期间文件已变化，请重新读取"));
-    }
+    ensure_original(path, original)?;
     replace
         .apply(&stage.0, path)
         .map_err(Error::io_context("原子替换失败，原配置已保留或恢复"))?;
@@ -481,5 +485,149 @@ mod tests {
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(read(&link).is_err());
         }
+    }
+    #[test]
+    fn config_read_and_verify_reject_invalid_text_empty_content_and_unbounded_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("invalid.toml");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(read(&path).is_err());
+        assert!(verify(&path, " ").is_err());
+        assert!(verify(&path, &"x".repeat(MAX_CONFIG + 1)).is_err());
+        let target = root.path().join("new.toml");
+        let overlay = Overlay {
+            path: target.to_str().unwrap(),
+            text: config(),
+            size: RefCell::new(0),
+            digest: RefCell::new(Sha256::new()),
+        };
+        for index in 0..1024 {
+            std::fs::write(root.path().join(format!("item-{index}.toml")), []).unwrap();
+        }
+        assert!(overlay.list_files(root.path().to_str().unwrap()).is_err());
+        assert!(ensure_original(&path, "stale").is_err());
+    }
+
+    #[test]
+    fn included_file_lists_skip_directories_and_bound_the_added_target_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-created.toml");
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let overlay = Overlay {
+            path: path.to_str().unwrap(),
+            text: config(),
+            size: RefCell::new(0),
+            digest: RefCell::new(Sha256::new()),
+        };
+        assert_eq!(
+            overlay.list_files(root.path().to_str().unwrap()).unwrap(),
+            vec!["not-created.toml"]
+        );
+        for index in 0..1024 {
+            std::fs::write(root.path().join(format!("item-{index}.toml")), []).unwrap();
+        }
+        assert!(overlay
+            .list_files(root.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("1024"));
+
+        let existing_root = tempfile::tempdir().unwrap();
+        let existing = existing_root.path().join("existing.toml");
+        std::fs::write(&existing, config()).unwrap();
+        let overlay = Overlay {
+            path: existing.to_str().unwrap(),
+            text: config(),
+            size: RefCell::new(0),
+            digest: RefCell::new(Sha256::new()),
+        };
+        let files = overlay
+            .list_files(existing_root.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            files.iter().filter(|name| *name == "existing.toml").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_non_not_found_open_error_without_following_a_symlink_loop() {
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let loop_path = root.path().join("loop");
+            std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+            assert!(read(&loop_path.join("frpc.toml")).is_err());
+        }
+    }
+
+    #[test]
+    fn configuration_paths_are_absolute_files_and_overlay_directory_checks_are_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(check_path(Path::new("relative.toml")).is_err());
+        assert!(check_path(Path::new("/")).is_err());
+        assert!(check_path(root.path()).is_err());
+        assert!(check_path(Path::new(&format!("/{}", "x".repeat(4096)))).is_err());
+        #[cfg(unix)]
+        {
+            let target = root.path().join("config.toml");
+            std::fs::write(&target, config()).unwrap();
+            let link = root.path().join("linked.toml");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(check_path(&link).is_err());
+        }
+        let target = root.path().join("new.toml");
+        let overlay = Overlay {
+            path: target.to_str().unwrap(),
+            text: config(),
+            size: RefCell::new(0),
+            digest: RefCell::new(Sha256::new()),
+        };
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(overlay
+            .list_files(other.to_str().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn verification_rejects_more_than_the_bounded_proxy_count() {
+        let root = tempfile::tempdir().unwrap();
+        let mut text = String::from("serverAddr='127.0.0.1'\nserverPort=7000\n");
+        for index in 0..=1024 {
+            text.push_str(&format!(
+                "[[proxies]]\nname='tcp-{index}'\ntype='tcp'\nlocalPort=8080\nremotePort={}\n",
+                10000 + index
+            ));
+        }
+        assert!(verify(&root.path().join("frpc.toml"), &text)
+            .unwrap_err()
+            .message
+            .contains("资源数量"));
+
+        let mut visitors = String::from("serverAddr='127.0.0.1'\nserverPort=7000\n");
+        for index in 0..=1024 {
+            visitors.push_str(&format!(
+                "[[visitors]]\nname='visitor-{index}'\ntype='stcp'\nserverName='private'\nsecretKey='key'\nbindAddr='127.0.0.1'\nbindPort={}\n",
+                50000 + index
+            ));
+        }
+        assert!(verify(&root.path().join("frpc.toml"), &visitors)
+            .unwrap_err()
+            .message
+            .contains("资源数量"));
+    }
+
+    #[test]
+    fn original_file_digest_accepts_unchanged_bytes_and_rejects_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("frpc.toml");
+        let original = config();
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        ensure_original(&path, &hash(original.as_bytes())).unwrap();
+        assert!(ensure_original(&path, &hash(b"previous config")).is_err());
+        std::fs::remove_file(&path).unwrap();
+        ensure_original(&path, "").unwrap();
     }
 }

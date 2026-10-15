@@ -377,6 +377,20 @@ async fn get(port: u16, method: &str, path: &str, extra: &str) -> String {
     read_to_end(&mut s).await
 }
 
+async fn get_complete(port: u16, method: &str, path: &str, extra: &str) -> String {
+    let mut stream = connect(port).await;
+    stream
+        .write_all(format!("{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(T, stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 #[tokio::test]
 async fn static_files_are_served_safely() {
     let root = site();
@@ -814,7 +828,7 @@ async fn static_file_bad_requests_unreadable_entries_and_long_listings() {
     for i in 0..1100 {
         std::fs::write(many.join(format!("f{i:04}")), "").unwrap();
     }
-    let r = get(port, "GET", "/many/", "").await;
+    let r = get_complete(port, "GET", "/many/", "").await;
     assert_eq!(r.matches("<a href").count(), 1000, "listing is bounded");
     // 无法解析的请求。
     let mut s = connect(port).await;

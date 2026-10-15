@@ -11,6 +11,7 @@
     )
 )]
 
+pub mod bridge;
 pub mod config;
 pub mod controller;
 pub mod diagnostics;
@@ -48,6 +49,47 @@ pub fn external_url(source: &str) -> Result<String, Error> {
 pub mod local;
 pub mod settings;
 
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_origins_and_external_urls_reject_credentials_and_remote_authority() {
+        for allowed in [
+            reqwest::Url::parse("tauri://localhost/index.html").unwrap(),
+            reqwest::Url::parse("http://tauri.localhost/index.html").unwrap(),
+            reqwest::Url::parse("https://tauri.localhost/index.html").unwrap(),
+        ] {
+            assert!(trusted_origin(&allowed));
+        }
+        for denied in [
+            reqwest::Url::parse("tauri://example.com/index.html").unwrap(),
+            reqwest::Url::parse("http://tauri.localhost:1234/index.html").unwrap(),
+            reqwest::Url::parse("https://user:password@tauri.localhost/index.html").unwrap(),
+            reqwest::Url::parse("https://:password@tauri.localhost/index.html").unwrap(),
+        ] {
+            assert!(!trusted_origin(&denied));
+        }
+        assert_eq!(
+            external_url("https://example.com/path").unwrap(),
+            "https://example.com/path"
+        );
+        assert!(external_url("http://example.com/path").is_ok());
+        let long = format!("https://example.com/{}", "x".repeat(4096));
+        for denied in [
+            "file:///etc/passwd",
+            "mailto:user@example.com",
+            "https://user@example.com",
+            "https://:password@example.com",
+            "http://",
+            long.as_str(),
+        ] {
+            assert!(external_url(denied).is_err());
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 
 /// A structured failure can cross IPC without exposing headers or credentials.
@@ -83,42 +125,5 @@ impl Error {
     }
     pub fn invalid_context<E>(message: &'static str) -> impl FnOnce(E) -> Self {
         move |_| Self::invalid(message)
-    }
-}
-
-#[cfg(test)]
-#[cfg_attr(coverage, coverage(off))]
-mod tests {
-    use super::*;
-    #[test]
-    fn packaged_origins_and_external_urls_keep_native_authority_separate() {
-        for url in [
-            "tauri://localhost/",
-            "http://tauri.localhost/index.html",
-            "https://tauri.localhost/",
-        ] {
-            assert!(trusted_origin(&reqwest::Url::parse(url).unwrap()));
-        }
-        for url in [
-            "https://controller.example.com",
-            "http://tauri.localhost:8080/",
-            "tauri://elsewhere",
-            "file:///etc/passwd",
-            "https://user@tauri.localhost/",
-        ] {
-            assert!(!trusted_origin(&reqwest::Url::parse(url).unwrap()));
-        }
-        assert_eq!(
-            external_url("https://rustfrp.com").unwrap(),
-            "https://rustfrp.com/"
-        );
-        for url in [
-            "file:///private/file",
-            "javascript:alert(1)",
-            "https://user:secret@example.com",
-            "invalid",
-        ] {
-            assert!(external_url(url).is_err());
-        }
     }
 }

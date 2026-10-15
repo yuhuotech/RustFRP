@@ -41,7 +41,7 @@ export function settingsPage(context: Context, id = 'account'): Page {
   if (page === 'enroll') actions.push(button('创建接入令牌', guarded(context, () => enroll(context)), { primary: true, id: 'new-enroll-token' }));
   if (page === 'account') {
     content.append(intro('账号与连接', '权限由 Controller 校验，设备身份与管理会话相互独立。', 'clients'), panel('当前账号', 'clients', details([['账号', context.admin?.name ?? '未登录'], ['角色', context.admin ? roleNames[context.admin.role] : '本机模式']]), context.admin ? button('退出登录', () => context.logout()) : null,
-      context.host.desktop ? el('div', 'actions', button('管理本机', () => context.navigate('local')), button('切换服务器', () => context.logout(), { id: 'switch-controller' })) : null), panel('外观', 'settings', themes(context)));
+      context.host.desktop ? el('div', 'actions', button('管理本机', () => context.navigate('local')), button(context.admin ? '切换服务器' : '登录管理服务', () => context.logout(), { id: 'switch-controller' })) : null), panel('外观', 'settings', themes(context)));
   } else if (page === 'appearance') content.append(intro('外观', '使用原生字体和共享配色，支持系统深浅色。', 'settings'), panel('主题', 'settings', themes(context)));
   else if (page === 'logs') content.append(intro('控制器日志', '实时读取有界日志环；覆盖缺口明确标示。', 'audit'), logs.notice, logs.element);
   else if (page === 'api' || page === 'admins' || page === 'enroll') {

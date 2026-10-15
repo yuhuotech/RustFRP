@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+fn finish_write(destination: &Path, result: std::io::Result<()>) -> Result<(), Error> {
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+        return Err(Error::io("诊断保存失败"));
+    }
+    Ok(())
+}
+
 pub fn contents(status: &Value, logs: &Value, captured_at: u64) -> Result<Value, Error> {
     let status = status
         .as_object()
@@ -94,14 +102,10 @@ pub fn export(root: &Path, value: &Value, captured_at: u64) -> Result<PathBuf, E
     let mut file = options
         .open(&destination)
         .map_err(Error::io_context("无法创建私有诊断文件"))?;
-    if file
-        .write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
-        let _ = std::fs::remove_file(&destination);
-        return Err(Error::io("诊断保存失败"));
-    }
+    finish_write(
+        &destination,
+        file.write_all(&bytes).and_then(|()| file.sync_all()),
+    )?;
     Ok(destination)
 }
 #[cfg(test)]
@@ -131,5 +135,37 @@ mod tests {
         assert!(contents(&status, &json!({"items":["x".repeat(513)]}), 1).is_err());
         assert!(contents(&status, &json!({"items":vec!["x";129]}), 1).is_err());
         assert!(export(Path::new("relative"), &value, 1).is_err());
+        assert!(export(root.path(), &json!({"payload":"x".repeat(128 * 1024)}), 2).is_err());
+        let blocker = root.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        assert!(export(&blocker, &value, 3).is_err());
+        let partial = root.path().join("partial.json");
+        std::fs::write(&partial, b"partial").unwrap();
+        assert!(finish_write(&partial, Err(std::io::Error::other("disk full"))).is_err());
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn diagnostics_reject_unbounded_shapes_and_keep_optional_fields_safe() {
+        assert!(contents(&Value::Null, &json!({"items":[]}), 2).is_err());
+        assert!(contents(&json!({}), &Value::Null, 2).is_err());
+        assert!(contents(&json!({}), &json!({"items":vec!["x";129]}), 2).is_err());
+
+        let value = contents(
+            &json!({"traffic":{"bytes_in":"unknown","extra":8}}),
+            &json!({"items":[]}),
+            2,
+        )
+        .unwrap();
+        assert_eq!(value["agent_version"], "");
+        assert_eq!(value["traffic"], json!({}));
+        let without_traffic = contents(&json!({"pid":7}), &json!({"items":[]}), 3).unwrap();
+        assert!(without_traffic["traffic"].is_null());
+        assert!(contents(
+            &json!({"traffic":{}}),
+            &json!({"items":[{"not":"a log line"}]}),
+            2,
+        )
+        .is_err());
     }
 }

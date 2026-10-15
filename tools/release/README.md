@@ -1,7 +1,7 @@
 # Release signing
 
 The `v*` GitHub Actions workflow builds macOS arm64/x86_64 DMGs and ZIPs,
-Windows x86_64 setup/ZIP, Linux x86_64 DEB/tar.gz, and the Flutter Web panel.
+Windows x86_64 setup/ZIP, Linux x86_64 DEB/tar.gz, and the shared Web UI.
 It signs the SHA256 manifest with an Ed25519 private key, then publishes the
 manifest, signature, and derived public key alongside the packages.
 
@@ -41,7 +41,7 @@ then replace the Agent with rollback on failure. A Controller administrator
 sends the requested version to an online Agent; the Agent exits after a
 successful replacement so its process supervisor can start the new binary.
 
-The CA-07 Agent updater and D-09 Flutter desktop App updater are implemented
+The CA-07 Agent updater and Tauri desktop App updater are implemented
 and have automated signature, digest, install-plan, and rollback tests. The App
 updater checks GitHub Releases or the configured mainland mirrors and installs
 the package for the detected platform. Neither updater can accept an unsigned
@@ -51,7 +51,7 @@ No signed Release has been published or verified with real Actions credentials
 yet. Configure `RUSTFRP_RELEASE_SIGNING_KEY_PEM` and the matching
 `RUSTFRP_RELEASE_PUBLIC_KEY_HEX` variable before publishing; the workflow checks
 that the public key compiled into the Agent/App matches the signing key. Public
-website deployment and multi-platform Flutter desktop acceptance remain tasks.
+website deployment and multi-platform desktop acceptance remain tasks.
 The authorized Linux Controller/Agent deployment, public HTTPS panel and
 cross-host Edge migration passed on 2026-10-13; see
 `docs/WAN_ACCEPTANCE_20261013.md` for exact network scope and remaining limits.

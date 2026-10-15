@@ -44,7 +44,7 @@ export class WebHost implements Host {
       if (!['http:', 'https:'].includes(url.protocol)) throw new Error('不支持的链接');
       window.open(url.href, '_blank', 'noopener,noreferrer'); return null;
     }
-    if (action === 'info') return { desktop: false, version: '0.1.0' };
+    if (action === 'info') return { desktop: false, version: document.querySelector<HTMLMetaElement>('meta[name="rustfrp-ui-version"]')?.content || 'development' };
     throw new Error('此操作需要桌面客户端');
   }
   async request(): Promise<Json> { throw new Error('浏览器请求使用同源 HTTP'); }

@@ -1017,7 +1017,7 @@ async fn panel_static_files_spa_fallback_and_traversal() {
     let dir = std::env::temp_dir().join(format!("rustfrp-panel-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("assets")).unwrap();
     std::fs::write(dir.join("index.html"), "<html>panel</html>").unwrap();
-    std::fs::write(dir.join("main.dart.js"), "console.log(1)").unwrap();
+    std::fs::write(dir.join("app.js"), "console.log(1)").unwrap();
     std::fs::write(dir.join("assets/logo.svg"), "<svg/>").unwrap();
     std::fs::write(dir.join("secret.txt"), "top secret").unwrap();
     let r = rig_with(Config {
@@ -1033,7 +1033,7 @@ async fn panel_static_files_spa_fallback_and_traversal() {
     );
     assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
     assert_eq!(h[header::CACHE_CONTROL], "no-cache");
-    let (st, h, _) = r.req(Method::GET, "/main.dart.js", None, None).await;
+    let (st, h, _) = r.req(Method::GET, "/app.js", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert!(h[header::CONTENT_TYPE]
         .to_str()

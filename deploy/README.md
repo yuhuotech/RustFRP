@@ -7,7 +7,7 @@ separately in the host firewall.
 ## systemd and Caddy
 
 1. Install `rustfrp-server` at `/usr/local/bin/rustfrp-server` and the built
-   Flutter panel at `/opt/rustfrp/panel`.
+   shared UI at `/opt/rustfrp/panel`.
 2. Create a `rustfrp` system user and `/etc/rustfrp/rustfrp-server.env` with
    `RUSTFRP_HTTP=127.0.0.1:8080`, `RUSTFRP_EDGE=0.0.0.0:7000`,
    `RUSTFRP_PANEL_DIR=/opt/rustfrp/panel`,

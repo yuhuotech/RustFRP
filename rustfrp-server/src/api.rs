@@ -2555,7 +2555,7 @@ mod tests {
             Some("x".into()),
             "leading slashes are stripped, never escape"
         );
-        assert_eq!(panel_relative("/main.dart.js"), Some("main.dart.js".into()));
+        assert_eq!(panel_relative("/app.js"), Some("app.js".into()));
         assert_eq!(
             panel_relative("/assets/a/b.png"),
             Some("assets/a/b.png".into())

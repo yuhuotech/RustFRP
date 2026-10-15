@@ -68,6 +68,7 @@ export class App {
     for (const [label, control] of [...(this.host.desktop ? [['Controller 地址', server] as const] : []), ['账号', name] as const, ['密码', password] as const]) {
       control.id = `login-${control.name}`; const caption = el('label', '', label); caption.htmlFor = control.id; card.append(el('div', 'form-field', caption, control));
     }
+    if (this.host.desktop) server.closest('.form-field')?.append(button('使用本机管理服务', () => { server.value = 'http://127.0.0.1:9674'; name.focus(); }, { id: 'login-local-controller', compact: true }));
     const error = el('p', 'form-error'); error.setAttribute('role', 'alert'); error.hidden = !failure;
     if (failure instanceof Error) error.textContent = failure.message;
     const submit = button('登录', () => {}, { primary: true, id: 'login-submit' }); submit.type = 'submit'; card.append(error, submit);
@@ -144,7 +145,7 @@ export class App {
   }
   private showError(error: unknown): void { toast(error instanceof Error ? error.message : String(error), 'danger'); }
   private async logout(): Promise<void> {
-    try { await this.api.request('logout', { body: {} }); }
+    try { if (this.admin) await this.api.request('logout', { body: {} }); }
     catch (error) { this.showError(error); }
     finally { this.admin = null; this.resources.clear(); if (this.host.desktop) void this.host.call('savePreferences', { local_mode: false }).catch(error => this.showError(error)); this.login(); }
   }

@@ -9,6 +9,7 @@
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "e2e": "playwright test",
+    "build-test": "node tools/build.test.mjs",
     "bench": "node tools/budget.mjs"
   },
   "dependencies": {

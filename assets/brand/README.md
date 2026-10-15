@@ -19,7 +19,7 @@ Logo 使用**一笔贯通的倾斜双环**：两个闭合环分别代表内网�
 python3 tools/gen_icons.py
 ```
 
-同步更新品牌 PNG、Flutter 登录/侧栏共享 Logo、macOS AppIcon、Windows 多尺寸 ICO、Web favicon 和 PWA 图标。PWA maskable 版为不透明方形底，主体缩至安全圆内。脚本不改业务代码，不增加 Agent / Edge 运行时内存。
+同步更新品牌 PNG、Tauri 桌面图标、Web favicon 与 PWA 图标。PWA maskable 版为不透明方形底，主体缩至安全圆内。脚本不改业务代码，不增加 Agent / Edge 运行时内存。
 
 当前工程没有 Android / iOS 工程、Linux 图标安装配置或托盘图标；后续新增这些入口时应从本设计源生成，勿恢复旧图形。
 

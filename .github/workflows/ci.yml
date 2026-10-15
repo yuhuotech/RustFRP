@@ -1,8 +1,11 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, refactor/native-ui]
   pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -12,42 +15,100 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt, llvm-tools-preview
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - name: fmt / clippy
-        run: make lint
-      - name: test
-        run: make test
-      - name: Rust coverage gate (line / function / branch >= 90%)
-        run: make core-cov agent-cov server-cov
-
-  flutter:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Linux desktop build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libx11-dev libxi-dev
-      - uses: subosito/flutter-action@v2
+      - run: make ui-deps ui-build rust-lint rust-test
+      - name: Every Rust service crate (line / function / branch >= 90%)
+        run: make core-cov agent-cov server-cov assets-cov
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          channel: stable
-      - name: analyze + test + coverage (line >= 90%)
-        run: |
-          cd rustfrp-app
-          flutter pub get
-          flutter analyze
-          flutter test --coverage
-          cd ..
-          python3 tools/cov/check_lcov.py rustfrp-app/coverage/lcov.info --name rustfrp-app --list-gaps
-      - name: web build (same-origin panel)
-        run: cd rustfrp-app && flutter build web --no-web-resources-cdn
+          name: rust-coverage
+          path: target/cov/*.lcov
 
-  e2e:
+  ui:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: make e2e
-      - run: make bench-mem
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
+      - run: make ui-deps ui-test ui-cov ui-build
+      - name: Install the three real browser engines
+        run: node rustfrp-ui/node_modules/@playwright/test/cli.js install --with-deps chromium firefox webkit
+      - name: Real Controller, Agents, browser workflows and cache upgrade
+        run: make ui-e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-evidence
+          path: |
+            rustfrp-ui/coverage/
+            playwright-report/
+            test-results/
+            target/ui/
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system WebView and tray libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev xvfb dbus-x11
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            rustfrp-desktop -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Shared assets and desktop checks
+        shell: bash
+        run: make ui-deps ui-build desktop-lint desktop-test
+      - name: Native coverage with real Linux WebKitGTK
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a python3 tools/cov/desktop.py
+      - name: Native coverage with real macOS / Windows WebView
+        if: runner.os != 'Linux'
+        shell: bash
+        run: python tools/cov/desktop.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-evidence-${{ runner.os }}
+          path: |
+            target/cov/desktop*
+            target/ui/native-*.json
+
+  data-plane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make e2e bench-mem installer-test

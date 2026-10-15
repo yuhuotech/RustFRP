@@ -11,20 +11,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: subosito/flutter-action@v2
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: actions/setup-node@v4
         with:
-          channel: stable
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: Rust checks
-        run: make lint test
-      - name: Flutter and web checks
+        run: make ui-deps ui-build rust-lint rust-test core-cov agent-cov server-cov assets-cov
+      - name: Shared DOM UI checks and standalone panel
+        env:
+          RUSTFRP_RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          cd rustfrp-app
-          flutter pub get
-          flutter analyze
-          flutter test
-          flutter build web --release --no-web-resources-cdn
-          tar -czf ../rustfrp-panel.tar.gz -C build/web .
+          make ui-test ui-cov ui-build
+          tar -czf rustfrp-panel.tar.gz -C rustfrp-ui/dist .
       - uses: actions/upload-artifact@v4
         with:
           name: release-panel
@@ -40,31 +43,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: subosito/flutter-action@v2
+      - uses: actions/setup-node@v4
         with:
-          channel: stable
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
       - name: Install Linux desktop build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libx11-dev libxi-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev
       - name: Build and package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          cargo build --release --bins
-          mkdir -p dist
-          cp target/release/rustfrp-agent dist/rustfrp-agent-linux-x86_64
-          sha256sum dist/rustfrp-agent-linux-x86_64 | cut -d ' ' -f 1 > dist/rustfrp-agent-linux-x86_64.sha256
-          cd rustfrp-app && flutter pub get && flutter build linux --release --build-name="$VERSION" --dart-define=RUSTFRP_VERSION="$VERSION" --dart-define=RUSTFRP_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX="$RUSTFRP_RELEASE_PUBLIC_KEY_HEX" && cd ..
-          mkdir -p dist/rustfrp-linux-x86_64/app dist/rustfrp-linux-x86_64/bin
-          cp target/release/rustfrp-agent target/release/rustfrp-server dist/rustfrp-linux-x86_64/bin/
-          cp -R rustfrp-app/build/linux/x64/release/bundle/. dist/rustfrp-linux-x86_64/app/
-          tar -czf "dist/rustfrp-linux-x86_64.tar.gz" -C dist rustfrp-linux-x86_64
-          mkdir -p deb/usr/bin deb/usr/lib/rustfrp/bin deb/usr/lib/rustfrp/app deb/usr/share/applications deb/DEBIAN
-          cp target/release/rustfrp-agent target/release/rustfrp-server deb/usr/lib/rustfrp/bin/
-          ln -s ../lib/rustfrp/bin/rustfrp-agent deb/usr/bin/rustfrp-agent
-          ln -s ../lib/rustfrp/bin/rustfrp-server deb/usr/bin/rustfrp-server
-          cp -R rustfrp-app/build/linux/x64/release/bundle/. deb/usr/lib/rustfrp/app/
-          printf '[Desktop Entry]\nType=Application\nName=RustFRP\nExec=/usr/lib/rustfrp/app/rustfrp_app\nIcon=rustfrp\nCategories=Network;Utility;\n' > deb/usr/share/applications/rustfrp.desktop
-          printf 'Package: rustfrp\nVersion: %s\nArchitecture: amd64\nMaintainer: RustFRP contributors\nDepends: libgtk-3-0, libx11-6, libxi6, libstdc++6, libglib2.0-0, libdbus-1-3\nDescription: Lightweight self-hosted tunneling client and controller\n' "$VERSION" > deb/DEBIAN/control
-          dpkg-deb --root-owner-group --build deb "dist/rustfrp-linux-x86_64.deb"
+          make ui-deps ui-build
+          cargo build --release --bins --features rustfrp-server/embedded-panel
+          (cd rustfrp-desktop && node ../rustfrp-ui/node_modules/@tauri-apps/cli/tauri.js build --no-bundle --config "{\"version\":\"$VERSION\"}")
+          python3 tools/release/package.py --platform linux --desktop rustfrp-desktop/target/release/rustfrp_app --version "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux
@@ -87,9 +79,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: subosito/flutter-action@v2
+      - uses: actions/setup-node@v4
         with:
-          channel: stable
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
       - name: Build and sign application
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -105,9 +99,10 @@ jobs:
             test -n "${!name}" || { echo "Missing required release secret: $name" >&2; exit 1; }
           done
           VERSION="${GITHUB_REF_NAME#v}"
-          cargo build --release --bins
-          cd rustfrp-app && flutter pub get && flutter build macos --release --build-name="$VERSION" --dart-define=RUSTFRP_VERSION="$VERSION" --dart-define=RUSTFRP_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX="$RUSTFRP_RELEASE_PUBLIC_KEY_HEX" && cd ..
-          APP="rustfrp-app/build/macos/Build/Products/Release/rustfrp_app.app"
+          make ui-deps ui-build
+          cargo build --release --bins --features rustfrp-server/embedded-panel
+          (cd rustfrp-desktop && node ../rustfrp-ui/node_modules/@tauri-apps/cli/tauri.js build --bundles app --config "{\"version\":\"$VERSION\"}")
+          APP="rustfrp-desktop/target/release/bundle/macos/RustFRP.app"
           mkdir -p "$APP/Contents/Resources/bin" dist
           cp target/release/rustfrp-agent target/release/rustfrp-server "$APP/Contents/Resources/bin/"
           KEYCHAIN="$RUNNER_TEMP/rustfrp-signing.keychain-db"
@@ -125,11 +120,12 @@ jobs:
           shasum -a 256 "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}" | cut -d ' ' -f 1 > "dist/rustfrp-agent-macos-${RUSTFRP_ARCH}.sha256"
           codesign --force --deep --options runtime --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/rustfrp-macos-${RUSTFRP_ARCH}.zip"
           hdiutil create -volname RustFRP -srcfolder "$APP" -ov -format UDZO "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
           codesign --force --timestamp --sign "$APPLE_DEVELOPER_IDENTITY" "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
           xcrun notarytool submit "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$APP"
           xcrun stapler staple "dist/rustfrp-macos-${RUSTFRP_ARCH}.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/rustfrp-macos-${RUSTFRP_ARCH}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos-${{ matrix.arch }}
@@ -145,27 +141,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: subosito/flutter-action@v2
+      - uses: actions/setup-node@v4
         with:
-          channel: stable
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rustfrp-ui/package-lock.json
       - name: Build and package
         shell: pwsh
         run: |
           $env:RUSTFRP_VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
-          cargo build --release --bins
-          Push-Location rustfrp-app
-          flutter pub get
-          flutter build windows --release --build-name=$env:RUSTFRP_VERSION --dart-define=RUSTFRP_VERSION=$env:RUSTFRP_VERSION --dart-define=RUSTFRP_GITHUB_REPOSITORY=$env:GITHUB_REPOSITORY --dart-define=RUSTFRP_RELEASE_PUBLIC_KEY_HEX=$env:RUSTFRP_RELEASE_PUBLIC_KEY_HEX
+          npm ci --prefix rustfrp-ui
+          npm run --prefix rustfrp-ui build
+          cargo build --release --bins --features rustfrp-server/embedded-panel
+          if ($LASTEXITCODE -ne 0) { throw 'Service build failed' }
+          Push-Location rustfrp-desktop
+          $configuration = @{ version = $env:RUSTFRP_VERSION } | ConvertTo-Json -Compress
+          node ../rustfrp-ui/node_modules/@tauri-apps/cli/tauri.js build --bundles nsis --config $configuration
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
           Pop-Location
-          New-Item -ItemType Directory -Force dist/windows | Out-Null
-          Copy-Item rustfrp-app/build/windows/x64/runner/Release/* dist/windows/ -Recurse -Force
-          Copy-Item target/release/rustfrp-agent.exe,target/release/rustfrp-server.exe dist/windows/ -Force
-          Copy-Item target/release/rustfrp-agent.exe dist/rustfrp-agent-windows-x86_64.exe -Force
-          $agentHash = (Get-FileHash dist/rustfrp-agent-windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -NoNewline dist/rustfrp-agent-windows-x86_64.exe.sha256 $agentHash
-          Compress-Archive -Path dist/windows/* -DestinationPath dist/rustfrp-windows-x86_64.zip -Force
-          choco install innosetup --yes --no-progress
-          iscc tools/release/rustfrp.iss
+          python tools/release/package.py --platform windows --desktop rustfrp-desktop/target/release/rustfrp_app.exe --version $env:RUSTFRP_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+          $installers = @(Get-ChildItem rustfrp-desktop/target/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) { throw 'Expected one native installer' }
+          Copy-Item $installers[0].FullName dist/rustfrp-windows-x86_64-setup.exe
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows

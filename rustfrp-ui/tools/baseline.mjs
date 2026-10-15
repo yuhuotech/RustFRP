@@ -11,7 +11,7 @@ try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await context.newPage();
     await page.addInitScript(() => {
-      window.addEventListener('flutter-first-frame', () => { window.__rustfrpFirstFrame = performance.now(); });
+      window.addEventListener('load', () => { window.__rustfrpFirstFrame = performance.now(); });
     });
     await page.goto('http://127.0.0.1:9674', { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.__rustfrpFirstFrame > 0, { timeout: 30000 });
@@ -21,10 +21,10 @@ try {
       resources: performance.getEntriesByType('resource').map(entry => ({ name: new URL(entry.name).pathname, bytes: entry.transferSize, duration_ms: entry.duration })),
     }));
     samples.push(timing);
-    if (!iteration) await page.screenshot({ path: resolve(folder, 'flutter-login.png') });
+    if (!iteration) await page.screenshot({ path: resolve(folder, 'shared-ui-login.png') });
     await context.close();
   }
-  const result = { commit: '6058ade', browser: browser.version(), viewport: [1440, 900], cache: 'fresh browser context; OS caches not reset', criterion: 'flutter-first-frame; login without a session', samples };
-  await writeFile(resolve(folder, 'flutter-browser.json'), JSON.stringify(result, null, 2) + '\n');
+  const result = { commit: '6058ade', browser: browser.version(), viewport: [1440, 900], cache: 'fresh browser context; OS caches not reset', criterion: 'DOM load; login without a session', samples };
+  await writeFile(resolve(folder, 'shared-ui-browser.json'), JSON.stringify(result, null, 2) + '\n');
   console.log(JSON.stringify({ browser: result.browser, first_frame_ms: samples.map(sample => sample.first_frame_ms), transfer_bytes: samples.map(sample => sample.transfer_bytes) }));
 } finally { await browser.close(); }

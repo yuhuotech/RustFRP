@@ -178,7 +178,15 @@ async fn tunnel_pages(path: &Path, identity: &str) -> Result<Value, Error> {
             return Err(Error::invalid("本机隧道超过容量限制"));
         }
         result.extend(items.iter().cloned());
-        match value.get("next_offset").and_then(Value::as_u64) {
+        let next = match value.get("next_offset") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| Error::invalid("本机隧道分页游标无效"))?,
+            ),
+        };
+        match next {
             None => return Ok(json!({"revision":current,"items":result})),
             Some(next) if items.len() == 32 && next == offset + 32 && next < 1024 => offset = next,
             _ => return Err(Error::invalid("本机隧道分页无效，请刷新")),
@@ -413,12 +421,133 @@ mod tests {
                 .is_err());
         }
     }
+    #[tokio::test]
+    async fn discovery_requires_the_exact_identity_and_well_formed_private_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        publish(&path, port).await;
+        for value in [
+            json!({"version":0,"port":port,"token":"a".repeat(64),"controller":"host:7000"}),
+            json!({"version":1,"port":0,"token":"a".repeat(64),"controller":"host:7000"}),
+            json!({"version":1,"port":port,"token":"a".repeat(63),"controller":"host:7000"}),
+            json!({"version":1,"port":port,"token":"z".repeat(64),"controller":"host:7000"}),
+            json!({"version":1,"port":port,"token":"a".repeat(64),"controller":"other:7000"}),
+        ] {
+            tokio::fs::write(&path, value.to_string()).await.unwrap();
+            assert!(discovery(&path, "host:7000").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_local_control_distinguishes_missing_connections_and_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.json");
+        let server = fixture(&path, vec![json!({"error":"invalid_request"})]).await;
+        assert!(request(&path, "host:7000", "status", None, None)
+            .await
+            .unwrap_err()
+            .message
+            .contains("不支持"));
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        publish(&path, listener.local_addr().unwrap().port()).await;
+        drop(listener);
+        assert_eq!(status(&path, "host:7000").await.unwrap(), None);
+
+        let server = fixture(
+            &path,
+            vec![json!({"revision":1,"items":[],"next_offset":null})],
+        )
+        .await;
+        assert_eq!(
+            tunnels(&path, "host:7000").await.unwrap()["items"],
+            json!([])
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_control_errors_preserve_command_and_stop_certainty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.json");
+        for (reply, command, uncertain) in [
+            (json!({"error":"auth_failed"}), "status", false),
+            (json!({"ok":false}), "stop", true),
+            (json!({"version":2}), "status", false),
+        ] {
+            let server = fixture(&path, vec![reply]).await;
+            let error = request(&path, "host:7000", command, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.uncertain, uncertain);
+            server.await.unwrap();
+        }
+
+        for (reply, command, uncertain) in [
+            (b"partial".to_vec(), "stop", true),
+            (vec![b'x'; 4097], "stop", true),
+            (b"partial".to_vec(), "status", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            publish(&path, address.port()).await;
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut request = Vec::new();
+                reader.read_until(b'\n', &mut request).await.unwrap();
+                reader.get_mut().write_all(&reply).await.unwrap();
+            });
+            let error = request(&path, "host:7000", command, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_response");
+            assert_eq!(error.uncertain, uncertain);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_log_and_stop_commands_keep_their_typed_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.json");
+        let server = fixture(
+            &path,
+            vec![
+                json!({"items":["new line"],"cursor":9,"gap":false}),
+                json!({"ok":true}),
+            ],
+        )
+        .await;
+        let logs = request(&path, "host:7000", "logs", Some(4), None)
+            .await
+            .unwrap();
+        assert_eq!(logs["items"][0], "new line");
+        assert_eq!(logs["cursor"], 9);
+        assert_eq!(
+            request(&path, "host:7000", "stop", None, None)
+                .await
+                .unwrap()["ok"],
+            true
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0]["after"], 4);
+        assert_eq!(requests[0]["command"], "logs");
+        assert_eq!(requests[1]["command"], "stop");
+    }
+
     #[test]
     fn reply_bounds_preserve_zero_and_reject_untrusted_versions_ports_and_cursors() {
         let status = json!({"version":1,"pid":1,"connected":false,"revision":0,"proxies":0,"traffic":{"bytes_in":0,"bytes_out":0,"connections":0},"agent_version":"0.1.0"});
         validate_reply("status", &status).unwrap();
         for (key, value) in [
+            ("version", json!(2)),
             ("pid", json!(0)),
+            ("revision", json!("unknown")),
             ("proxies", json!(1025)),
             ("connected", json!("false")),
             ("traffic", json!({})),
@@ -435,6 +564,7 @@ mod tests {
             validate_reply("logs", &valid).unwrap();
         }
         for bad in [
+            json!({"items":[],"cursor":"bad"}),
             json!({"items":vec!["line";129]}),
             json!({"items":["x".repeat(513)]}),
             json!({"items":[],"cursor":9007199254740992_u64}),
@@ -453,6 +583,13 @@ mod tests {
         assert!(
             validate_reply("tunnels", &json!({"revision":0,"items":vec![tunnel(0);33]})).is_err()
         );
+        let missing_id =
+            json!({"kind":"tcp","local_ip":"127.0.0.1","local_port":80,"remote_port":0});
+        assert!(validate_reply("tunnels", &json!({"revision":0,"items":[missing_id]})).is_err());
+        let mut wrong_kind = tunnel(0);
+        wrong_kind["kind"] = json!(false);
+        assert!(validate_reply("tunnels", &json!({"revision":0,"items":[wrong_kind]})).is_err());
+        assert!(validate_reply("tunnels", &json!({"items":[]})).is_err());
         assert!(validate_reply("stop", &json!({"ok":false})).is_err());
         assert!(validate_reply("unknown", &json!({})).is_err());
     }
@@ -476,6 +613,7 @@ mod tests {
         let requests = server.await.unwrap();
         assert_eq!(requests[0]["offset"], 0);
         assert_eq!(requests[1]["offset"], 32);
+        assert_eq!(requests[0]["command"], "tunnels");
         let server = fixture(
             &path,
             vec![first, json!({"revision":8,"items":[],"next_offset":null})],
@@ -513,6 +651,22 @@ mod tests {
                 .unwrap_err()
                 .uncertain
         );
+        server.await.unwrap();
+        let page = json!({"revision":7,"items":(0..32).map(tunnel).collect::<Vec<_>>(),"next_offset":1024});
+        let server = fixture(&path, vec![page]).await;
+        assert!(tunnels(&path, "host:7000")
+            .await
+            .unwrap_err()
+            .message
+            .contains("分页"));
+        server.await.unwrap();
+        let malformed = json!({"revision":7,"items":[],"next_offset":"32"});
+        let server = fixture(&path, vec![malformed]).await;
+        assert!(tunnels(&path, "host:7000")
+            .await
+            .unwrap_err()
+            .message
+            .contains("响应不兼容"));
         server.await.unwrap();
     }
 }

@@ -14,9 +14,24 @@
     "functions": 90.0,
     "branches": 90.0
   },
-  "rustfrp-app": {
+  "rustfrp-ui-assets": {
     "lines": 90.0,
-    "functions": null,
-    "branches": null
+    "functions": 90.0,
+    "branches": 90.0
+  },
+  "rustfrp-desktop-support": {
+    "lines": 90.0,
+    "functions": 90.0,
+    "branches": 90.0
+  },
+  "rustfrp-desktop": {
+    "lines": 90.0,
+    "functions": 90.0,
+    "branches": 90.0
+  },
+  "rustfrp-ui": {
+    "lines": 90.0,
+    "functions": 90.0,
+    "branches": 90.0
   }
 }

@@ -26,10 +26,12 @@ impl Platform {
         }
     }
 }
+#[derive(Clone)]
 pub struct Startup {
     pub platform: Platform,
     pub home: PathBuf,
     pub executable: PathBuf,
+    namespace: Option<String>,
 }
 pub trait Runner {
     fn run(&self, args: &[String]) -> Result<bool, Error>;
@@ -41,8 +43,30 @@ impl Runner for TaskScheduler {
     }
 }
 impl Startup {
+    pub fn isolated(home: PathBuf, executable: PathBuf) -> Self {
+        Self {
+            platform: Platform::current(),
+            namespace: Some(format!(
+                "com.rustfrp.test.{}",
+                crate::config::hash(home.to_string_lossy().as_bytes())
+            )),
+            home,
+            executable,
+        }
+    }
+    fn task_name(&self) -> String {
+        self.namespace
+            .clone()
+            .unwrap_or_else(|| "RustFRP-Startup".into())
+    }
     fn check(&self) -> Result<(), Error> {
-        if !self.home.is_absolute()
+        if self.namespace.as_ref().is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 120
+                || !name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+                })
+        }) || !self.home.is_absolute()
             || !self.executable.is_absolute()
             || self.executable.as_os_str().len() > 4096
             || self
@@ -57,10 +81,15 @@ impl Startup {
     }
     pub fn path(&self) -> PathBuf {
         if self.platform == Platform::Mac {
-            self.home
-                .join("Library/LaunchAgents/com.rustfrp.desktop.plist")
+            self.home.join("Library/LaunchAgents").join(format!(
+                "{}.plist",
+                self.namespace.as_deref().unwrap_or("com.rustfrp.desktop")
+            ))
         } else {
-            self.home.join(".config/autostart/rustfrp.desktop")
+            self.home.join(".config/autostart").join(format!(
+                "{}.desktop",
+                self.namespace.as_deref().unwrap_or("rustfrp")
+            ))
         }
     }
     pub fn definition(&self) -> Result<String, Error> {
@@ -73,7 +102,8 @@ impl Startup {
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
                 .replace('\'', "&apos;");
-            Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.rustfrp.desktop</string><key>ProgramArguments</key><array><string>{escaped}</string><string>--startup-to-tray</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>"))
+            let label = self.namespace.as_deref().unwrap_or("com.rustfrp.desktop");
+            Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{escaped}</string><string>--startup-to-tray</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>"))
         } else if self.platform == Platform::Linux {
             // Desktop Entry Exec quoting is distinct from shell quoting; %% is a literal percent.
             let escaped = executable
@@ -90,7 +120,7 @@ impl Startup {
     pub fn enabled(&self, runner: &impl Runner) -> Result<bool, Error> {
         self.check()?;
         if self.platform == Platform::Windows {
-            return runner.run(&["/Query".into(), "/TN".into(), "RustFRP-Startup".into()]);
+            return runner.run(&["/Query".into(), "/TN".into(), self.task_name()]);
         }
         match std::fs::symlink_metadata(self.path()) {
             Ok(metadata) if metadata.is_file() => Ok(true),
@@ -111,7 +141,7 @@ impl Startup {
                     "/SC".into(),
                     "ONLOGON".into(),
                     "/TN".into(),
-                    "RustFRP-Startup".into(),
+                    self.task_name(),
                     "/TR".into(),
                     format!("\"{}\" --startup-to-tray", self.executable.display()),
                     "/F".into(),
@@ -120,7 +150,7 @@ impl Startup {
                 vec![
                     "/Delete".into(),
                     "/TN".into(),
-                    "RustFRP-Startup".into(),
+                    self.task_name(),
                     "/F".into(),
                 ]
             };
@@ -162,11 +192,21 @@ pub fn current(executable: &Path) -> Result<Startup, Error> {
     } else {
         "HOME"
     })
-    .ok_or_else(|| Error::io("无法定位当前用户目录"))?;
+    .map(PathBuf::from);
+    from_home(platform, executable, home)
+}
+
+fn from_home(
+    platform: Platform,
+    executable: &Path,
+    home: Option<PathBuf>,
+) -> Result<Startup, Error> {
+    let home = home.ok_or_else(|| Error::io("无法定位当前用户目录"))?;
     let startup = Startup {
         platform,
-        home: PathBuf::from(home),
+        home,
         executable: executable.into(),
+        namespace: None,
     };
     startup.check()?;
     Ok(startup)
@@ -188,6 +228,49 @@ mod tests {
         }
     }
     #[test]
+    fn isolated_startup_names_never_target_the_existing_login_definition_or_task() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            calls: RefCell::new(vec![]),
+            result: true,
+        };
+        for platform in [Platform::Mac, Platform::Linux, Platform::Windows] {
+            let mut startup =
+                Startup::isolated(home.path().join("isolated"), home.path().join("app"));
+            startup.platform = platform;
+            assert_ne!(startup.task_name(), "RustFRP-Startup");
+            if platform == Platform::Windows {
+                assert!(startup.set(true, &fake).unwrap());
+                assert!(startup.set(false, &fake).is_ok());
+                assert!(fake
+                    .calls
+                    .borrow()
+                    .iter()
+                    .all(|args| !args.iter().any(|value| value == "RustFRP-Startup")));
+            } else {
+                assert!(!startup.enabled(&fake).unwrap());
+                assert!(startup.set(true, &fake).unwrap());
+                assert!(startup
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("com.rustfrp.test."));
+                if platform == Platform::Mac {
+                    assert!(startup
+                        .definition()
+                        .unwrap()
+                        .contains(startup.namespace.as_ref().unwrap()));
+                }
+                assert!(!startup.set(false, &fake).unwrap());
+            }
+            for namespace in ["", "bad/name", "bad space", &"a".repeat(121)] {
+                startup.namespace = Some(namespace.into());
+                assert!(startup.enabled(&fake).is_err());
+            }
+        }
+    }
+    #[test]
     fn unix_definitions_are_private_escaped_atomic_and_disable_without_terminating_the_app() {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake {
@@ -199,6 +282,7 @@ mod tests {
                 platform,
                 home: home.path().into(),
                 executable: home.path().join("R&<\"'$`%\\ app"),
+                namespace: None,
             };
             assert!(!startup.enabled(&fake).unwrap());
             assert!(startup.set(true, &fake).unwrap());
@@ -238,6 +322,7 @@ mod tests {
             platform: Platform::Windows,
             home: home.path().into(),
             executable: home.path().join("app with spaces.exe"),
+            namespace: None,
         };
         let fake = Fake {
             calls: RefCell::new(vec![]),
@@ -263,9 +348,22 @@ mod tests {
         assert!(startup.definition().is_err());
         let invalid = Startup {
             executable: PathBuf::from("relative"),
-            ..startup
+            ..startup.clone()
         };
         assert!(invalid.enabled(&fake).is_err());
+        struct Sequence(RefCell<std::collections::VecDeque<bool>>);
+        impl Runner for Sequence {
+            fn run(&self, _: &[String]) -> Result<bool, Error> {
+                self.0
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| Error::io("no scheduled result"))
+            }
+        }
+        let sequence = Sequence(RefCell::new(std::collections::VecDeque::from([
+            true, false,
+        ])));
+        assert!(startup.set(false, &sequence).is_err());
     }
     #[test]
     #[cfg(unix)]
@@ -281,6 +379,7 @@ mod tests {
             platform: Platform::Linux,
             home: home.path().into(),
             executable: home.path().join("app"),
+            namespace: None,
         };
         std::fs::write(home.path().join(".config"), b"unrelated config").unwrap();
         assert!(startup.set(true, &fake).is_err());
@@ -302,5 +401,28 @@ mod tests {
         let current = current(&startup.executable).unwrap();
         assert!(current.platform == Platform::current());
         assert_eq!(current.executable, startup.executable);
+        assert!(from_home(Platform::Windows, &startup.executable, None).is_err());
+        let windows = from_home(
+            Platform::Windows,
+            &startup.executable,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(windows.path().file_name().unwrap(), "rustfrp.desktop");
+        assert!(from_home(
+            Platform::Mac,
+            Path::new("relative-app"),
+            Some(home.path().to_path_buf())
+        )
+        .is_err());
+        let mut bad_home = startup.clone();
+        bad_home.home = PathBuf::from("relative-home");
+        assert!(bad_home.enabled(&fake).is_err());
+        let mut long_executable = startup.clone();
+        long_executable.executable = home.path().join("x".repeat(4097));
+        assert!(long_executable.enabled(&fake).is_err());
+        let mut control_executable = startup.clone();
+        control_executable.executable = home.path().join("app\nname");
+        assert!(control_executable.enabled(&fake).is_err());
     }
 }

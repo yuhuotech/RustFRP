@@ -1,5 +1,7 @@
 # RustFRP 技术设计文档 V1.0
 
+> **2026-10-14 管理 UI 架构修订**：Web 管理面与桌面共享 `rustfrp-ui/` 手写 HTML/CSS/TypeScript；Controller 以目录或内嵌资源托管同一 UI，桌面使用 Tauri 系统 WebView，Rust IPC 仅开放有类型和大小限制的能力。此修订替换本文件早期 Flutter 单工程方案与其对应目录、构建和测试描述。当前实施与验收以 [`UI_REFACTOR_STATUS.md`](UI_REFACTOR_STATUS.md) 为准。
+
 > 状态：草案，待评审　｜　编制日期：2026-10-11
 > 配套文档：[需求说明书](RUSTFRP_PRD_V1.0.md)
 > 参考：`/data/www/linkory/` 的 `docs/UI_SPEC.md`、`WEB_DESIGN.md`、`ADMIN_DESIGN.md`、`DEVELOPMENT_PLAN.md` 与 `linkory-app/lib/theme/tokens.dart`。
@@ -63,7 +65,7 @@ flowchart LR
 
 ### 1.1 一句话定位
 
-**Rust 数据面（省内存）+ 自带管理面（可视化集中管理）+ Flutter 一套代码覆盖 Web 面板与三平台桌面客户端。**
+**Rust 数据面（省内存）+ 自带管理面（可视化集中管理）+ 一套原生 HTML/CSS/TypeScript UI 覆盖 Web 和桌面客户端。**
 
 ### 1.2 核心设计决策
 
@@ -76,20 +78,20 @@ flowchart LR
 | D5 | 协议**自研**：TLS 之上用多路复用，**服务端主动开流**（不用 frp 的「工作连接池」） | 省去预建连接池的内存与延迟，新建连接 = 开一个流 |
 | D6 | 存储用**嵌入式 SQLite**（WAL），不用 MySQL | 单文件、零外部依赖、常驻内存小；管理面数据量级（百~千行）远用不到 MySQL。linkory 用 MySQL 是因为有消息历史，这里没有 |
 | D7 | **配置声明式**：面板只修改「期望状态（spec）」，Agent 对账收敛并回报「实际状态（status）」 | 支持热更新、断线重放、幂等 |
-| D8 | **Flutter 单工程**：`rustfrp-app` 同时编译 Web（管理面板）与 macOS / Linux / Windows（桌面客户端） | 沿用 linkory 的做法（网页版 = 同一套 Flutter 代码，平台差异用条件导入隔离） |
-| D9 | **官网用静态 HTML**（`rustfrp-web`），不用 Flutter | SEO、首屏、体积；视觉复用同一套 token |
-| D10 | **不再单独做 React 管理后台**，也**不做独立的「外部端」** | 管理面板即 Flutter Web，由 Controller 同源托管 |
+| D8（2026-10-14 修订） | `rustfrp-ui` 使用原生 HTML/CSS/TypeScript；服务端静态托管和 Tauri 桌面 WebView 共用这套资源 | 不加载 WebAssembly UI 运行时，页面实现与宿主能力分离 |
+| D9 | 官网使用静态 HTML（`rustfrp-web`） | SEO、首屏、体积；视觉复用 UI token |
+| D10（2026-10-14 修订） | Controller 同源托管共享 UI；Tauri 仅提供有界的桌面原生能力 | 同一业务 UI 可在服务端进程和客户端窗口运行 |
 
 ### 1.3 实施方案（分阶段，对应 PRD §8）
 
-每阶段遵循 linkory 的流程：**先改 `rustfrp-protocol` → 再实现 Rust → 再实现 Flutter → 补测试 → 主干保持可运行**。
+每阶段遵循协议先行和可运行原则：**先改 `rustfrp-protocol` → 再实现 Rust / 共享 UI → 补测试 → 主干保持可运行**。
 
 | 阶段 | 做什么 | 关键产出 | 主要风险与对策 |
 |---|---|---|---|
-| **P00** | 建 Monorepo、Cargo workspace、`rustfrp-protocol` 骨架、Flutter 工程（含草绿 token 与共享控件）、CI、Makefile | 空壳可编译、可运行 | — |
+| **P00** | 建 Monorepo、Cargo workspace、`rustfrp-protocol` 骨架、CI、Makefile | 空壳可编译、可运行 | — |
 | **P01** | `rustfrp-core`：TLS 连接 + yamux 多路复用 + 帧编解码；`frpcfg` 配置解析与兼容报告；`rustfrp-agent` 两种角色最小闭环；tcp/udp 代理；**直接读取 frps/frpc.toml 驱动**；内存基线实测 | 两进程跑通 SSH 穿透 | 先做内存基准脚手架，防止后期补救 |
 | **P02** | `rustfrp-server`：SQLite 迁移、管理员 CLI、设备接入（令牌→密钥）、配置快照/增量下发、审计、REST + WS | 纯 curl 可管理 | 配置对账的幂等与顺序，写属性测试 |
-| **P03** | Flutter Web 面板：登录、概览、节点、客户端、隧道、**接入向导** | 面板闭环 | Web 与桌面的条件导入边界（§3.4） |
+| **P03（已由 2026-10-14 UI 重构修订）** | 共享 HTML/CSS/TypeScript 管理面：登录、概览、节点、客户端、隧道、接入向导；Controller 静态资源服务与 Tauri 桌面桥接 | 同一面板在 Web/桌面运行 | 浏览器与桌面权限边界由服务端 Cookie/CSRF 与 typed IPC 约束 |
 | **P04** | HTTP/HTTPS vhost、子域名、证书、Basic Auth、Host 改写、PROXY protocol | S1 场景 | HTTP 解析要流式、零拷贝，不整包缓冲 |
 | **P05** | 桌面端：托管本机 agent、托盘、开机启动、控制台模式、三平台打包 | 三平台安装包 | 各系统服务注册与签名（提前验证） |
 | **P06** | stcp / sudp / tcpmux、健康检查、负载均衡、限速、插件 | 对照表 P0/P1 全绿 | 限速用令牌桶，不额外起任务 |
@@ -98,8 +100,8 @@ flowchart LR
 ### 1.4 质量门槛（每个 PR）
 
 - `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test`
-- `flutter analyze` + `flutter test`（含 golden：宽/窄 × 浅/深）
-- **协议 fixtures 一致性测试**（Rust 与 Dart 读同一批 JSON）
+- `make ui-test ui-cov ui-e2e`，`make desktop-test desktop-cov desktop-e2e`
+- **协议 fixtures 一致性测试**（Rust 读取共享 JSON）
 - **内存基准回归**：`tools/bench/mem.sh` 跑空载与 1000 连接，超过预算 10% 则 CI 失败
 
 ---
@@ -113,7 +115,7 @@ UI 的颜色、字号、圆角、控件与深浅色沿用 linkory（其本身移
 沿用的规则（原文见 linkory `docs/UI_SPEC.md`，本项目新建同名文档 `docs/UI_SPEC.md` 随代码维护）：
 
 1. 只用 token：颜色 `context.c.xxx`、字号 `Type.xxx`、圆角 `Radii.xxx`；页面代码禁止 `Color(0x…)`、裸字号、裸圆角。
-2. 只用共享控件（`shared/widgets.dart`）；缺的先加到共享层。
+2. 只用 `rustfrp-ui/src/components/` 中的共享 DOM 组件；缺的先加到共享层。
 3. 深浅色都要对；颜色成对使用 `x / xText / xSoft`，不靠透明度推算。
 4. 克制：**一个视图最多一个实心主色按钮**；无渐变、无大面积彩色块。
 5. 文案中文、简短；错误提示给「原因 + 下一步」。
@@ -208,20 +210,22 @@ Logo 沿用 linkory 的结构（28×28 圆角方块 + 白色图形，固定品�
 | Controller | Rust | `rustfrp-server`（Linux/macOS/Windows，x64/arm64） | 管理面 + 内置 Edge + 托管 Web 面板 |
 | Edge | Rust | `rustfrp-agent --mode edge` | 数据面，可多节点 |
 | Client Agent | Rust | `rustfrp-agent --mode client` | 内网机器上的隧道客户端 |
-| Web 面板 | Flutter Web | `build/web`（由 Controller 托管在 `/`） | 管理员 |
-| 桌面客户端 | Flutter Desktop | `.dmg` / `setup.exe`+zip / `.deb`+tar.gz | 本机 agent 管理 + 管理控制台 |
+| Web 面板 | 原生 HTML / CSS / TypeScript | `rustfrp-ui/dist` 或内嵌静态资源（由 Controller 托管在 `/`） | 管理员 |
+| 桌面客户端 | Tauri + 系统 WebView | `.dmg` / `.msi`、`.deb` / tar.gz 与 ZIP | 本机 Agent 管理 + 管理控制台 |
 | 官方网站 | 静态 HTML/CSS/JS | `rustfrp-web/`（自有服务器 nginx，`rustfrp.com` / `www.rustfrp.com`） | 介绍、下载、文档入口 |
 
-> 移动端（Android / iOS）：Flutter 工程保留 `android/` `ios/` 目录能力但 V1.0 不启用；V2.0 评估。
+> 移动端（Android / iOS）不属于当前 V1.0 交付范围。
 
 ### 3.2 总体架构
 
 ```mermaid
 flowchart TB
-  subgraph Flutter["rustfrp-app（Flutter 单工程）"]
-    UI["UI / features"] --> ST["store (Riverpod)"]
-    ST --> API["core/api · core/realtime"]
-    ST --> LOC["core/local_agent（仅桌面）"]
+  subgraph SharedUI["rustfrp-ui（共享 HTML/CSS/TypeScript）"]
+    WEBHOST["WebHost · 同源 REST"]
+    DESKTOPHOST["DesktopHost · typed IPC"]
+  end
+  subgraph Desktop["rustfrp-desktop（Tauri）"]
+    BRIDGE["有界命令桥 + 本机服务"]
   end
   subgraph Ctl["rustfrp-server（Rust）"]
     HTTP["axum：/api/v1 · /agent/v1/ws · 静态面板"]
@@ -237,8 +241,10 @@ flowchart TB
     RUN["tunnel runtime"]
     IPC["本机管理接口 127.0.0.1"]
   end
-  API <-->|"HTTPS · WSS（Web 用 Cookie；桌面用 Bearer）"| HTTP
-  LOC <-->|"回环 HTTP + 本地令牌"| IPC
+  WEBHOST <-->|"HTTPS · Cookie + CSRF"| HTTP
+  DESKTOPHOST <-->|"typed IPC"| BRIDGE
+  BRIDGE <-->|"loopback · local token"| IPC
+  BRIDGE <-->|"有界 REST client"| HTTP
   CTRL <-->|"WSS 控制面"| HTTP
   RUN <-->|"TLS + yamux 数据面"| EDGE0
 ```
@@ -264,38 +270,30 @@ flowchart TB
 - 仅监听 `127.0.0.1:<随机端口>`，采用有界、带本地令牌的 JSON 控制请求（非 HTTP，浏览器不能直接调用）。协议与共享 fixture 见 `rustfrp-protocol/LOCAL_CONTROL.md`。
 - macOS 首次用令牌接入并保存身份，然后交给 `launchd bootstrap gui/<uid>`；服务定义放在用户状态目录，**不含接入令牌**。Linux / Windows 使用独立后台进程，尚需实机验收。
 - 关闭窗口只关闭界面，重开恢复原进程的状态；仅显式「停止」发出带本地令牌的停止请求，不通过 PID 强杀。
-- 当前实现覆盖受管与独立本机入口、随包 Agent、本机隧道/状态/日志/诊断、托盘、关闭到托盘、用户级开机启动和连接通知；独立模式可编辑完整 TOML/YAML/JSON 配置并在保存前验证。CA-07 Agent 和 D-09 Flutter App 更新器均已实现签名清单/版本标记/包摘要校验与平台安装或回滚；真实签名 Release 仍需配置 CI 密钥，三平台真实安装验收仍待完成。
+- 当前实现覆盖受管与独立本机入口、随包 Agent、本机隧道/状态/日志/诊断、托盘、关闭到托盘、用户级开机启动和连接通知；独立模式可编辑完整 TOML/YAML/JSON 配置并在保存前验证。桌面应用更新器验证签名清单、版本标记与包摘要，并按平台策略安装或回滚；真实签名 Release 仍需配置 CI 密钥，多平台真实安装验收仍待完成。
 - 设计增量内存：仅在显式 `--local-control` 时分配监听器、几个状态标量和约 2 KiB 请求缓冲；请求串行处理，读写 2 秒超时，无额外 per-connection 线程或无界容器。
 
-### 3.4 Flutter 平台差异隔离
+### 3.4 共享 UI 与桌面权限边界（2026-10-14 修订）
 
-沿用 linkory `core/web/` 的条件导入模式：
+`rustfrp-ui` 只实现业务页面、状态和 DOM 交互。浏览器宿主用同源 Cookie、CSRF 与 Origin 校验访问 Controller；桌面宿主通过 Tauri command allowlist 提供 Controller 请求和本机功能。bridge 对来源、参数大小、文件类型与 URL scheme 做显式验证；UI 不可调用任意命令或访问任意文件路径。
 
-```
-core/platform/
-  platform.dart          # 抽象接口 + 条件导出
-  platform_io.dart       # 桌面实现（dart:io、window_manager、tray_manager、本机 agent）
-  platform_web.dart      # Web 实现（package:web、Web Locks 单标签页、Cookie 会话）
-  platform_stub.dart     # 测试/其它
-```
+桌面程序将同一份 `rustfrp-ui` 构建产物放入系统 WebView。托盘、窗口、剪贴板、外部链接、通知权限和文件选择器留在 `rustfrp-desktop`；可测策略与本机 Agent、更新、配置逻辑放在独立支持 crate。Web 构建不包含 Tauri API 的运行时分支，CSP 不需要 WebAssembly 求值。
 
 | 能力 | 桌面 | Web |
 |---|---|---|
-| 凭据存储 | `flutter_secure_storage`（Keychain / Credential Manager / libsecret） | HttpOnly Cookie（服务端设置，脚本不可读）；仅 UI 偏好用 localStorage |
-| 管理会话 | Bearer（短期 access + 可轮换 refresh） | Cookie + `X-CSRF-Token` + 同源 Origin 校验 |
-| 实时事件 | WebSocket | WebSocket（同源，Origin 校验天然通过） |
-| 本机 agent | ✅ | ❌（隐藏入口） |
-| 托盘 / 开机启动 / 窗口控制 | ✅ | ❌（隐藏） |
-| Flutter App 包更新（D-09） | ✅（桌面更新器实现；真实签名 Release 待配置） | ❌（隐藏，随 Controller 更新） |
-| 多标签页 | — | Web Locks 互斥，非活动标签页只读提示（沿用 linkory） |
-| 构建 | `flutter build macos|linux|windows` | `flutter build web --release --wasm`，**CanvasKit 随包、不依赖外部 CDN**，内置中文字体 |
+| 管理会话 | 有界 native REST client；会话与 CSRF 留在 Rust | HttpOnly Cookie + `X-CSRF-Token` + 同源 Origin 校验 |
+| 本机 Agent / 完整本机配置 | ✅ | ❌ |
+| 托盘 / 开机启动 / 窗口控制 | ✅ | ❌ |
+| 应用更新 | ✅ Ed25519 清单与平台安装/回滚策略 | 随 Controller 发布共享面板 |
+| UI 代码 | 共用 `rustfrp-ui` | 共用 `rustfrp-ui` |
+| 运行时 | Tauri 系统 WebView | 浏览器 DOM |
 
 Web 面板路径前缀可配置（`RUSTFRP_WEB_PREFIX`，默认 `/`），Controller 返回 `index.html` 时改写 `<base href>`（沿用 linkory 做法），API 始终在 `/api/v1`，不受影响。
 
 ### 3.5 Controller 托管面板
 
-- `RUSTFRP_PANEL_DIR` 指向 `build/web`（或编译时 `embed-panel` feature 内嵌，预压缩 brotli，运行时按需读取，不常驻堆内存）。
-- 安全头：严格 CSP（`default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:`）、`frame-ancestors 'none'`、`X-Content-Type-Options`、`Referrer-Policy`。
+- `RUSTFRP_PANEL_DIR` 指向 `rustfrp-ui/dist`（或通过 `embedded-panel` feature 编译进服务端；压缩资源运行时按需读取，不常驻堆内存）。
+- 安全头：严格 CSP（`default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; font-src 'self' data:`）、`frame-ancestors 'none'`、`X-Content-Type-Options`、`Referrer-Policy`。
 - API 同源，**不开 CORS 例外**。
 - 默认监听 `127.0.0.1`；公网暴露需显式配置并强制 HTTPS（风险 R6）。
 
@@ -305,7 +303,7 @@ Web 面板路径前缀可配置（`RUSTFRP_WEB_PREFIX`，默认 `/`），Control
 
 ### 4.1 原则
 
-**P1　协议是唯一来源。** 所有跨进程的数据结构定义在 `rustfrp-protocol/`（OpenAPI + JSON Schema + `PROTOCOL.md`）。Rust（`rustfrp-core::proto`）与 Dart（`core/models/`）各自实现，但都必须通过**同一批 fixtures**（`rustfrp-protocol/fixtures/*.json`）的往返测试。改 Model 的顺序固定：协议 → Rust → Dart。
+**P1　协议是唯一来源。** 所有跨进程的数据结构定义在 `rustfrp-protocol/`（OpenAPI + JSON Schema + `PROTOCOL.md`）。Rust model 和 TypeScript UI types 通过同一批 fixtures（`rustfrp-protocol/fixtures/*.json`）验证。改 Model 的顺序固定：协议 → Rust → UI types。
 
 **P2　期望状态与实际状态分离（spec / status）。** 每个可配置资源（Tunnel、Node 配置、Client 配置）拆成 `spec`（用户意图，只由管理面写）和 `status`（运行事实，只由 Agent 回报写）。永远不混写一个字段，避免「谁说了算」的冲突。
 
@@ -313,9 +311,9 @@ Web 面板路径前缀可配置（`RUSTFRP_WEB_PREFIX`，默认 `/`），Control
 
 **P4　版本化与幂等。** 每个作用域（每个 Edge、每个 Client）维护单调递增的 `revision`（u64）。下发 = 全量快照（`revision=N`）+ 增量（`N→N+1`，`upsert/remove` 按 ID）；Agent 回报 `applied_revision`。所有变更操作带 `request_id`，重复提交返回同一结果。
 
-**P5　显式枚举，向前兼容。** 枚举在 Rust 用 `#[serde(other)]` 兜底 `Unknown`，在 Dart 用 `fromWire` 返回 `unknown`。**新增枚举值是兼容变更；删除或改名是破坏变更**，需要升协议大版本。未知字段一律忽略，不报错。
+**P5　显式枚举，向前兼容。** 枚举在 Rust 用 `#[serde(other)]` 兜底 `Unknown`，在 TypeScript 用显式映射保留未知值。**新增枚举值是兼容变更；删除或改名是破坏变更**，需要升协议大版本。未知字段一律忽略，不报错。
 
-**P6　不可变与值语义（Dart）。** Model 全部 `@immutable`、`final` 字段、`copyWith`、`==`/`hashCode`；列表字段用不可修改视图。Store 只通过替换整个对象更新状态，UI 不直接改 Model。
+**P6　不可变与值语义。** UI API model 使用只读字段与窄类型；状态由明确的更新函数替换，不在视图组件中原地改传输对象。
 
 **P7　敏感信息不进通用 Model。** 令牌、共享密钥、私钥、密码哈希存放在独立表/独立类型（`SecretRef`），**默认序列化时输出 `null`/占位**；只有「创建/轮换」那一次响应带明文。日志与审计的 Model 中不允许有这类字段（类型层面做不到引用）。
 
@@ -325,7 +323,7 @@ Web 面板路径前缀可配置（`RUSTFRP_WEB_PREFIX`，默认 `/`），Control
 
 **P10　尺寸有界。** 所有字符串/列表有上限（名称 ≤ 64、标签 ≤ 16 个、单次快照 ≤ 1 MiB）；指标不存逐连接记录，只存聚合（每隧道每分钟一个桶），避免数据膨胀吃内存与磁盘。
 
-**P11　UI 视图模型与传输模型分层。** 传输模型（`models/*.dart`，与协议一一对应）≠ 视图模型（`features/*/view_models`）。例如 `TunnelView` 可组合 `Tunnel + TunnelStatus + Node.publicAddr` 并生成「公网地址」展示串；协议改动只影响前者。
+**P11　UI 视图模型与传输模型分层。** 传输模型（`rustfrp-ui/src/api/`）≠ 页面视图状态（`rustfrp-ui/src/features/`）。例如隧道行可组合 Tunnel、状态与 Node 地址；协议改动只影响传输映射。
 
 ### 4.2 核心实体
 
@@ -370,7 +368,7 @@ EnrollToken:          issued → used | expired | revoked
 
 - JSON 字段 `snake_case`；枚举值 `snake_case` 字符串；时间字段后缀 `_at`（毫秒时间戳）；时长后缀 `_ms`；字节后缀 `_bytes`。
 - Rust：`serde` + `deny_unknown_fields` **仅用于**内部持久化结构，对外协议结构不用（P5）。
-- Dart：`fromJson` 对缺失/类型错误字段给默认值或抛 `ProtocolException`（带字段路径），**不吞错**。
+- TypeScript UI：校验来自 API 的 JSON 字段，缺失或类型错误时保留字段路径并显示明确错误，不吞错。
 - ID 在 URL 中用字符串，不暴露自增序号。
 
 ---
@@ -386,7 +384,9 @@ RustFRP/
 ├── rustfrp-server/             # Controller（含内置 Edge、托管面板）
 ├── rustfrp-agent/              # Agent（client / edge 双角色）
 ├── rustfrp-protocol/           # 协议唯一来源
-├── rustfrp-app/                # Flutter：Web 面板 + 三平台桌面
+├── rustfrp-ui/                 # Web 与桌面共享 HTML/CSS/TypeScript 管理 UI
+├── rustfrp-desktop/            # Tauri WebView 壳与桌面支持库
+├── rustfrp-ui-assets/          # 有界静态资源服务
 ├── rustfrp-web/                # 官方网站（静态）
 ├── deploy/                     # Docker Compose / systemd / 环境变量样例
 ├── installer/                  # Windows(Inno Setup) / Linux(.deb) / macOS(dmg 脚本) / install.sh / install.ps1
@@ -497,57 +497,31 @@ rustfrp-protocol/
 │   ├── models.schema.json
 │   └── tunnel_options.schema.json
 ├── frp-compat/                 # 兼容性测试集：frp 官方样例/边界配置 + 期望解析结果与错误
-├── fixtures/                   # 黄金样例（Rust 与 Dart 测试共同读取）
+├── fixtures/                   # 黄金样例（Rust 与 TypeScript UI 测试共同读取）
 │   ├── tunnel_tcp.json  tunnel_http.json  snapshot.json  delta.json  status.json …
 └── CHANGELOG.md                # 协议变更记录（兼容/破坏标注）
 ```
 
-### 5.6 `rustfrp-app/` — Flutter 单工程（Web + 三平台桌面）
-
-结构直接沿用 `linkory-app/lib`：`app / core / shared / theme / features`。
+### 5.6 共享管理 UI 与系统 WebView 桌面端（2026-10-14 修订）
 
 ```text
-rustfrp-app/
-├── pubspec.yaml                # riverpod、http、web_socket_channel、window_manager、tray_manager、
-│                               # local_notifier、flutter_secure_storage、lucide_icons_flutter、
-│                               # flutter_markdown_plus、url_launcher、file_picker …（与 linkory 一致）
-├── lib/
-│   ├── main.dart
-│   ├── app/app.dart            # MaterialApp、主题、路由、窗口圆角包装
-│   ├── theme/tokens.dart       # ★ 唯一改动：action 一族换草绿（§2.2）；其余与 linkory 逐字节一致
-│   ├── shared/                 # 共享控件与格式化：widgets.dart、format.dart、rounded_window.dart、
-│   │                           #   close_dialog.dart、charts.dart、data_table.dart …
-│   ├── core/
-│   │   ├── models/             # 传输模型（对应 protocol）：tunnel.dart node.dart client.dart admin.dart …
-│   │   ├── api.dart            # REST 客户端（统一错误、CSRF/Bearer 注入）
-│   │   ├── realtime.dart       # 面板 WS（事件订阅、断线重连）
-│   │   ├── store.dart          # 全局 AppStore（Riverpod）：section、选中项、连接状态
-│   │   ├── session.dart        # 登录态、模式（本机/控制台）
-│   │   ├── secrets.dart        # 凭据存储（条件实现）
-│   │   ├── platform/           # 条件导入隔离（§3.4）
-│   │   ├── local_agent/        # 桌面：本机 agent 发现、安装服务、回环 API 客户端
-│   │   ├── updater.dart  update_install.dart  version.dart  log.dart
-│   │   └── desktop.dart        # 托盘、开机启动、窗口管理
-│   └── features/
-│       ├── shell/              # 三栏/窄屏壳、图标栏、底部导航、toast
-│       ├── auth/               # 登录页/对话框、Controller 地址选择
-│       ├── dashboard/          # 概览
-│       ├── nodes/              # 节点列表与详情、接入新节点
-│       ├── clients/            # 客户端列表与详情
-│       ├── tunnels/            # 隧道列表、编辑抽屉、模板
-│       ├── enroll/             # 接入向导（客户端/节点共用）
-│       ├── audit/              # 审计
-│       ├── logs/               # 日志尾随
-│       ├── local/              # 本机模式：本机概览、本机隧道
-│       ├── settings/           # 账号、管理员、令牌、通用、更新、关于
-│       ├── update/             # 更新对话框
-│       └── guest/              # 未登录浏览模式
-├── web/                        # index.html、manifest、内置中文字体（NotoSansSC）
-├── macos/ linux/ windows/      # 桌面 runner（Linux/Windows 窗口圆角沿用 linkory 实现）
-├── test/                       # 单测、widget、golden（宽/窄 × 浅/深）、fixtures 一致性
-├── integration_test/
-└── assets/
+rustfrp-ui/
+├── src/app/          # 页面状态与导航
+├── src/components/   # 语义化表格、表单、对话框、反馈
+├── src/features/     # 概览、节点、客户端、隧道、审计、设置、本机模式
+├── src/api/          # 类型、操作 allowlist、同源 API client
+├── src/platform/     # WebHost 与 DesktopHost
+└── src/styles/       # token、主题和布局
+
+rustfrp-desktop/
+├── src/lib.rs                   # Tauri 窗口、托盘与受限 IPC commands
+├── src/native_calls.rs          # 剪贴板、系统对话框、通知和窗口 API 适配
+└── crates/support/               # IPC policy、Controller、Agent、配置、更新服务与单测
+
+rustfrp-ui-assets/               # 有界读取、预压缩与摘要校验的资源服务
 ```
+
+UI bundle 在浏览器和桌面 WebView 中共用。Web 端通过 Controller 同源 Cookie/CSRF 调用管理 API；桌面端将请求委托给 Rust 中的有界 REST client，另外提供类型化本机能力。Web build 不依赖 CDN 或 WebAssembly UI 运行时。
 
 ### 5.7 `rustfrp-web/` — 官方网站（静态）
 
@@ -570,7 +544,7 @@ rustfrp-web/
 |---|---|
 | `deploy/` | `docker-compose.yml`（单服务 + 卷）、`.env.example`、`rustfrp-server.service`、反向代理 nginx/caddy 样例（`/` 面板 + `/api` + `/agent` WS） |
 | `installer/` | `windows/*.iss`、`linux/deb/`、`macos/dmg.sh`、`install.sh`（`curl … \| sh`，校验 SHA256 与签名）、`install.ps1` |
-| `tools/` | `server_run.sh`、`app_run.sh`、`web_run.sh`、`bench/mem.sh`（内存基准）、`bench/throughput.sh`、`gen_icons.py`、`package_macos.sh`、`deploy_*.sh`、`e2e/`（假 Agent + 真 Controller 的端到端） |
+| `tools/` | `web_run.sh`、`bench/mem.sh`（内存基准）、`bench/throughput.sh`、`gen_icons.py`、发布打包、部署与 E2E 工具 |
 | `docs/` | `RUSTFRP_PRD_V1.0.md`、`RUSTFRP_TECH_DESIGN_V1.0.md`、`UI_SPEC.md`、`ADMIN_DESIGN.md`（权限与审计）、`DEPLOYMENT.md`、`SECURITY_AUDIT_*.md`、`images/` |
 | `.github/workflows/` | `ci.yml`（fmt/clippy/test/analyze/基准）、`release.yml`（`v*` 标签 → 多平台构建 → 签名 → SHA256SUMS(+sig) → Release） |
 
@@ -580,8 +554,9 @@ rustfrp-web/
 server-run / server-test      # cargo run -p rustfrp-server / cargo test
 agent-run MODE=client|edge
 core-test                     # cargo test -p rustfrp-core
-app-run [DEVICE=…] / app-test # flutter run / flutter analyze + test
-web-build                     # flutter build web --wasm → rustfrp-server 托管
+ui-test / ui-cov / ui-build / ui-e2e
+desktop-test / desktop-cov / desktop-e2e
+web-build                     # rustfrp-ui → rustfrp-server 托管
 web-run                       # 本机起 Controller 并打开浏览器
 bench-mem                     # 内存基准
 e2e                           # 端到端
@@ -678,8 +653,9 @@ Controller 先发 `Challenge{nonce}`，节点用身份密钥签名应答 `Hello`
 |---|---|
 | Rust 单元/属性测试 | 协议编解码往返、对账引擎幂等与乱序、状态机迁移、端口分配 |
 | Rust 集成测试 | 真实 SQLite + 真实 WS + 假 Agent；真实 Edge/Client 在回环上跑 TCP/UDP/HTTP 全链路 |
-| 协议一致性 | Rust 与 Dart 读取同一 fixtures |
-| Flutter | widget + golden（宽/窄 × 浅/深）、store 单测、集成测试 |
+| 协议一致性 | Rust 与 TypeScript 读取同一 fixtures |
+| 共享 UI | DOM 行为、样式预算和 Chromium / Firefox / WebKit E2E |
+| 桌面 UI | IPC 策略与支持 crate 单测、实际系统 WebView 和本机 Agent E2E |
 | 端到端 | `tools/e2e/`：起 Controller + 2 Agent，通过 API 建隧道，校验字节与热更新不断连 |
 | 基准 | 内存与吞吐，CI 回归 |
 | 发布 | 推送 `v*` 标签 → 测试 → 各平台构建 → 签名/公证 → `SHA256SUMS(.sig)` → Release；带连字符标为预发布。应用内更新沿用 linkory 的更新器与「国内加速」下载源 |
@@ -700,20 +676,20 @@ Controller 先发 `Challenge{nonce}`，节点用身份密钥签名应答 `Hello`
 
 ## 当前实现补充：受管安装入口
 
-Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用 Flutter 静态目录。
+Controller 已内置 `/install.sh` 与 `/install.ps1`，无需启用额外静态目录。
 接入命令的 POSIX 参数使用单引号转义，Windows 返回可直接粘贴到 PowerShell 的表达式，保留设备名中的引号、中文及特殊字符。
 脚本按系统/架构选择 `/downloads/` 下的原始 agent，通过 HTTPS 下载并校验对应 SHA256 文件，失败保留旧 agent。
 下载目录由外部静态服务器托管，避免管理 API 整包读取发布二进制。
-当前桌面实现包含托盘、用户级开机启动和通知；Agent 的 systemd/launchd/Windows 任务计划服务命令也已实现。CA-07 Agent 与 D-09 Flutter App 更新器使用编译时固定的 Ed25519 公钥校验签名清单及包摘要，并执行安全替换/失败处理。CI 公钥变量/签名私钥尚未配置，所以未发布真实签名 Release。官网部署和正式安全审计报告仍缺，三平台实机验收也未完成。
+当前桌面实现包含托盘、用户级开机启动和通知；Agent 的 systemd/launchd/Windows 任务计划服务命令也已实现。Agent 与桌面应用更新器使用编译时固定的 Ed25519 公钥校验签名清单及包摘要，并执行安全替换/失败处理。CI 公钥变量/签名私钥尚未配置，所以未发布真实签名 Release。官网部署和正式安全审计报告仍缺，多平台实机验收也未完成。
 目录约定、验证命令与增量内存评估见 [installer/README.md](../installer/README.md)。
 
 
 ### 本轮验收记录
 
-宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；颜色与字号 token 无变更。
-Flutter analyze 与 158 项测试通过；Web 同源构建成功。Rust/Flutter 覆盖率见 [HANDOFF.md](HANDOFF.md)：Rust crates 与 Flutter 行覆盖率均达到统一的 90% 最低门槛。真实签名 Release、公网部署、跨主机迁移和多平台目标主机验收尚未完成。
+宽屏两栏与菜单折叠已覆盖 Web / 桌面、本机 / 管理员模式；UI token 由共享 CSS 维护。
+UI 重构后的单测、E2E 与覆盖率以 [UI_REFACTOR_STATUS.md](UI_REFACTOR_STATUS.md) 中的当前证据为准。真实签名 Release、公网部署、跨主机迁移和多平台目标主机验收尚未完成。
 macOS 隔离实例实测：首次接入错误提示、有效接入、停止、复用身份启动、菜单收起、重开保留折叠与原 PID、窗口完全退出后真实 TCP 隧道继续回显；最后通过本地控制接口停止并清理临时 launchd 任务。
-Rust 全仓测试、fmt / clippy、全链路冒烟与 `make cov` 均通过；行/函数/分支（Rust）和行（Flutter）的最低门槛统一为 90%。2026-10-12 `make bench-mem`（10 条隧道）空闲 Edge/Client 为 5.05/5.06 MiB，100 条空闲连接为 6.97/7.41 MiB，20 次 512 KiB 回显后为 7.39/7.88 MiB，关闭后为 7.41/7.89 MiB；均低于 10 MiB 上限。
+Rust 全仓测试、fmt / clippy、全链路冒烟与 `make cov` 按当前 CI 门槛验收；Rust、共享 UI 与桌面 crate 行/函数/分支最低门槛为 90%。数据面内存历史数据见 `tools/bench/README.md`。
 
 菜单顶部品牌区：logo 22px、名称使用常规 13px；桌面顶部留 44px，Web 留 24px。收起时整行隐藏品牌图形与名称，只显示水平居中的展开按钮。
 

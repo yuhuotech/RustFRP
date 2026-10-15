@@ -9,8 +9,9 @@
 | 每个 Rust crate（`rustfrp-core` / `-server` / `-agent`） | **行覆盖率** | **≥ 90%** | `cargo llvm-cov` |
 | 同上 | **分支覆盖率** | **≥ 90%** | `cargo +nightly llvm-cov --branch` |
 | 同上 | 函数覆盖率 | ≥ 90% | 同上 |
-| Flutter（`rustfrp-app`） | 行覆盖率 | ≥ 90% | `flutter test --coverage` + `tools/cov/check_lcov.py` |
-| Flutter | 分支 | 见 §1.3 | — |
+| 桌面 Rust（`rustfrp-desktop` / `rustfrp-desktop-support`） | 行 / 函数 / 分支 | 均 ≥ 90% | `make desktop-cov` |
+| 共享 UI（`rustfrp-ui`） | 行 / 函数 / 分支 | 均 ≥ 90% | `make ui-cov` + `tools/cov/check_lcov.py` |
+| 静态资源服务（`rustfrp-ui-assets`） | 行 / 函数 / 分支 | 均 ≥ 90% | `make assets-cov` |
 
 1. **门槛按 crate / 包整体计算，且每个 PR 都必须通过**：行、函数、分支均须 ≥90%。`tools/cov/baseline.json` 记录此最低门槛，不执行高于 90% 的历史数据回归门槛。
 2. 新增的重要业务行为要有带有效断言的测试，并覆盖关键错误与边界路径；CI 不要求新增代码逐行达到 100% diff coverage。
@@ -19,6 +20,7 @@
    - `main.rs` 中仅做参数解析与转调的薄入口（逻辑必须在库里，入口 ≤ 30 行）；
    - 平台专属且无法在 CI 平台执行的系统调用薄封装（如 Windows 服务注册），需有对应的手工验证清单；
    - 自动生成的代码。
+   - 只在 `native-e2e` feature 下构建、用于驱动真实宿主验收的测试命令；命令不能进入普通桌面构建。
    其他一律不得排除。**生产代码**禁止任何就地豁免注解（`coverage(off)`、`tarpaulin_include` 等）。
    唯一例外：`#[cfg(test)] mod tests` 测试模块本身用 `#[cfg_attr(coverage, coverage(off))]` 排除，避免测试代码的断言宏分支稀释统计。
 5. 无法用单元测试触达的代码（网络、时钟、文件系统）要**通过 trait 注入假实现**来测，而不是排除。设计上优先让逻辑可测。
@@ -41,23 +43,19 @@ make cov             # 全仓库汇总 + HTML 报告（target/llvm-cov/html）
 | 属性/模糊测试 | `proptest`（编解码、解析器、状态机、对账引擎） | 往返不变量：`decode(encode(x)) == x`；解析器对任意输入**不 panic** |
 | 集成测试 | 各 crate `tests/` | 真实 SQLite、真实回环 TCP/WS、假 Agent；覆盖 spec 里的验收用例（AT-xx） |
 | 兼容性测试 | `rustfrp-protocol/frp-compat/` | frp 官方样例与边界配置；解析结果、默认值、错误信息与 frp 一致；**每新增一个兼容字段先加用例** |
-| 协议一致性 | `rustfrp-protocol/fixtures/` | Rust 与 Dart 读同一批 JSON，往返相等 |
+| 协议一致性 | `rustfrp-protocol/fixtures/` | Rust 读同一批 JSON，往返相等 |
 | 端到端 | `tools/e2e/` | Controller + 多 Agent 全链路，含热更新不断连、断线恢复 |
 | 基准 | `tools/bench/` | 内存（RSS）与吞吐；超基线 10% 失败（原则一） |
-| UI | `flutter test` | widget、golden（宽/窄 × 浅/深）、store 单测 |
+| UI | `make ui-test` / `make ui-e2e` | DOM 行为、Chromium / Firefox / WebKit 与真实 Controller |
+| 桌面 UI | `make desktop-test` / `make desktop-e2e` | IPC、系统 WebView、本机 Agent 生命周期 |
 
-### 1.3 Flutter 的分支覆盖说明
+### 1.3 UI 覆盖说明
 
-Dart 官方 `--coverage` 只产出**行覆盖**（lcov 无 BRDA 分支数据），目前没有成熟的 Dart 分支覆盖工具。因此：
-
-- 门槛：**行覆盖 ≥ 90%** 由 CI 强制；
-- 分支纪律：每个 `if/else`、`switch`、三元、`?.`/`??` 的各个走向必须有用例，**由评审清单检查**（PR 模板里有勾选项）；
-- 业务逻辑尽量放在可测的纯 Dart 类（store / view model），UI 层保持薄；
-- 若后续出现可靠的 Dart 分支覆盖工具，再把门槛升级为强制。
+共享 TypeScript UI 与桌面 Rust crate 均强制行、函数、分支覆盖率 ≥90%。Playwright 对 Web 页面、权限、缓存升级与真实 Controller 行为做跨引擎验收；桌面 E2E 另用真实系统 WebView 验收原生桥接与 Agent 生命周期。操作系统本身的调用仅允许按 `tools/cov/exclusions.md` 登记为薄适配，并保留手工验收证据。
 
 ## 2. 开发流程
 
-1. **先协议、后 Rust、再 Flutter**；改 Model 必须同步 `rustfrp-protocol/` 与 fixtures。
+1. **先协议、后 Rust 与共享 UI**；改 Model 必须同步 `rustfrp-protocol/` 与 fixtures。
 2. **测试先行**：新功能先写失败的测试（至少是验收用例的骨架），再实现。
 3. **小步提交**：一个提交一件事；提交信息 `type(scope): 说明`（`feat/fix/refactor/test/docs/chore`，scope 如 `core`、`server`、`agent`、`app`、`web`）。
 4. **主干始终可运行**；每阶段结束打 tag。
@@ -74,12 +72,12 @@ Dart 官方 `--coverage` 只产出**行覆盖**（lcov 无 BRDA 分支数据）�
 - 日志用 `tracing`；**不得**记录令牌、密钥、密码、流量内容。
 - 公开 API 写文档注释；注释只解释「为什么」，不复述代码。
 
-## 4. Flutter / Dart 规范
+## 4. 共享 UI 规范
 
-- 颜色/字号/圆角只用 token；控件只用 `shared/widgets.dart`（见 UI_SPEC）；新页面用 `PageHeader`。
-- `flutter analyze` 零警告；`flutter test` 全绿；golden 在宽/窄 × 浅/深下更新。
-- Model 不可变（`@immutable`、`copyWith`、`==`）；业务逻辑放 store/纯类，Widget 保持薄。
-- 平台差异只放 `core/platform/` 的条件导入内。
+- Web 与桌面共用 `rustfrp-ui/` 的 HTML、CSS 和 TypeScript；平台能力经受限宿主桥接，不在 UI 中调用任意系统命令。
+- 颜色、字号、间距和圆角使用 `rustfrp-ui/src/styles/` token；DOM 使用语义化元素与可访问标签。
+- `npm run check`、`npm test`、`npm run coverage` 与 `npm run build-test` 全绿；Playwright 在 Chromium、Firefox、WebKit 上通过。
+- API 模型显式声明并保持不可变；业务操作通过 allowlist；所有写请求包含审计理由，错误、取消和空状态均有行为断言。
 
 ## 5. 安全与依赖
 

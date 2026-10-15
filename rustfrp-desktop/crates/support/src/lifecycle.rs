@@ -207,10 +207,11 @@ pub trait Backend: Sync {
     fn pause(&self) -> impl Future<Output = ()> + Send;
 }
 
-async fn wait_start(
+async fn wait_start_with_timeout(
     backend: &impl Backend,
     config: &Config,
     enrollment: bool,
+    timeout: Duration,
 ) -> Result<Value, Error> {
     let work = async {
         loop {
@@ -225,26 +226,40 @@ async fn wait_start(
             backend.pause().await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(15), work)
+    tokio::time::timeout(timeout, work)
         .await
         .map_err(|_| Error {
             uncertain: true,
             ..Error::io("Agent 启动尚未确认，请刷新状态后检查接入令牌、证书和程序版本")
         })?
 }
-async fn wait_stop(backend: &impl Backend, config: &Config) -> Result<(), Error> {
+async fn wait_start(
+    backend: &impl Backend,
+    config: &Config,
+    enrollment: bool,
+) -> Result<Value, Error> {
+    wait_start_with_timeout(backend, config, enrollment, Duration::from_secs(15)).await
+}
+async fn wait_stop_with_timeout(
+    backend: &impl Backend,
+    config: &Config,
+    timeout: Duration,
+) -> Result<(), Error> {
     let work = async {
         while backend.status(config).await?.is_some() {
             backend.pause().await;
         }
         Ok(())
     };
-    tokio::time::timeout(Duration::from_secs(10), work)
+    tokio::time::timeout(timeout, work)
         .await
         .map_err(|_| Error {
             uncertain: true,
             ..Error::io("Agent 仍在退出，请刷新状态确认")
         })?
+}
+async fn wait_stop(backend: &impl Backend, config: &Config) -> Result<(), Error> {
+    wait_stop_with_timeout(backend, config, Duration::from_secs(10)).await
 }
 pub async fn start(backend: &impl Backend, config: &Config, token: &str) -> Result<Value, Error> {
     config.validate()?;
@@ -1061,6 +1076,52 @@ mod tests {
             self.push("pause");
         }
     }
+    struct WaitingBackend {
+        status: Option<Value>,
+    }
+    impl Backend for WaitingBackend {
+        async fn status(&self, _: &Config) -> Result<Option<Value>, Error> {
+            Ok(self.status.clone())
+        }
+        async fn prepare(&self, _: &Config) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn enrolled(&self, _: &Config) -> Result<bool, Error> {
+            Ok(false)
+        }
+        async fn launch(&self, _: &Config, _: Option<&str>) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Config) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn unregister(&self, _: &Config) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn pause(&self) {
+            tokio::task::yield_now().await;
+        }
+    }
+    #[tokio::test]
+    async fn lifecycle_waits_report_uncertain_timeout_without_blocking_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = cfg(directory.path());
+        let pending = WaitingBackend { status: None };
+        let start = wait_start_with_timeout(&pending, &config, false, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(start.uncertain);
+        assert!(start.message.contains("尚未确认"));
+
+        let stopping = WaitingBackend {
+            status: Some(running(false)),
+        };
+        let stop = wait_stop_with_timeout(&stopping, &config, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(stop.uncertain);
+        assert!(stop.message.contains("仍在退出"));
+    }
     #[tokio::test]
     async fn first_enrollment_is_transient_and_background_service_never_gets_the_token() {
         let directory = tempfile::tempdir().unwrap();
@@ -1415,5 +1476,25 @@ mod tests {
         };
         supervise(&mut stop).unwrap();
         assert!(stop.pauses.is_empty());
+    }
+
+    #[test]
+    fn a_second_supervisor_exits_cleanly_when_the_owned_job_lock_is_held() {
+        use fs2::FileExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = cfg(directory.path());
+        save_job(&config, true).unwrap();
+        let job = config.job_path();
+        let lock_path = job.with_extension("desktop-job.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        assert!(run_supervisor(&job).is_ok());
     }
 }

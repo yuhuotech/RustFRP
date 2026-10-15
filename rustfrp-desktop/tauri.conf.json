@@ -16,6 +16,7 @@
     "active": true,
     "targets": ["app", "dmg", "deb", "nsis"],
     "resources": { "resources/": "." },
-    "icon": ["../assets/brand/rustfrp-logo-32.png", "../assets/brand/rustfrp-logo-128.png", "../assets/brand/rustfrp-logo-256.png"]
+    "icon": ["../assets/brand/rustfrp-logo-32.png", "../assets/brand/rustfrp-logo-128.png", "../assets/brand/rustfrp-logo-256.png", "../assets/brand/rustfrp-logo.icns", "../assets/brand/rustfrp-logo.ico"],
+    "windows": { "nsis": { "installMode": "currentUser", "displayLanguageSelector": false } }
   }
 }

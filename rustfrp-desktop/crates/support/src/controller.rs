@@ -455,6 +455,12 @@ mod tests {
                 true,
             ),
             (
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhtml"
+                    .into(),
+                "invalid_response",
+                false,
+            ),
+            (
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into(),
                 "http_error",
                 false,
@@ -473,7 +479,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = vec![0; 4096];
-                stream.read(&mut bytes).await.unwrap();
+                assert!(stream.read(&mut bytes).await.unwrap() > 0);
                 let _ = stream.write_all(reply.as_bytes()).await;
             });
             client
@@ -499,6 +505,36 @@ mod tests {
             }
             server.await.unwrap();
         }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = vec![b'x'; MAX_RESPONSE + 1];
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        client
+            .select(&format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let error = client
+            .request(
+                "patchNode",
+                RequestArgs {
+                    id: Some("edge".into()),
+                    body: Some(json!({"reason":"fixture"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn tracked_requests_cancel_before_dispatch_and_bound_concurrent_and_early_cancellation_state(
@@ -512,6 +548,12 @@ mod tests {
                 .await
                 .is_err());
         }
+        let long_id = "x".repeat(65);
+        assert!(client.cancel(&long_id).is_err());
+        assert!(client
+            .request_tracked(long_id, "me", RequestArgs::default())
+            .await
+            .is_err());
         for index in 0..40 {
             assert!(!client.cancel(&format!("early-{index}")).unwrap());
         }
@@ -551,7 +593,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 4096];
-            stream.read(&mut bytes).await.unwrap();
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
             notice.notify_one();
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
@@ -581,11 +623,12 @@ mod tests {
         assert!(!error.uncertain);
         assert!(!client.busy());
         server.abort();
-        let mut flights = client.flights.lock().unwrap();
-        for index in 0..8 {
-            flights.insert(format!("fixture-{index}"), CancellationToken::new());
+        {
+            let mut flights = client.flights.lock().unwrap();
+            for index in 0..8 {
+                flights.insert(format!("fixture-{index}"), CancellationToken::new());
+            }
         }
-        drop(flights);
         assert!(client
             .request_tracked("over-limit".into(), "me", RequestArgs::default())
             .await
@@ -595,9 +638,12 @@ mod tests {
 
     #[test]
     fn address_and_operation_boundary_reject_credentials_and_arbitrary_requests() {
+        assert!(controller_url(&"http://example.com/".repeat(300)).is_err());
         for address in [
             "file:///etc/passwd",
             "https://u:p@example.com",
+            "https://user@example.com",
+            "https://:password@example.com",
             "https://example.com/?token=x",
             "https://example.com/#x",
             "garbage",
@@ -614,6 +660,31 @@ mod tests {
         let (_, url, write) = endpoint(&base, "client", &args).unwrap();
         assert_eq!(url.path(), "/panel/api/v1/clients/a%2Fb%3Fx");
         assert!(!write);
+        let mut query = BTreeMap::new();
+        query.insert("page".into(), "2".into());
+        let (_, url, _) = endpoint(
+            &base,
+            "clients",
+            &RequestArgs {
+                query,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(url.query(), Some("page=2"));
+        let mut too_many = BTreeMap::new();
+        for index in 0..9 {
+            too_many.insert(format!("p{index}"), "1".into());
+        }
+        assert!(endpoint(
+            &base,
+            "clients",
+            &RequestArgs {
+                query: too_many,
+                ..Default::default()
+            },
+        )
+        .is_err());
         assert!(endpoint(
             &base,
             "createTunnel",
@@ -643,27 +714,154 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn endpoint_rejects_unbounded_identifiers_queries_and_non_object_bodies() {
+        let base = controller_url("https://controller.example/panel").unwrap();
+        for id in ["", ".", "..", "line\nbreak"] {
+            assert!(endpoint(
+                &base,
+                "client",
+                &RequestArgs {
+                    id: Some(id.into()),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        }
+        assert!(endpoint(
+            &base,
+            "client",
+            &RequestArgs {
+                id: Some("x".repeat(257)),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        let mut long_key = BTreeMap::new();
+        long_key.insert("k".repeat(65), "value".into());
+        assert!(endpoint(
+            &base,
+            "clients",
+            &RequestArgs {
+                query: long_key,
+                ..Default::default()
+            }
+        )
+        .is_err());
+        let mut long_value = BTreeMap::new();
+        long_value.insert("page".into(), "v".repeat(1025));
+        assert!(endpoint(
+            &base,
+            "clients",
+            &RequestArgs {
+                query: long_value,
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(endpoint(
+            &base,
+            "createTunnel",
+            &RequestArgs {
+                body: Some(json!({"payload":"x".repeat(MAX_REQUEST)})),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(endpoint(
+            &base,
+            "createTunnel",
+            &RequestArgs {
+                query: BTreeMap::from([("reason".into(), "audited from query".into())]),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn dropping_a_flight_tolerates_a_poisoned_registry() {
+        use std::sync::Arc;
+        let client = Arc::new(ControllerClient::default());
+        let poisoned = client.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.flights.lock().unwrap();
+            panic!("poison request registry");
+        })
+        .join()
+        .is_err());
+        drop(Flight {
+            owner: &client,
+            id: "finished".into(),
+        });
+    }
+
+    #[tokio::test]
+    async fn invalid_error_json_is_not_uncertain_and_non_object_me_does_not_mutate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [("200 OK", "[]"), ("400 Bad Request", "not json")] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = ControllerClient::default();
+        client.select(&format!("http://{address}")).await.unwrap();
+        assert_eq!(
+            client.request("me", RequestArgs::default()).await.unwrap(),
+            json!([])
+        );
+        let error = client
+            .request(
+                "patchNode",
+                RequestArgs {
+                    id: Some("node".into()),
+                    body: Some(json!({"reason":"test"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_response");
+        assert!(!error.uncertain);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn sessions_hide_credentials_preserve_csrf_and_surface_auth_errors() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for body in [
-                json!({"csrf":"private-csrf","admin":{"id":"a","role":"owner"}}),
-                json!({"ok":true}),
-                json!({"error":{"code":"unauthorized","message":"expired"}}),
+            for (status, body) in [
+                (
+                    "200 OK",
+                    json!({"csrf":"private-csrf","admin":{"id":"a","role":"owner"}}),
+                ),
+                ("200 OK", json!({"ok":true})),
+                (
+                    "401 Unauthorized",
+                    json!({"error":{"code":"unauthorized","message":"expired"}}),
+                ),
+                ("200 OK", json!({"ok":true})),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut data = vec![0; 8192];
                 let n = socket.read(&mut data).await.unwrap();
                 requests.push(String::from_utf8_lossy(&data[..n]).to_string());
                 let text = body.to_string();
-                let status = if body.get("error").is_some() {
-                    "401 Unauthorized"
-                } else {
-                    "200 OK"
-                };
                 socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: rustfrp_session=private-cookie; Path=/; HttpOnly\r\nConnection: close\r\n\r\n{text}", text.len()).as_bytes()).await.unwrap();
             }
             requests
@@ -702,10 +900,54 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, 401);
         assert_eq!(error.code, "unauthorized");
+        client
+            .request("logout", RequestArgs::default())
+            .await
+            .unwrap();
+        assert!(client
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .csrf
+            .is_empty());
         let requests = server.await.unwrap();
         assert!(requests[0].contains("x-rustfrp-admin: 1"));
         assert!(requests[1].contains("x-csrf-token: private-csrf"));
         assert!(requests[1].contains("cookie: rustfrp_session=private-cookie"));
         assert!(!requests[1].contains("origin:"));
+        assert_eq!(requests.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn response_from_a_controller_replaced_mid_request_is_discarded() {
+        use std::sync::Arc;
+        let client = Arc::new(ControllerClient::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        client.select(&format!("http://{address}")).await.unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        let notice = received.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            notice.notify_one();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                .await
+                .unwrap();
+        });
+        let running = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request("me", RequestArgs::default()).await })
+        };
+        received.notified().await;
+        client.select("http://127.0.0.1:1").await.unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert!(error.message.contains("已切换"));
+        server.await.unwrap();
     }
 }

@@ -6,6 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "host_command",
             "native_test_config",
             "native_test_report",
+            "native_test_tray_policy",
+            "native_window_cycle",
+            "native_window_visibility",
         ]
     } else {
         &["controller_request", "controller_cancel", "host_command"]

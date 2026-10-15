@@ -1,8 +1,8 @@
 # RustFRP UI 框架重构方案与实施计划
 
-日期：2026-10-14。状态：按用户批准进行完整实施；当前证据和未完成项见 [实施与验收清单](UI_REFACTOR_STATUS.md)，最终切换与 Flutter 清理尚未完成。
+日期：2026-10-14。状态：按用户批准实施；本机代码、测试、覆盖率与 Flutter 工程清理已完成，跨平台/签名/内存对照及窗口恢复性能仍按证据列为保留项，见 [实施与验收清单](UI_REFACTOR_STATUS.md)。用户确认：本期不设 24 小时长稳门槛。
 
-研究基线：RustFRP `6058ade`；Magpie `f074996d93b87b17ea682c4b5951d52794bb28cb`，该提交时间为 2026-10-14 09:38:12 +08:00。本文核查了两边的源码和官方框架文档；没有运行 Magpie 性能基准，也没有完成新宿主的性能测量。
+研究基线：RustFRP `6058ade`；Magpie `f074996d93b87b17ea682c4b5951d52794bb28cb`，该提交时间为 2026-10-14 09:38:12 +08:00。本文核查了两边的源码和官方框架文档，没有运行 Magpie 性能基准。当前浏览器与 macOS WebView 已有短时性能样本；新桌面和旧 Flutter 的同场景进程树内存对照尚未完成。
 
 ## 1. 建议采用的架构
 
@@ -195,7 +195,7 @@ Tauri 默认对自定义注册命令的权限有单独规则，不能只安装 c
 | 桌面隐藏 | 页面任务停止；轻量模式释放 WebView 后接近该平台无窗口宿主基线 | 记录宿主、Agent 及关联进程；共享页使用 PSS/物理占用辅助解释 |
 | Controller | 原有典型常驻 ≤12 MiB 目标；新增静态托管稳态增量目标 ≤1 MiB | 同一业务负载，区分静态访问、登录短时峰值与常驻；并发访问/冷读另测 |
 | Agent/Edge | 原有典型 ≤10 MiB 目标继续成立 | UI 使用系统 WebView不改变数据面预算；退出/释放界面不影响隧道 |
-| 长时间稳定性 | 反复切页/开关窗口与 24h 运行无持续增长，订阅/队列/缓存均有界 | GC/缓存预热后看趋势，保留峰值和原始样本，不用一次 RSS 证明无泄漏 |
+| 长时间稳定性 | 本期按用户确认不设验收门槛，不执行 24h 测试 | 保留短时切页/窗口循环与缓存、订阅、队列的有界性检查；长期趋势另行安排 |
 
 跨平台不直接比较 RSS 数字：Linux同时记录 RSS/PSS，macOS记录可归属进程与物理占用，Windows记录 working set/private bytes。浏览器共享 GPU/网络进程的归属需注明，不能把其他标签页一并算入或完全遗漏。
 
@@ -221,13 +221,13 @@ rustfrp-desktop/
   capabilities/          # 明确的命令/窗口权限
   tests/                 # 平台集成与宿主专项验收
 tools/ui/                # 大小预算、性能采样、截图和清单核对
-rustfrp-app/             # 迁移期间保留的 Flutter 参考与回退版本
+target/ui-refactor-baseline/ # Git 忽略的旧 Web/桌面构建参考产物，不是源码依赖
 rustfrp-web/             # 现有官网，与管理面板工程分开
 ```
 
 桌面初期使用独立 Cargo workspace 与独立 CI job，避免现有服务端 `cargo build --bins` / 覆盖率 Job 被迫编译 GUI。新增 Rust crates 的覆盖率与 lint 同样纳入统一入口，不能因 workspace 分离而漏检。
 
-新增建议命令：`make ui-test`、`ui-cov`、`ui-build`、`ui-shots`、`ui-bench`、`desktop-test`、`desktop-cov`、`desktop-build`。迁移期间保留现有 Flutter 命令；最终切换时再更新 `web-build`、`start_dev.sh` 与 Release 工作流。本地 Web 预览继续固定端口 9674。
+实施后入口为 `make ui-test ui-cov ui-build ui-shots`、`make desktop-test desktop-cov desktop-build`；`make cov`、`web-build`、`start_dev.sh`、CI 和 Release 工作流均已切换到共享 UI/Tauri。Flutter 命令和工程依赖已删除。本地 Web 预览继续固定端口 9674。
 
 ## 9. 分阶段实施计划
 
@@ -240,8 +240,8 @@ rustfrp-web/             # 现有官网，与管理面板工程分开
 | P2 公共交互底座 | token 到 CSS；两栏布局；表格/弹窗/表单/提示；请求取消/去重/缓存；权限显示；暗色/窄屏/IME | 宽窄/深浅、键盘、输入中刷新和重复点击通过；资源预算可自动校验 | 3–4 人日 |
 | P3 管理页面迁移 | 概览 → 节点 → 客户端/访问者 → 隧道/模板/批量 → 配置导入导出 → 审计/系统设置 | 每条迁移矩阵均有真实 API 成功/失败证据，配置兼容与权限不退化 | 7–10 人日 |
 | P4 桌面能力迁移 | Rust 本机服务层、受管/独立模式、配置 verify/原子保存、诊断；托盘/自启动/通知；Agent/App 更新；偏好迁移 | 桌面行为矩阵通过；轻量释放/重建与独立 Agent 生存通过；签名拒绝/升级/回滚路径分别验证 | 5–7 人日 |
-| P5 三平台整体验证与发布 | 浏览器三引擎、真实 WKWebView/WebView2/WebKitGTK；性能/长稳、安装/卸载、更新/签名流水线；回退演练 | 所有质量门槛通过，逐平台记录实机证据；未具备的发布凭据仍明确标记 | 4–6 人日 |
-| P6 切换与清理 | 发布新默认面板/桌面；保留旧发布包与数据备份；观察一周期；清理 Flutter 默认依赖与同步文档 | 功能、资源与回退复核通过，遗留验收不被错误标为完成 | 2–3 人日 |
+| P5 三平台整体验证与发布 | 浏览器三引擎、真实系统 WebView；短时性能、安装/卸载、更新/签名流水线；回退演练 | 质量门槛通过，逐平台记录可取得的实机证据；发布凭据按实际配置标记 | 4–6 人日 |
+| P6 切换与清理 | 新默认面板/桌面；保留旧发布包与数据备份；删除 Flutter 工程、依赖和入口；同步文档 | 功能、资源与回退复核通过，遗留验收不被错误标为完成 | 2–3 人日 |
 
 预计完整迁移 **25–36 人日，约 5–8 周**。最先交付的是 P0/P1 的双端原型和对照数据，约 4–6 人日。若缺目标平台主机或签名凭据，开发与可验证部分继续完成，平台发布验收单独记录等待条件。
 
@@ -252,7 +252,7 @@ P3 按完整业务路径迁移页面，每个路径都覆盖读取、编辑、�
 ### 10.1 测试与覆盖率
 
 - 现有 Rust 每 crate 行/函数/分支 ≥90% 继续执行；新增桌面支持与资源服务代码也纳入基线。
-- 新前端建议行/函数/分支均 ≥90%，以行为断言为主，覆盖角色、状态、异常、输入与提交；迁移期间 Flutter 行覆盖率 ≥90% 继续检查。
+- 新前端行/函数/分支均 ≥90%，以行为断言为主，覆盖角色、状态、异常、输入与提交。
 - 系统 API 薄封装的不可执行部分按现有规则登记排除，并提供平台手工清单；业务逻辑通过可注入接口测试，不能把整个桌面 crate 排除。
 - Playwright 覆盖 Chromium、Firefox、WebKit，验证真实 Controller 与写入审计；浏览器 WebKit 通过不代表 WKWebView/WebKitGTK 已验收。
 - Windows/Linux 可使用桌面 WebDriver；macOS 依官方当前支持选择 WebdriverIO 适配或宿主自动化/实机操作，原生 WebDriver 不直接假设可用。[官方测试说明](https://v2.tauri.app/develop/tests/)
@@ -263,11 +263,11 @@ P3 按完整业务路径迁移页面，每个路径都覆盖读取、编辑、�
 
 共享 UI 发布同时生成静态包、内嵌清单与桌面资源输入，记录同一构建的内容摘要。先验证支持的 Controller API 版本范围；桌面/服务器更新速度不一致时显示明确能力边界。
 
-新 UI 初期通过独立静态发布目录和开发构建验证；现有 Flutter 保持可运行。外部目录托管可通过目录/符号链接原子切换回退，已缓存的哈希资源在保留期内不删除。内嵌资源随二进制切换，但替换 Controller 会影响同进程内置 Edge，需要安排该模式的发布窗口；不能将静态目录切换的无重启特性套用到二进制升级。
+新 UI 通过独立静态发布目录和内嵌构建验证。外部目录托管可通过目录/符号链接原子切换回退，已缓存的哈希资源在保留期内不删除。内嵌资源随二进制切换，但替换 Controller 会影响同进程内置 Edge，需要安排该模式的发布窗口；不能将静态目录切换的无重启特性套用到二进制升级。
 
 桌面偏好迁移读取旧配置后写入新命名空间，并保留旧配置备份；不改 Agent 身份与 frp 配置格式。发布后回退旧桌面时，后台 Agent 仍可接入；Agent 本身的版本升级遵守原有独立签名与回滚流程。
 
-在执行切换时同步 `README.md`、`AGENTS.md`、`docs/UI_SPEC.md`、技术设计中的 Flutter 选型、开发规范、`IMPLEMENTATION_STATUS.md`、`HANDOFF.md`、本机协议和 Release 文档。本文的方案状态不改变当前实现完成度，也不替代正式签名/多平台/重载性能等现有保留验收。
+切换时同步了 `README.md`、`AGENTS.md`、`docs/UI_SPEC.md`、技术设计、开发规范、`IMPLEMENTATION_STATUS.md`、`HANDOFF.md`、本机协议和 Release 文档。长时间稳定性不属于本期门槛。当前短时实测：浏览器本地反馈 p95 26ms；macOS release WebView 30 次窗口恢复首帧 p95 516ms，高于建议的 200ms；桌面进程树内存对照尚无数据。本文方案不替代其他平台实机、真实签名 Release 或正式安全审计。
 
 ### 10.3 最主要的风险与处置
 
@@ -279,7 +279,7 @@ P3 按完整业务路径迁移页面，每个路径都覆盖读取、编辑、�
 | 桌面远端访问或本机桥接权限扩大 | 本地可信页面 + 类型化操作；原生会话层；来源/窗口/文件/命令范围检查 |
 | WebView 平台差异 | 实机测试字体、IME、图形加速、托盘与释放；功能检测与降级，平台修复留在宿主层 |
 | 更新器更换破坏签名链 | 对现有签名格式与可信公钥单独迁移，篡改/缺密钥/取消/中断/回滚均验收 |
-| 原型通过但长时间资源上涨 | 有界缓存/日志/订阅；窗口循环与 24h 趋势采样，保存峰值与原始数据 |
+| 原型通过但长期资源上涨 | 有界缓存/日志/订阅与短时窗口循环检查；本期不执行 24h 趋势采样 |
 
 ## 11. 研究来源
 
@@ -296,4 +296,4 @@ Magpie 源码固定到上述提交，避免后续 main 变化影响本次结论�
 - [Linux WebKitGTK 绘制适配](https://github.com/yetone/magpie/blob/f074996d93b87b17ea682c4b5951d52794bb28cb/internal/gui/webkit_linux.go)
 - [Tauri 架构](https://v2.tauri.app/concept/architecture/)、[进程模型](https://v2.tauri.app/concept/process-model/)、[权限](https://v2.tauri.app/security/capabilities/)、[CSP](https://v2.tauri.app/security/csp/)、[测试](https://v2.tauri.app/develop/tests/)、[更新](https://v2.tauri.app/plugin/updater/)
 
-RustFRP 核查入口：`rustfrp-server/src/api.rs`、`rustfrp-agent/src/local_control.rs`、`rustfrp-app/lib/core/api.dart`、`core/local_agent.dart`、`core/platform/local_backend_io.dart`、`core/app_updater.dart`、`core/app_update_install.dart`、`theme/tokens.dart`、`test/`、`docs/UI_SPEC.md`、`docs/IMPLEMENTATION_STATUS.md` 与 `.github/workflows/release.yml`。
+RustFRP 核查入口：`rustfrp-server/src/api.rs`、`rustfrp-agent/src/local_control.rs`、`rustfrp-ui/src/api/`、`rustfrp-ui/src/features/`、`rustfrp-desktop/crates/support/src/`、`rustfrp-desktop/src/`、`rustfrp-ui/tests/`、`rustfrp-ui/e2e/`、`docs/UI_SPEC.md`、`docs/IMPLEMENTATION_STATUS.md` 与 `.github/workflows/release.yml`。旧 Flutter 源码不再保存在仓库。
