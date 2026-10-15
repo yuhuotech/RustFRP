@@ -9,6 +9,7 @@ export interface Context {
   navigate(section: Section, id?: string): void;
   refresh(): Promise<void>;
   logout(): Promise<void>;
+  loginLocal?(): Promise<void>;
   showError(error: unknown): void;
   write(operation: Parameters<ApiClient['request']>[0], args: Parameters<ApiClient['request']>[1]): Promise<Json>;
 }

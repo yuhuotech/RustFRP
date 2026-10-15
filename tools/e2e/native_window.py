@@ -83,9 +83,9 @@ def main():
         assert extra_supervisor.returncode!=0 and "参数" in extra_supervisor.stderr
         relative_state = subprocess.run([str(executable)], env={**os.environ, "RUSTFRP_DESKTOP_STATE_DIR": "relative"}, capture_output=True, text=True, timeout=10)
         assert relative_state.returncode != 0 and "绝对路径" in relative_state.stderr
-        local={"binary":str(root/"bin"/AGENT.name),"stateDir":str(folder/"agent"),"name":name}
+        local={"binary":str(root/"bin"/AGENT.name),"stateDir":str(folder/"agent"),"name":name,"controller":"127.0.0.1:7000"}
         preferences=root/"preferences.json"
-        preferences.write_text(json.dumps({"local":local,"controller_url":"http://127.0.0.1:9674","notifications":False,"lightweight":True}))
+        preferences.write_text(json.dumps({"local":local,"local_mode":True,"controller_url":"http://127.0.0.1:9674","notifications":False,"lightweight":True}))
         if os.name!="nt": preferences.chmod(0o600)
         report=folder/"report.json"
         env={**os.environ,"HOME":str(home),"LOCALAPPDATA":str(home),"USERPROFILE":str(home),"RUSTFRP_E2E_PASSWORD":password,"RUSTFRP_NATIVE_E2E_TOKEN":token["token"],"RUSTFRP_NATIVE_E2E_NAME":name,"RUSTFRP_NATIVE_E2E_REPORT":str(report)}
@@ -97,15 +97,21 @@ def main():
         output=ROOT/"target/ui/native-window.log"
         output.parent.mkdir(parents=True,exist_ok=True)
         with output.open("w") as log:
-            app=subprocess.Popen([str(executable),"--startup-to-tray"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
+            # Exercise first-run setup in a visible WebView; hidden-start behavior
+            # remains covered independently by the isolated startup probes below.
+            app=subprocess.Popen([str(executable)],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
             try:
                 deadline=time.monotonic()+200
-                previous=""
+                previous=None
                 while time.monotonic()<deadline:
                     if report.exists():
                         evidence=json.loads(report.read_text())
                         stage=evidence["stage"]
-                        if stage!=previous: print(f"Native WebView: {stage}",flush=True); previous=stage
+                        progress=(stage,evidence.get("cycles"))
+                        if progress!=previous:
+                            detail=f" ({progress[1]}/30)" if stage=="window-cycles" else ""
+                            print(f"Native WebView: {stage}{detail}",flush=True)
+                            previous=progress
                         if not evidence.get("passed"): raise AssertionError(evidence.get("message","native test failed"))
                         if stage=="local-started" and not single_instance:
                             second=subprocess.Popen([str(executable),"--e2e-secondary"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
@@ -115,9 +121,11 @@ def main():
                             assert app.poll() is None
                             single_instance=True
                         if stage=="restored": break
-                    if app.poll() is not None: raise AssertionError("Native app exited before integration test completed")
+                    if app.poll() is not None: raise AssertionError(f"Native app exited before integration test completed (exit {app.returncode})")
                     time.sleep(0.25)
-                else: raise AssertionError("Native WebView E2E timed out; inspect target/ui/native-window.log")
+                else:
+                    latest=json.loads(report.read_text()) if report.exists() else {}
+                    raise AssertionError(f"Native WebView E2E timed out at {latest.get('stage', 'no report')}; inspect target/ui/native-window.log")
                 assert app.wait(timeout=5)==0
                 current=probe(root)
                 assert current["status"]["pid"]==evidence["agent_pid"] and current["status"]["connected"]

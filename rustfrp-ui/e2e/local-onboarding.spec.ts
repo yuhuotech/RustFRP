@@ -15,7 +15,7 @@ test('desktop connection forms stay compact and local action groups align', asyn
     } } });
   });
   await page.goto('/'); await page.evaluate(() => document.fonts.ready);
-  await expect(page.getByTestId('local-start')).toHaveText('连接此电脑');
+  await expect(page.getByTestId('local-start')).toHaveText('登录并连接此电脑');
   await page.getByTestId('local-settings').click();
   const dialog = page.locator('dialog');
   await expect(dialog.getByLabel('Agent 程序', { exact: true })).toBeHidden();
@@ -32,8 +32,10 @@ test('desktop connection forms stay compact and local action groups align', asyn
     const boxes = await Promise.all(ids.map(id => page.getByTestId(id).boundingBox()));
     expect(boxes.every(box => box && Math.abs(box.y - boxes[0]!.y) < 1 && box.height === boxes[0]!.height)).toBe(true);
   };
-  await align(['local-start', 'local-stop', 'local-settings']);
-  await page.getByTestId('local-start').click(); await page.getByTestId('dialog-submit').click();
+  await align(['local-start', 'local-settings']);
+  await expect(page.getByTestId('local-start')).toHaveText('登录并连接此电脑');
+  await page.locator('summary', { hasText: '管理员手动接入' }).click();
+  await page.getByTestId('local-manual-enroll').click(); await page.getByLabel('一次性接入令牌', { exact: true }).fill('test-only'); await page.getByTestId('dialog-submit').click();
   await page.getByTestId('refresh-page').click();
   await align(['local-tab-status', 'local-tab-tunnels', 'local-tab-logs']);
   await page.screenshot({ path: info.outputPath('local-buttons-aligned.png') });

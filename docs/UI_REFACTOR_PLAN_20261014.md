@@ -267,7 +267,7 @@ P3 按完整业务路径迁移页面，每个路径都覆盖读取、编辑、�
 
 桌面偏好迁移读取旧配置后写入新命名空间，并保留旧配置备份；不改 Agent 身份与 frp 配置格式。发布后回退旧桌面时，后台 Agent 仍可接入；Agent 本身的版本升级遵守原有独立签名与回滚流程。
 
-切换时同步了 `README.md`、`AGENTS.md`、`docs/UI_SPEC.md`、技术设计、开发规范、`IMPLEMENTATION_STATUS.md`、`HANDOFF.md`、本机协议和 Release 文档。长时间稳定性不属于本期门槛。当前短时实测：浏览器本地反馈 p95 26ms；macOS release WebView 30 次窗口恢复首帧 p95 516ms，高于建议的 200ms；桌面进程树内存对照尚无数据。本文方案不替代其他平台实机、真实签名 Release 或正式安全审计。
+切换时同步了 `README.md`、`AGENTS.md`、`docs/UI_SPEC.md`、技术设计、开发规范、`IMPLEMENTATION_STATUS.md`、`HANDOFF.md`、本机协议和 Release 文档。长时间稳定性不属于本期门槛。当前短时实测：浏览器本地反馈 p95 26ms；macOS release WebView 30 次窗口恢复首帧 p95 516ms，高于建议的 200ms；Ubuntu 24.04 ARM64 WebKitGTK/Xvfb release E2E 的对应 p95 为 52ms。桌面进程树内存对照尚无数据。本文方案不替代 Windows/物理 Linux 实机、真实签名 Release 或正式安全审计。
 
 ### 10.3 最主要的风险与处置
 

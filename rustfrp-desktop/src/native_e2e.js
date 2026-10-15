@@ -16,7 +16,18 @@ if (!window.__rustfrpNativeE2E) {
     const wait = async (condition, timeout = 30000) => {
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) { const result = await condition(); if (result) return result; await sleep(50); }
-      throw new Error('Native WebView condition timed out');
+      throw new Error(`Native WebView condition timed out: ${String(condition).slice(0, 220)}`);
+    };
+    const bounded = async (operation, timeout, label) => {
+      let timer;
+      try {
+        return await Promise.race([
+          operation,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeout); }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
     };
     const assert = (condition, message) => { if (!condition) throw new Error(message); };
     const click = id => { const control = document.querySelector(`[data-testid="${id}"]`); assert(control && !control.disabled, `Control unavailable: ${id}`); control.click(); };
@@ -49,9 +60,14 @@ if (!window.__rustfrpNativeE2E) {
         await report({ stage: 'restored', passed: true, session_restored: true, page_restored: true, agent_survives_release: true, agent_pid: local.pid });
         return;
       }
-      await wait(() => document.querySelector('#login-name'));
+      await wait(() => document.querySelector('[data-testid="local-start"]'));
+      assert(document.querySelector('[data-testid="local-start"]').textContent === '登录并连接此电脑', 'Saved address was mistaken for enrollment');
+      click('local-start'); await wait(() => document.querySelector('#login-name'));
       field('#login-server', config.controller); field('#login-name', 'preview'); field('#login-password', config.password);
-      click('login-submit'); await wait(() => document.querySelectorAll('.metric-card').length === 6);
+      click('login-submit'); await wait(() => document.querySelector('dialog select[name="node"]'));
+      assert(!document.querySelector('dialog input[name="enrollToken"]'), 'Login continuation asked the user for a token');
+      click('dialog-cancel'); navigation('overview'); await wait(() => document.querySelectorAll('.metric-card').length === 6);
+      evidence.saved_settings_login = true;
       assert(!document.cookie.includes('rfrp_session'), 'Cookie exposed to JavaScript');
       assert(!(await api('me')).csrf, 'CSRF exposed to JavaScript');
       const rejected = async operation => { try { await operation(); } catch (error) { assert(error?.code === 'invalid_request', 'Unexpected native rejection'); return; } throw new Error('Native boundary accepted an invalid operation'); };
@@ -87,7 +103,15 @@ if (!window.__rustfrpNativeE2E) {
       click('local-start'); await wait(() => document.querySelector('dialog select[name="node"]'));
       assert(!document.querySelector('dialog input[name="controller"]') && !document.querySelector('dialog input[name="binary"]'), 'Guided setup requires technical paths or addresses');
       field('dialog input[name="name"]', config.name); submit(); await wait(() => !document.querySelector('dialog[open]'));
-      const local = await wait(async () => { const status = await host('localStatus'); return status?.connected ? status : null; });
+      let local = await wait(async () => { const status = await host('localStatus'); return status?.connected ? status : null; });
+      assert((await host('info')).local_enrolled === true, 'Actual enrollment was not reflected in capabilities');
+      const credentialCount = (await api('enrollTokens')).length;
+      click('local-stop'); await wait(() => document.querySelector('dialog[open]')); submit(); await wait(() => !document.querySelector('dialog[open]'));
+      await wait(() => document.querySelector('[data-testid="local-start"]')?.textContent === '启动连接');
+      click('local-start'); assert(!document.querySelector('dialog[open]'), 'Restart asked for an enrollment token');
+      local = await wait(async () => { const status = await host('localStatus'); return status?.connected ? status : null; });
+      assert((await api('enrollTokens')).length === credentialCount, 'Restart created another enrollment credential');
+      evidence.restart_without_token = true;
       const saved = await host('preferences'); const nodes = await api('nodes');
       assert(saved.local.tlsPin === nodes[0].tls_fingerprint, 'Guided setup did not use the Controller certificate');
       assert(!JSON.stringify(saved).includes(config.token), 'Enrollment credential entered preferences');
@@ -101,14 +125,14 @@ if (!window.__rustfrpNativeE2E) {
       const cycleTimings = [];
       for (let cycle = 0; cycle < 30; cycle++) {
         const started = performance.now();
-        const frameReady = visibleFrame();
-        await invoke('native_window_cycle', { delayMs: 25 });
-        await frameReady;
+        await bounded(invoke('native_window_cycle', { delayMs: 25 }), 15000, `Native window cycle ${cycle + 1}/30`);
+        await bounded(visibleFrame(), 15000, `Native visible frame ${cycle + 1}/30`);
         cycleTimings.push(performance.now() - started);
         assert(await invoke('native_window_visibility'), 'Native WebView is not visible after its first frame');
         if (cycle === 0 || cycle === 29) await report({ stage: 'window-cycles', passed: true, cycles: cycle + 1 });
       }
-      assert((await host('localStatus')).pid === local.pid, 'Warm window cycles changed Agent PID');
+      const afterCycles = await bounded(host('localStatus'), 15000, 'Agent status after window cycles');
+      assert(afterCycles.pid === local.pid, 'Warm window cycles changed Agent PID');
       const p95 = values => [...values].sort((a, b) => a - b)[Math.ceil(values.length * 0.95) - 1];
       await report({ stage: 'warm-cycles', passed: true, cycles: 30, visible_first_frame_p95_ms: p95(cycleTimings), agent_pid: local.pid });
       await host('window', { action: 'minimize' });

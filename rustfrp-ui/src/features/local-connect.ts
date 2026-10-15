@@ -3,11 +3,11 @@ import { allowed, disabled, record, records, text, type NodeInfo } from '../api/
 import type { Context } from '../app/context';
 import { el, toast } from '../components/dom';
 import { FormDialog, reason } from '../components/forms';
-import { localSettings } from './local-config';
 
 // The authenticated Controller supplies the address and certificate; tokens stay in memory.
 export async function connectComputer(context: Context): Promise<void> {
-  if (!allowed(context.admin?.role, 'admin')) { await localSettings(context); return; }
+  if (!context.admin) { await (context.loginLocal ?? context.logout)(); return; }
+  if (!allowed(context.admin.role, 'admin')) throw new Error('当前账号没有接入电脑的权限。请使用管理员账号登录，或请管理员提供接入凭据。');
   const [nodeData, infoData, preferences] = await Promise.all([
     context.resources.read('nodes', 'nodes', {}, 0), context.host.call('info'), context.host.call('preferences'),
   ]);

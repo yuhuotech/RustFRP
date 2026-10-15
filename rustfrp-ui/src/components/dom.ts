@@ -26,6 +26,8 @@ const paths: Record<string, string> = {
   key: 'M15 4a5 5 0 1 0 0 10a5 5 0 1 0 0-10 M11 12l-8 8 M5 18l2 2',
   activity: 'M2 12h5l3-8l4 16l3-8h5', transfer: 'M5 7h14 M15 3l4 4l-4 4 M19 17H5 M9 13l-4 4l4 4',
   menu: 'M5 7h14 M5 12h14 M5 17h14', copy: 'M9 9h12v12H9z M3 15V3h12',
+  'sidebar-close': 'M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1 M9 3v18 M16 9l-3 3l3 3',
+  'sidebar-open': 'M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1 M9 3v18 M14 9l3 3l-3 3',
   warning: 'M12 3L2 21h20z M12 9v5 M12 17h.01', local: 'M3 4h18v13H3z M6 8l3 3l-3 3 M12 14h5 M8 21h8',
 };
 export function icon(name: string): SVGSVGElement {

@@ -19,6 +19,7 @@ export class App {
   private id?: string;
   private timer?: ReturnType<typeof setInterval>;
   private busy = false;
+  private returnToLocal = false;
   private disposed = false;
   private generation = 0;
   private stopWindow: () => void = () => {};
@@ -42,7 +43,7 @@ export class App {
         const preferences = record(await this.host.call('preferences'));
         if (typeof preferences.theme === 'string') { localStorage.setItem('rustfrp.theme', preferences.theme); this.applyTheme(); }
         if (typeof preferences.sidebar_collapsed === 'boolean') { localStorage.setItem('rustfrp.collapsed', String(preferences.sidebar_collapsed)); this.applyTheme(); }
-        if (typeof preferences.controller_url === 'string' && preferences.controller_url) await this.host.call('selectController', { url: preferences.controller_url });
+        if (typeof preferences.controller_url === 'string' && preferences.controller_url) { await this.host.call('selectController', { url: preferences.controller_url }); localStorage.setItem('rustfrp.server', preferences.controller_url); }
         if (preferences.local_mode === true) { this.section = 'local'; this.restorePage(); this.shell(); return; }
       }
       const value = record(await this.api.request('me')); this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin;
@@ -52,6 +53,7 @@ export class App {
   private context(): Context {
     return { api: this.api, resources: this.resources, host: this.host, admin: this.admin,
       navigate: (section, id) => this.navigate(section, id), refresh: () => this.refresh(true), logout: () => this.logout(), showError: error => this.showError(error),
+      loginLocal: async () => { this.returnToLocal = true; await this.logout(); },
       write: async (operation, args) => { const value = await this.api.request(operation, args); this.resources.invalidate(); await this.refresh(true); return value; },
     };
   }
@@ -62,7 +64,8 @@ export class App {
     for (const dialog of document.querySelectorAll<HTMLDialogElement>('dialog')) dialog.close();
     const card = el('form', 'login-card'); const logo = el('img'); logo.src = '/logo.svg'; logo.alt = 'RustFRP';
     card.append(el('div', 'login-brand', logo, el('h1', '', 'RustFRP')));
-    const server = el('input'); server.type = 'url'; server.name = 'server'; server.value = localStorage.getItem('rustfrp.server') ?? ''; server.placeholder = 'https://controller.example.com';
+    if (this.returnToLocal) card.append(el('p', 'muted-text', '登录后选择节点即可连接此电脑，应用会自动处理接入凭据。'));
+    const server = el('input'); server.type = 'url'; server.name = 'server'; server.value = localStorage.getItem('rustfrp.server') ?? (this.returnToLocal ? 'http://127.0.0.1:9674' : ''); server.placeholder = 'https://controller.example.com';
     const name = el('input'); name.name = 'name'; name.autocomplete = 'username'; name.required = true;
     const password = el('input'); password.name = 'password'; password.type = 'password'; password.autocomplete = 'current-password'; password.required = true;
     for (const [label, control] of [...(this.host.desktop ? [['Controller 地址', server] as const] : []), ['账号', name] as const, ['密码', password] as const]) {
@@ -78,7 +81,14 @@ export class App {
       try {
         if (this.host.desktop) { await this.host.call('selectController', { url: server.value }); localStorage.setItem('rustfrp.server', server.value); }
         const value = record(await this.api.request('login', { body: { name: name.value.trim(), password: password.value } }));
-        this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin; password.value = ''; this.shell();
+        this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin; password.value = '';
+        const connect = this.returnToLocal; this.returnToLocal = false;
+        if (connect) { this.section = 'local'; await this.host.call('savePreferences', { local_mode: true }); }
+        this.shell();
+        if (connect) {
+          try { const { connectComputer } = await import('../features/local-connect'); await connectComputer(this.context()); }
+          catch (error) { this.showError(error); }
+        }
       } catch (reason) { error.textContent = reason instanceof Error ? reason.message : String(reason); error.hidden = false; }
       finally { this.busy = false; submit.disabled = false; submit.setAttribute('aria-busy', 'false'); }
     });
@@ -86,10 +96,16 @@ export class App {
   }
   private shell(): void {
     const sidebar = el('aside', 'sidebar'); const logo = el('img'); logo.src = '/logo.svg'; logo.alt = 'RustFRP';
-    const collapse = button('«', () => {
+    const updateCollapse = () => {
+      const closed = document.documentElement.dataset.collapsed === 'true';
+      collapse.replaceChildren(icon(closed ? 'sidebar-open' : 'sidebar-close'));
+      collapse.title = closed ? '展开菜单' : '收起菜单'; collapse.setAttribute('aria-label', collapse.title); collapse.setAttribute('aria-expanded', String(!closed));
+    };
+    const collapse = button('', () => {
       const closed = document.documentElement.dataset.collapsed !== 'true'; document.documentElement.dataset.collapsed = String(closed); localStorage.setItem('rustfrp.collapsed', String(closed));
+      updateCollapse();
       if (this.host.desktop) void this.host.call('savePreferences', { sidebar_collapsed: closed }).catch(error => this.showError(error));
-    }); collapse.className = 'collapse'; collapse.setAttribute('aria-label', '展开或收起菜单');
+    }); collapse.className = 'collapse'; updateCollapse();
     sidebar.append(el('div', 'brand', logo, el('span', 'brand-name', 'RustFRP'), collapse));
     const menu = el('nav', 'nav-main'); menu.setAttribute('aria-label', '主菜单'); const foot = el('div', 'nav-foot'); const bottom = el('nav', 'bottom-nav'); bottom.setAttribute('aria-label', '底部导航');
     const sections: Section[] = this.admin ? ['overview', 'nodes', 'clients', 'tunnels', ...(allowed(this.admin.role, 'admin') ? ['audit' as const] : []), 'settings'] : ['local', 'settings'];
@@ -147,7 +163,14 @@ export class App {
   private async logout(): Promise<void> {
     try { if (this.admin) await this.api.request('logout', { body: {} }); }
     catch (error) { this.showError(error); }
-    finally { this.admin = null; this.resources.clear(); if (this.host.desktop) void this.host.call('savePreferences', { local_mode: false }).catch(error => this.showError(error)); this.login(); }
+    finally {
+      this.admin = null; this.resources.clear();
+      if (this.host.desktop) {
+        try { await this.host.call('savePreferences', { local_mode: false }); }
+        catch (error) { this.showError(error); }
+      }
+      this.login();
+    }
   }
   dispose(): void { this.disposed = true; this.stopWindow(); clearInterval(this.timer); document.removeEventListener('visibilitychange', this.visibility); this.page?.dispose(); this.resources.dispose(); this.api.close(); this.root.replaceChildren(); }
 }

@@ -50,6 +50,10 @@ test('narrow navigation and strict CSP render real controls without a canvas eng
 });
 test('system fonts, compact breakpoints and keyboard composition preserve an open form across polling', async ({ page }, info) => {
   await login(page); await page.evaluate(() => document.fonts.ready);
+  const toggle = page.locator('.collapse'); await expect(toggle.locator('svg')).toBeVisible(); await expect(toggle).toHaveAccessibleName('收起菜单');
+  await page.locator('.sidebar').screenshot({ path: info.outputPath('sidebar-expanded-light.png') });
+  await toggle.click(); await expect(toggle).toHaveAccessibleName('展开菜单'); await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await page.locator('.sidebar').screenshot({ path: info.outputPath('sidebar-collapsed-light.png') }); await toggle.click();
   for (const [width, columns] of [[1440, 6], [1024, 3], [720, 2], [390, 2], [300, 1]]) {
     await page.setViewportSize({ width, height: 900 });
     const count = await page.locator('.metrics').evaluate(element => getComputedStyle(element).gridTemplateColumns.split(' ').length); expect(count).toBe(columns);
@@ -59,6 +63,8 @@ test('system fonts, compact breakpoints and keyboard composition preserve an ope
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.locator('.nav-foot').getByRole('button', { name: '系统设置', exact: true }).click(); await page.getByRole('button', { name: '深色', exact: true }).click(); await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await page.locator('.nav-main').getByRole('button', { name: '概览', exact: true }).click(); await expect(page.locator('.metric-card')).toHaveCount(6); await page.screenshot({ path: info.outputPath('overview-1440-dark.png'), fullPage: true });
+  await page.locator('.sidebar').screenshot({ path: info.outputPath('sidebar-expanded-dark.png') }); await toggle.click();
+  await page.locator('.sidebar').screenshot({ path: info.outputPath('sidebar-collapsed-dark.png') }); await toggle.click();
   const fonts = await page.locator('body').evaluate(element => getComputedStyle(element).fontFamily); expect(fonts).toMatch(/system|apple|Segoe/); expect(await page.locator('canvas').count()).toBe(0);
   await page.evaluate(() => { document.documentElement.style.zoom = '125%'; });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);

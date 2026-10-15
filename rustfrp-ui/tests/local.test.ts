@@ -98,7 +98,7 @@ describe('local status reads stay bounded and platform-aware', () => {
 describe('native Agent actions and applied data', () => {
   it('uses the enrollment token once, blocks repeated submission and clears the field on success', async () => {
     const h = harness(); recordLocal(h.prefs).configFile = ''; const page = await mounted(h);
-    click('local-start'); field('enrollToken', 'dummy-once'); const token = document.querySelector<HTMLInputElement>('dialog input[name=enrollToken]')!;
+    click('local-manual-enroll'); field('enrollToken', 'dummy-once'); const token = document.querySelector<HTMLInputElement>('dialog input[name=enrollToken]')!;
     const base = h.call.getMockImplementation()!; let resolve!: (value: Json) => void;
     h.call.mockImplementation((action, args) => action === 'localStart' ? new Promise<Json>(done => { resolve = done; }) : base(action, args));
     submit(); submit(); expect(h.call.mock.calls.filter(([action]) => action === 'localStart')).toHaveLength(1); expect(document.querySelector<HTMLButtonElement>('[data-testid=dialog-cancel]')!.disabled).toBe(true);
@@ -107,12 +107,12 @@ describe('native Agent actions and applied data', () => {
     h.setStatus(fixture); await page.refresh(); expect(document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.disabled).toBe(true); expect(document.querySelector<HTMLButtonElement>('[data-testid=local-settings]')!.disabled).toBe(true);
   });
   it('starts standalone mode without credentials, stops with confirmation and restores action eligibility', async () => {
-    const h = harness(); const page = await mounted(h); click('local-start'); expect(document.querySelector('dialog input[name=enrollToken]')).toBeNull(); submit(); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull()); expect(h.calls).toContainEqual(['localStart', { enrollToken: '' }]);
+    const h = harness(); const page = await mounted(h); click('local-start'); expect(document.querySelector('dialog')).toBeNull(); await vi.waitFor(() => expect(h.context.refresh).toHaveBeenCalledOnce()); expect(h.calls).toContainEqual(['localStart', { enrollToken: '' }]);
     h.setStatus(fixture); await page.refresh(); click('local-stop'); expect(document.querySelector('dialog')!.textContent).toContain('本机隧道将中断'); submit(); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull()); expect(h.calls).toContainEqual(['localStop', {}]);
     h.setStatus(null); await page.refresh(); expect(document.querySelector<HTMLButtonElement>('[data-testid=local-stop]')!.disabled).toBe(true); expect(document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.disabled).toBe(false);
   });
   it('shows uncertain start failure and prevents another submission until the user refreshes', async () => {
-    const h = harness(); recordLocal(h.prefs).configFile = ''; await mounted(h); click('local-start'); field('enrollToken', 'dummy-once');
+    const h = harness(); recordLocal(h.prefs).configFile = ''; await mounted(h); click('local-manual-enroll'); field('enrollToken', 'dummy-once');
     h.call.mockRejectedValueOnce(new ApiError(0, 'local_timeout', '启动尚未确认', true)); submit(); await vi.waitFor(() => expect(document.querySelector('dialog')!.textContent).toContain('不要重复提交'));
     expect(document.querySelector<HTMLButtonElement>('[data-testid=dialog-submit]')!.disabled).toBe(true); const attempts = h.call.mock.calls.length; submit(); expect(h.call.mock.calls).toHaveLength(attempts); click('dialog-cancel'); expect(document.querySelector('dialog')).toBeNull();
   });
@@ -150,15 +150,33 @@ describe('guided computer connection', () => {
     h.context.admin = { id: 'a', name: 'preview', role: 'owner', disabled_at: null };
     return vi.spyOn(h.context.api, 'request').mockImplementation(async operation => operation === 'nodes' ? [node] : { token: 'one-time-test-token' });
   }
+  it('explains insufficient permissions without opening technical settings or creating credentials', async () => {
+    const h = harness(); owner(h); h.context.admin!.role = 'viewer';
+    await expect(connectComputer(h.context)).rejects.toThrow('当前账号没有接入电脑的权限'); expect(document.querySelector('dialog')).toBeNull();
+  });
   it('offers a working first connection instead of disabled controls and hides irrelevant tabs', async () => {
     const h = harness(); delete h.prefs.local; await mounted(h);
     expect(document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.disabled).toBe(false);
-    expect(document.querySelector('[data-testid=local-start]')!.textContent).toBe('连接此电脑');
+    expect(document.querySelector('[data-testid=local-start]')!.textContent).toBe('登录并连接此电脑');
     expect(document.querySelector<HTMLElement>('[data-testid=local-tab-status]')!.parentElement!.hidden).toBe(true);
     click('local-login-entry'); expect(h.context.logout).toHaveBeenCalledOnce();
-    click('local-start'); await vi.waitFor(() => expect(document.querySelector('dialog')).not.toBeNull());
-    expect(document.querySelector('details')?.open).toBe(false);
-    click('local-login'); expect(h.context.logout).toHaveBeenCalledTimes(2); expect(document.querySelector('dialog')).toBeNull();
+    click('local-start'); await vi.waitFor(() => expect(h.context.logout).toHaveBeenCalledTimes(2)); expect(document.querySelector('dialog')).toBeNull();
+    await localSettings(h.context); expect(document.querySelector('details')?.open).toBe(false);
+    click('local-login'); expect(h.context.logout).toHaveBeenCalledTimes(3); expect(document.querySelector('dialog')).toBeNull();
+  });
+  it('treats saved connection settings as unenrolled and sends the main action to login', async () => {
+    const h = harness(); recordLocal(h.prefs).configFile = ''; recordLocal(h.prefs).controller = '127.0.0.1:7000';
+    h.context.loginLocal = vi.fn().mockResolvedValue(undefined); await mounted(h);
+    expect(document.body.textContent).toContain('此电脑尚未接入'); expect(document.body.textContent).not.toContain('恢复运行');
+    click('local-start'); await vi.waitFor(() => expect(h.context.loginLocal).toHaveBeenCalledOnce());
+    expect(document.querySelector('[name=enrollToken]')).toBeNull(); expect(h.calls.some(([action]) => action === 'localStart')).toBe(false);
+  });
+  it('restarts an enrolled computer without showing a token form or minting credentials', async () => {
+    const h = harness(); recordLocal(h.prefs).configFile = ''; const base = h.call.getMockImplementation()!;
+    h.call.mockImplementation(async (action, args) => action === 'info' ? { local_enrolled: true } : base(action, args)); await mounted(h);
+    expect(document.querySelector('[data-testid=local-start]')!.textContent).toBe('启动连接');
+    click('local-start'); click('local-start'); await vi.waitFor(() => expect(h.context.refresh).toHaveBeenCalledOnce());
+    expect(h.call.mock.calls.filter(([action]) => action === 'localStart')).toEqual([['localStart', { enrollToken: '' }]]); expect(document.querySelector('dialog')).toBeNull();
   });
   it('keeps custom paths and certificates through collapsed advanced settings and validates manual input', async () => {
     const h = harness(); recordLocal(h.prefs).configFile = ''; recordLocal(h.prefs).caFile = '/custom/ca'; recordLocal(h.prefs).tlsPin = 'ff';

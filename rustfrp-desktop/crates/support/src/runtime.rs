@@ -95,9 +95,17 @@ impl Runtime {
             None
         };
         match action {
-            "info" => Ok(
-                json!({"desktop":true,"version":self.version,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"local_defaults":{"binary":lifecycle::default_binary(&self.system.root),"stateDir":self.system.root.join("agent"),"name":"本机"}}),
-            ),
+            "info" => {
+                let configuration = self.configuration().await?;
+                let enrolled = if configuration.config_file.is_empty() {
+                    lifecycle::Backend::enrolled(&self.system, &configuration).await?
+                } else {
+                    false
+                };
+                Ok(
+                    json!({"desktop":true,"version":self.version,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"local_enrolled":enrolled,"local_defaults":{"binary":lifecycle::default_binary(&self.system.root),"stateDir":self.system.root.join("agent"),"name":"本机"}}),
+                )
+            }
             "preferences" => Ok(self.preferences().await),
             "updateStatus" => serde_json::to_value(self.updates.status())
                 .map_err(Error::io_context("更新状态无效")),
@@ -332,6 +340,49 @@ fn argument<'a>(value: &'a Value, key: &str) -> Result<&'a str, Error> {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn info_distinguishes_saved_settings_from_enrollment_without_exposing_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = runtime(directory.path());
+        let state = directory.path().join("agent");
+        std::fs::create_dir_all(&state).unwrap();
+        let identity = state.join("identity.json");
+        let key = rustfrp_core::identity::DeviceKey::generate()
+            .unwrap()
+            .to_hex();
+        std::fs::write(&identity, json!({"key":key,"client_id":null}).to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            app.command("info", json!({})).await.unwrap()["local_enrolled"],
+            false
+        );
+        std::fs::write(
+            &identity,
+            json!({"key":key,"client_id":"client-test"}).to_string(),
+        )
+        .unwrap();
+        let info = app.command("info", json!({})).await.unwrap();
+        assert_eq!(info["local_enrolled"], true);
+        assert!(!info.to_string().contains(&key));
+        assert!(!info.to_string().contains("client-test"));
+        std::fs::write(&identity, b"corrupt").unwrap();
+        assert!(app.command("info", json!({})).await.is_err());
+        assert_eq!(std::fs::read(&identity).unwrap(), b"corrupt");
+        app.preferences
+            .lock()
+            .await
+            .as_object_mut()
+            .unwrap()
+            .insert("local".into(), json!({"configFile":"/test/frpc.toml"}));
+        assert_eq!(
+            app.command("info", json!({})).await.unwrap()["local_enrolled"],
+            false
+        );
+    }
     #[tokio::test]
     async fn injected_startup_roundtrips_through_commands_without_replacing_the_users_definition() {
         let root = tempfile::tempdir().unwrap();
@@ -601,6 +652,7 @@ mod tests {
         let app = runtime(directory.path());
         let info = app.command("info", json!({})).await.unwrap();
         assert_eq!(info["version"], "test-version");
+        assert_eq!(info["local_enrolled"], false);
         assert_eq!(
             info["local_defaults"]["stateDir"],
             directory.path().join("agent").to_string_lossy().as_ref()

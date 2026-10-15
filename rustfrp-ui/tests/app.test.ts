@@ -43,7 +43,9 @@ describe('shared application lifecycle', () => {
     localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'clients', id: 'c' }));
     const { app } = harness('owner', true, host); await app.start(); await vi.waitFor(() => expect(document.body.textContent).toContain('中文 NAS'));
     expect(document.documentElement.dataset.theme).toBe('dark'); expect(document.documentElement.dataset.collapsed).toBe('true'); expect(host.call).toHaveBeenCalledWith('selectController', { url: 'https://controller.example.com' });
+    expect(document.querySelector('.collapse svg')).not.toBeNull(); expect(document.querySelector('.collapse')!.getAttribute('aria-label')).toBe('展开菜单');
     (document.querySelector('.collapse') as HTMLButtonElement).click(); expect(host.call).toHaveBeenCalledWith('savePreferences', { sidebar_collapsed: false });
+    expect(document.querySelector('.collapse')!.getAttribute('aria-label')).toBe('收起菜单'); expect(document.querySelector('.collapse')!.getAttribute('aria-expanded')).toBe('true');
     app.navigate('tunnels'); app.navigate('nodes'); app.navigate('settings', 'appearance'); await vi.waitFor(() => expect(document.body.textContent).toContain('跟随系统')); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('系统设置'); expect(host.call).toHaveBeenCalledWith('savePreferences', { local_mode: false });
   });
   it('starts native local mode without a controller session and keeps local access separate from admin navigation', async () => {
@@ -67,6 +69,37 @@ describe('shared application lifecycle', () => {
     const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() };
     localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'toString' })); const first = harness('viewer', true, host); await first.app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));
     first.app.dispose(); localStorage.setItem('rustfrp.page', 'not-json'); const second = harness('viewer', true, host); await second.app.start(); expect(localStorage.getItem('rustfrp.page')).toBeNull(); second.app.navigate('tunnels'); second.app.dispose(); await Promise.resolve(); expect(document.getElementById('app')!.children).toHaveLength(0);
+  });
+  it('continues a configured but unenrolled local computer from login directly to node selection', async () => {
+    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true, local: { binary: '/agent', stateDir: '/identity', controller: '127.0.0.1:7000' } } : action === 'info' ? { local_enrolled: false, local_defaults: { binary: '/agent', stateDir: '/identity', name: '本机' } } : null), request: vi.fn() };
+    const { app, requests } = harness('owner', false, host); await app.start();
+    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-start]')).not.toBeNull());
+    document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click();
+    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull());
+    expect(document.querySelector<HTMLInputElement>('#login-server')!.value).toBe('http://127.0.0.1:9674');
+    document.querySelector<HTMLInputElement>('#login-name')!.value = 'preview'; document.querySelector<HTMLInputElement>('#login-password')!.value = 'test password';
+    document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
+    await vi.waitFor(() => expect(document.querySelector('dialog select[name=node]')).not.toBeNull());
+    expect(document.querySelector('[data-testid=page-title]')!.textContent).toBe('本机模式');
+    expect(document.querySelector('dialog [name=enrollToken]')).toBeNull(); expect(requests.some(request => request.path.endsWith('/enroll-tokens'))).toBe(false);
+    document.querySelector<HTMLButtonElement>('[data-testid=dialog-cancel]')!.click();
+  });
+  it('finishes persisting local mode before exposing a login that selects a Controller', async () => {
+    let save!: (value: Json) => void;
+    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true } : action === 'savePreferences' ? new Promise(resolve => { save = resolve; }) : action === 'localStatus' ? null : {}), request: vi.fn() };
+    const { app } = harness('owner', false, host); await app.start(); await vi.waitFor(() => { const action = document.querySelector<HTMLButtonElement>('[data-testid=local-start]'); expect(action).toBeDefined(); expect(action!.disabled).toBe(false); });
+    document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click(); await vi.waitFor(() => expect(save).toBeDefined());
+    expect(document.querySelector('#login-name')).toBeNull(); save(null);
+    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull()); expect(host.call).not.toHaveBeenCalledWith('selectController', expect.anything());
+  });
+  it('shows a permission failure after successful local login in the current page', async () => {
+    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true } : action === 'info' ? { local_enrolled: false } : null), request: vi.fn() };
+    const { app } = harness('viewer', false, host); await app.start();
+    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-start]')).not.toBeNull()); document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click();
+    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull()); document.querySelector<HTMLInputElement>('#login-name')!.value = 'reader'; document.querySelector<HTMLInputElement>('#login-password')!.value = 'test password';
+    document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
+    await vi.waitFor(() => expect(document.querySelector('.toast.danger')?.textContent).toContain('当前账号没有接入电脑的权限'));
+    expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('本机模式'); expect(document.querySelector('dialog')).toBeNull();
   });
   it('native login selection and login errors remain actionable without storing passwords', async () => {
     const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() }; const { app, fetcher } = harness('owner', false, host); await app.start();

@@ -32,7 +32,7 @@ export async function localSettings(context: Context): Promise<void> {
     if (group) advanced.append(group);
   }
   dialog.content.append(advanced);
-  if (!context.admin) dialog.content.prepend(el('div', 'connection-guide', el('strong', '', '推荐：登录后自动接入'), el('p', 'muted-text', '选择服务端节点即可，地址和证书由应用填写。'), button('登录管理服务', () => { dialog.close(); return context.logout(); }, { id: 'local-login' })));
+  if (!context.admin) dialog.content.prepend(el('div', 'connection-guide', el('strong', '', '推荐：登录后自动接入'), el('p', 'muted-text', '选择服务端节点即可，地址和证书由应用填写。'), button('登录管理服务', () => { dialog.close(); return (context.loginLocal ?? context.logout)(); }, { id: 'local-login' })));
   const file = dialog.control('configFile');
   file?.closest('.form-field')?.append(button('选择文件…', async () => {
     const selected = await context.host.call('pickFile', { kind: 'config' });
