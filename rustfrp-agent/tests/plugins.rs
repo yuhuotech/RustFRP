@@ -7,6 +7,7 @@
 )]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rustfrp_agent::client::{self, ClientConfig, Event, ProxyCfg};
@@ -24,6 +25,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 const T: Duration = Duration::from_secs(10);
+static NEXT_SITE: AtomicU64 = AtomicU64::new(0);
 
 struct Rig {
     stop: CancellationToken,
@@ -344,12 +346,13 @@ async fn http_proxy_supports_connect_plain_requests_and_basic_auth() {
 
 fn site() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "rfrp-static-{}-{}",
+        "rfrp-static-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_SITE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(dir.join("docs/sub")).unwrap();
     std::fs::create_dir_all(dir.join("empty")).unwrap();
