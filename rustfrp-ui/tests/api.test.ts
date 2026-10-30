@@ -19,7 +19,7 @@ describe('Controller request contract and session boundary', () => {
   it('uses browser cookies and attaches CSRF only to writes', async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(response({ csrf: 'test-csrf', admin: { id: 'a' } })).mockImplementation(() => Promise.resolve(response({ ok: true })));
     const api = new ApiClient(undefined, fetcher);
-    await api.request('login', { body: { name: 'root', password: 'test' } });
+    await api.request('login', { body: { token: 'test-management-token' } });
     expect(fetcher.mock.calls[0][1].headers).toMatchObject({ 'x-rustfrp-admin': '1' });
     await api.request('patchClient', { id: 'id', body: { reason: '维护' } });
     expect(fetcher.mock.calls[1][1]).toMatchObject({ credentials: 'same-origin', method: 'PATCH', headers: { 'x-csrf-token': 'test-csrf' } });

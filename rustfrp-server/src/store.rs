@@ -50,6 +50,30 @@ fn admin_from(r: &Row<'_>) -> rusqlite::Result<Admin> {
 }
 const ADMIN_COLS: &str = "id, name, role, disabled_at, created_at";
 
+/// Bind the single configuration credential to existing session storage. Rotation
+/// revokes sessions without deleting user data or retaining past token hashes.
+pub fn bind_management_token(c: &mut Connection, digest: &str, now: i64) -> Res<Admin> {
+    let tx = c.transaction()?;
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT password_hash FROM admins WHERE id = '__management__'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if previous.as_deref() != Some(digest) {
+        tx.execute("DELETE FROM admin_sessions", [])?;
+    }
+    tx.execute("INSERT INTO admins (id,name,password_hash,role,created_at,disabled_at) VALUES ('__management__','管理 token',?1,'owner',?2,NULL) ON CONFLICT(id) DO UPDATE SET password_hash=excluded.password_hash,role='owner',disabled_at=NULL", params![digest,now])?;
+    let admin = tx.query_row(
+        &format!("SELECT {ADMIN_COLS} FROM admins WHERE id = '__management__'"),
+        [],
+        admin_from,
+    )?;
+    tx.commit()?;
+    Ok(admin)
+}
+
 /// 创建管理员（`password_hash` 为已计算好的哈希）。
 pub fn create_admin(
     c: &Connection,

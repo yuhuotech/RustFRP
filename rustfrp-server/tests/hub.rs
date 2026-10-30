@@ -32,6 +32,7 @@ async fn start() -> (Server, std::path::PathBuf) {
         store::new_id()
     ));
     let cfg = Config {
+        admin_token: "test-management-token".into(),
         db_path: path.clone(),
         http_addr: "127.0.0.1:0".into(),
         edge_addr: "127.0.0.1:0".into(),
@@ -361,6 +362,14 @@ async fn enrollment_rejections() {
     };
 
     // 未知令牌 / 已过期 / 已撤销 / 已使用。
+    assert!(rejected(agent(
+        &server,
+        key.clone(),
+        None,
+        Some("test-management-token")
+    ))
+    .await
+    .contains("enroll token"));
     let e = rejected(agent(&server, key.clone(), None, Some("rfrp_unknown"))).await;
     assert!(
         e.contains("invalid, used, revoked or expired enroll token"),
@@ -491,6 +500,7 @@ async fn startup_errors() {
     let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let busy_addr = busy.local_addr().unwrap().to_string();
     let base = || Config {
+        admin_token: "test-management-token".into(),
         db_path: std::env::temp_dir().join(format!(
             "rustfrp-err-{}-{}.db",
             std::process::id(),
@@ -810,6 +820,7 @@ async fn controller_accepts_explicit_edge_identity_and_rejects_bad_material() {
     )
     .unwrap();
     let cfg = rustfrp_server::config::Config {
+        admin_token: "test-management-token".into(),
         db_path: dir.join("test.db"),
         http_addr: "127.0.0.1:0".into(),
         edge_addr: "127.0.0.1:0".into(),

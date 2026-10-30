@@ -140,6 +140,7 @@ async fn managed_devices_reach_each_other_privately_through_a_visitor() {
     ));
     let server = app::start(
         Config {
+            admin_token: "test-management-token".into(),
             db_path: path.clone(),
             http_addr: "127.0.0.1:0".into(),
             edge_addr: "127.0.0.1:0".into(),

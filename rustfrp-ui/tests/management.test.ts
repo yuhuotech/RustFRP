@@ -193,7 +193,7 @@ describe('settings, enrollment, logs and audit', () => {
     const call = vi.mocked(h.context.host.call); const prefs: RecordValue = { close_to_tray: false, lightweight: false, notifications: false };
     call.mockImplementation(async action => action === 'preferences' ? prefs : action === 'startup' ? false : action === 'updateStatus' ? { disabled: 'fixture key missing' } : { version: '0.1.0' });
     await mount(settingsPage(h.context), h.context); click('switch-controller'); expect(h.context.logout).toHaveBeenCalled();
-    [...document.querySelectorAll('button')].find(control => control.textContent === '管理本机')!.click(); expect(h.context.navigate).toHaveBeenCalledWith('local'); click('setting-appearance'); expect(h.context.navigate).toHaveBeenCalledWith('settings', 'appearance');
+    click('setting-appearance'); expect(h.context.navigate).toHaveBeenCalledWith('settings', 'appearance');
     await mount(settingsPage(h.context, 'appearance'), h.context); for (const label of ['浅色', '深色', '跟随系统']) [...document.querySelectorAll('button')].find(control => control.textContent === label)!.click(); expect(call).toHaveBeenCalledWith('savePreferences', { theme: 'system' }); expect(document.documentElement.dataset.theme).toBe('light');
     await mount(settingsPage(h.context, 'desktop'), h.context);
     for (const label of ['关闭窗口保留托盘', '隐藏后释放窗口', '设备状态通知']) { const check = document.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!; expect(check.checked).toBe(false); check.checked = true; check.dispatchEvent(new Event('change')); await vi.waitFor(() => expect(check.disabled).toBe(false)); }
@@ -203,13 +203,11 @@ describe('settings, enrollment, logs and audit', () => {
   it('about pages retain safe external actions and native update status while web hides system controls', async () => {
     const h = harness(); await mount(settingsPage(h.context, 'about'), h.context); for (const label of ['官网', 'Release']) [...document.querySelectorAll('button')].find(control => control.textContent === label)!.click(); expect(h.context.host.call).toHaveBeenCalledWith('openUrl', expect.objectContaining({ url: 'https://rustfrp.com' }));
     Object.defineProperty(h.context.host, 'desktop', { value: true }); vi.mocked(h.context.host.call).mockImplementation(async (action): Promise<Json> => action === 'preferences' ? {} : action === 'updateStatus' ? { disabled: 'missing fixture key' } : { version: '0.1.0' }); const page = settingsPage(h.context, 'about'); await mount(page, h.context); await page.refresh(true); expect(document.body.textContent).toContain('missing fixture key'); expect(settingSections(h.context).some(([id]) => id === 'desktop')).toBe(true);
-    h.context.admin = null; await mount(settingsPage(h.context), h.context); expect(document.body.textContent).toContain('未登录'); expect(document.body.textContent).toContain('本机模式');
+    h.context.admin = null; await mount(settingsPage(h.context), h.context); expect(document.body.textContent).toContain('未连接'); expect(document.body.textContent).toContain('单管理 token');
   });
-  it('creates admins, refuses empty protected-owner edits and renders expired and revoked credentials without raw tokens', async () => {
-    const h = harness(); await mount(settingsPage(h.context, 'admins'), h.context); click('new-admin'); field('name', '审核员'); field('password', 'fixture password'); field('role', 'viewer'); await reasonAndSave(h.writes); expect(h.writes[0]).toMatchObject({ operation: 'createAdmin', args: { body: { name: '审核员', role: 'viewer' } } }); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
-    click('edit-admin-a'); field('reason', '检查'); submit(); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toContain('填写要修改')); expect(h.writes).toHaveLength(1); document.querySelector<HTMLDialogElement>('dialog')!.close();
-    h.data['api-tokens'] = [{ id: 'expired', name: '过去', scope: 'future.scope', expires_at: 1, revoked_at: null }, { id: 'revoked', name: '已撤销', scope: 'admin', expires_at: 1, revoked_at: 2 }]; await mount(settingsPage(h.context, 'api'), h.context); expect(document.body.textContent).toContain('future.scope'); expect(document.body.textContent).toContain('已过期'); expect(document.querySelector('[data-testid=revoke-api-token-revoked]')).toBeNull();
-    h.data['enroll-tokens'] = [h.data['enroll-tokens'] as Json].flatMap(value => Array.isArray(value) ? value : []); await mount(settingsPage(h.context, 'enroll'), h.context); click('revoke-enroll-tok'); await reasonAndSave(h.writes, 2); expect(h.writes[1].operation).toBe('revokeEnrollToken'); await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull()); click('new-enroll-token'); await vi.waitFor(() => expect(document.querySelector('dialog h2')!.textContent).toBe('接入客户端'));
+  it('keeps device enrollment separate from the management credential', async () => {
+    const h = harness(); await mount(settingsPage(h.context, 'enroll'), h.context); click('revoke-enroll-tok'); await reasonAndSave(h.writes); expect(h.writes[0].operation).toBe('revokeEnrollToken');
+    await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull()); click('new-enroll-token'); await vi.waitFor(() => expect(document.querySelector('dialog h2')!.textContent).toBe('接入客户端'));
   });
   it('enrollment recognizes expiration, revocation, missing IDs and read failures while preserving once-only credentials', async () => {
     const h = harness(); h.data.nodes = []; await enroll(h.context); expect(document.querySelector('dialog')).toBeNull(); expect(document.body.textContent).toContain('没有可接入');
@@ -226,18 +224,11 @@ describe('settings, enrollment, logs and audit', () => {
     h.data.audit = entries(11000); h.context.resources.invalidate(); await page.refresh(); expect(document.body.textContent).toContain('1000 条'); await page.refresh(true); expect(document.body.textContent).toContain('本次加载 100 条');
     h.fetcher.mockRejectedValue(new Error('offline')); click('audit-older'); await vi.waitFor(() => expect(h.context.showError).toHaveBeenCalled()); expect(document.body.textContent).toContain('本次加载 100 条');
   });
-  it('honors settings permissions and protects the current and last owner', async () => {
-    const viewer = harness('viewer'); expect(settingSections(viewer.context).map(([id]) => id)).toEqual(['account', 'appearance', 'about']);
-    const h = harness(); await mount(settingsPage(h.context, 'admins'), h.context); click('edit-admin-a');
-    expect(document.querySelector<HTMLSelectElement>('[name=role]')!.disabled).toBe(true); expect(document.querySelector<HTMLInputElement>('[name=disabled]')!.disabled).toBe(true);
-    field('password', 'new test password'); await reasonAndSave(h.writes); expect(h.writes[0].args.body).toEqual({ password: 'new test password', reason: '维护验证' });
-    await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull()); click('edit-admin-b'); field('role', 'operator'); await reasonAndSave(h.writes, 2); expect(h.writes[1].args.body?.role).toBe('operator');
+  it('does not expose multiple administrators or management tokens', async () => {
+    const h = harness(); expect(settingSections(h.context).map(([id]) => id)).not.toContain('admins'); expect(settingSections(h.context).map(([id]) => id)).not.toContain('api');
+    await mount(settingsPage(h.context, 'admins'), h.context); expect(document.body.textContent).toContain('单管理 token'); expect(document.querySelector('[data-testid=new-admin]')).toBeNull();
   });
-  it('creates and revokes API tokens with scopes and a one-time private dialog', async () => {
-    const h = harness(); await mount(settingsPage(h.context, 'api'), h.context); click('new-api-token'); field('name', 'CI'); field('scope', 'tunnels'); await reasonAndSave(h.writes);
-    await vi.waitFor(() => expect(document.querySelector('dialog h2')?.textContent).toBe('保存 API Token')); expect(document.querySelector<HTMLTextAreaElement>('dialog textarea')!.value).toBe('test-api-once');
-    document.querySelector<HTMLDialogElement>('dialog')!.close(); expect(document.body.textContent).not.toContain('test-api-once'); click('revoke-api-token-api'); await reasonAndSave(h.writes, 2); expect(h.writes[1].operation).toBe('revokeApiToken');
-  });
+
   it('creates enrollment with selected node and detects the one-time token being used', async () => {
     const h = harness(); await enroll(h.context); field('name', '开发设备'); field('node_id', 'edge'); await reasonAndSave(h.writes);
     expect(h.writes[0]).toMatchObject({ operation: 'createEnrollToken', args: { body: { node_id: 'edge', kind: 'client', ttl_minutes: 60 } } });

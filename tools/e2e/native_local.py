@@ -91,7 +91,7 @@ def main():
             assert len(body) <= 2 * 1024 * 1024
             return json.loads(body) if body else None
 
-    api("POST", "/auth/login", {"name": "preview", "password": os.environ.get("RUSTFRP_E2E_PASSWORD", "native ui test password")})
+    api("POST", "/auth/login", {"token": os.environ.get("RUSTFRP_E2E_ADMIN_TOKEN", "native-ui-test-management-token")})
     csrf = api("GET", "/auth/me")["csrf"]
     node = api("GET", "/node")
     evidence = {"version": 1, "platform": sys.platform, "managed": {}, "standalone": {}}

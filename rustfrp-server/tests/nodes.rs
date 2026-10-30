@@ -45,6 +45,7 @@ fn cleanup(path: &std::path::Path) {
 
 fn config(path: &std::path::Path, node_addr: &str) -> Config {
     Config {
+        admin_token: "test-management-token".into(),
         db_path: path.to_path_buf(),
         http_addr: "127.0.0.1:0".into(),
         edge_addr: "127.0.0.1:0".into(),

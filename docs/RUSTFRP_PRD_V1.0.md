@@ -1,5 +1,7 @@
 # RustFRP 需求说明书（PRD）V1.0
 
+> 2026-10-15 用户确认的管理入口修订：只使用一个服务端 `[admin].token`，Web 与桌面保持相同管理流程，地址与 token 验证成功即进入控制台；不再要求账号密码、初始管理员创建、多管理密钥或启动本机 Agent。编辑配置并重启服务生效。该约定替代历史管理登录与账号交互要求，设备接入身份仍独立。具体契约见 `rustfrp-protocol/MANAGEMENT_AUTH.md`。
+
 > **2026-10-14 架构决策修订**：G6 的 Flutter 单工程已由 `docs/UI_REFACTOR_PLAN_20261014.md` 替换为 `rustfrp-ui/` 原生 HTML/CSS/TypeScript + Tauri 系统 WebView；Web 与桌面共用同一 UI 构建。本文中 Flutter/Dart 工程、平台导入和构建描述为历史方案，不再是当前实现要求；当前实施/验收见 `docs/UI_REFACTOR_STATUS.md`。
 
 > 状态：草案，待评审　｜　编制日期：2026-10-11

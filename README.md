@@ -64,9 +64,13 @@ make e2e
 ./start_dev.sh
 ```
 
+首次运行会创建 `target/dev-panel/server.toml`。修改其中 `[admin].token`，再运行脚本即可。Web 和桌面登录统一只用管理 token，不需要用户名、密码或启动本机 Agent；管理 token 与客户端/节点接入令牌独立。配置修改后重启生效，token 原文不保存到浏览器或桌面偏好。
+
+直接启动服务端：复制 `rustfrp-server.example.toml` 为 `rustfrp-server.toml`，修改 `token = "change-me"` 后运行 `rustfrp-server run`（或 `run -c <配置路径>`）。也可用 `RUSTFRP_ADMIN_TOKEN` 覆盖配置。空值/示例占位值会明确报错。
+
 浏览器打开 <http://localhost:9674>。macOS 桌面体验先运行 `make desktop-build`，再打开 `rustfrp-desktop/target/release/bundle/macos/RustFRP.app`，Controller 地址使用 `http://127.0.0.1:9674`。预览服务默认把 Web、内置 Edge 和独立节点接入分别绑定在 `9674`、`127.0.0.1:17000`、`127.0.0.1:17001`；结束后运行 `./start_dev.sh stop`。
 
-桌面本机模式可直接点击「登录管理服务」，登录页「使用本机管理服务」一键填写本地地址。管理员登录后从「本机模式 → 连接此电脑」选择节点并启动，应用自动处理地址、证书和一次性接入凭据。手动连接、已有 frpc 配置与高级设置仍可使用，详见 [本机模式说明](docs/LOCAL_AGENT.md)。
+桌面默认管理地址 `http://127.0.0.1:9674`；Web 默认当前服务器。填写管理 token 后直接进入相同控制台。Web 选择其他服务器时前往目标控制台再认证，不跨站传递 token。旧本机维护能力保留在桌面设置的高级区域，详见 [本机模式说明](docs/LOCAL_AGENT.md)。
 
 生产 HTTPS 反向代理与容器/系统服务样板见 [`deploy/README.md`](deploy/README.md)。静态官网源码见 [`rustfrp-web/`](rustfrp-web/)。Release 工作流及所需凭据见 [`tools/release/README.md`](tools/release/README.md)。
 

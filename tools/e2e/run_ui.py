@@ -67,8 +67,8 @@ def main():
             "RUSTFRP_PUBLIC_HOST": "127.0.0.1",
             "RUSTFRP_PANEL_DIR": str(ROOT / "rustfrp-ui/dist"),
         })
-        password = "native ui test password"
-        subprocess.run([str(server), "admin", "create", "preview"], input=password + "\n", text=True, env=env, cwd=ROOT, check=True, capture_output=True)
+        admin_token = "native-ui-test-management-token"
+        env["RUSTFRP_ADMIN_TOKEN"] = admin_token
         log_path = ROOT / "target/ui/e2e-controller.log"
         log_path.parent.mkdir(exist_ok=True)
         with log_path.open("wb") as log:
@@ -88,7 +88,7 @@ def main():
                         raise RuntimeError(f"Controller did not become ready; inspect {log_path}")
                     time.sleep(0.1)
                 test_env = os.environ.copy()
-                test_env["RUSTFRP_E2E_PASSWORD"] = password
+                test_env["RUSTFRP_E2E_ADMIN_TOKEN"] = admin_token
                 return subprocess.call(command, cwd=ROOT, env=test_env)
             finally:
                 if controller.poll() is None:

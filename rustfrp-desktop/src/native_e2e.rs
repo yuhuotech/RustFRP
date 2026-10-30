@@ -41,7 +41,7 @@ pub async fn native_test_config(window: WebviewWindow) -> Result<Value, Error> {
     native_calls::trusted(&window)?;
     let variable = |name| std::env::var(name).map_err(|_| Error::invalid("本机 E2E 参数缺失"));
     Ok(
-        json!({"controller":"http://127.0.0.1:9674","password":variable("RUSTFRP_E2E_PASSWORD")?,"token":variable("RUSTFRP_NATIVE_E2E_TOKEN")?,"name":variable("RUSTFRP_NATIVE_E2E_NAME")?,"mode":std::env::var("RUSTFRP_NATIVE_E2E_MODE").unwrap_or_else(|_| "full".into())}),
+        json!({"controller":"http://127.0.0.1:9674","adminToken":variable("RUSTFRP_E2E_ADMIN_TOKEN")?,"token":variable("RUSTFRP_NATIVE_E2E_TOKEN")?,"name":variable("RUSTFRP_NATIVE_E2E_NAME")?,"mode":std::env::var("RUSTFRP_NATIVE_E2E_MODE").unwrap_or_else(|_| "full".into())}),
     )
 }
 #[tauri::command]
@@ -58,6 +58,7 @@ pub async fn native_test_report(
     if !matches!(
         stage,
         "local-started"
+            | "authenticated"
             | "window-cycle-start"
             | "window-cycles"
             | "warm-cycles"

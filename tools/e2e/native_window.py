@@ -65,8 +65,8 @@ def main():
             raw = response.read(2*1024*1024+1)
             assert len(raw)<=2*1024*1024
             return json.loads(raw) if raw else None
-    password=os.environ.get("RUSTFRP_E2E_PASSWORD","native ui test password")
-    api("POST","/auth/login",{"name":"preview","password":password})
+    admin_token=os.environ.get("RUSTFRP_E2E_ADMIN_TOKEN","native-ui-test-management-token")
+    api("POST","/auth/login",{"token":admin_token})
     csrf=api("GET","/auth/me")["csrf"]
     node=api("GET","/node")
     name=f"native-window-e2e-{time.time_ns()}"
@@ -88,7 +88,7 @@ def main():
         preferences.write_text(json.dumps({"local":local,"local_mode":True,"controller_url":"http://127.0.0.1:9674","notifications":False,"lightweight":True}))
         if os.name!="nt": preferences.chmod(0o600)
         report=folder/"report.json"
-        env={**os.environ,"HOME":str(home),"LOCALAPPDATA":str(home),"USERPROFILE":str(home),"RUSTFRP_E2E_PASSWORD":password,"RUSTFRP_NATIVE_E2E_TOKEN":token["token"],"RUSTFRP_NATIVE_E2E_NAME":name,"RUSTFRP_NATIVE_E2E_REPORT":str(report)}
+        env={**os.environ,"HOME":str(home),"LOCALAPPDATA":str(home),"USERPROFILE":str(home),"RUSTFRP_E2E_ADMIN_TOKEN":admin_token,"RUSTFRP_NATIVE_E2E_TOKEN":token["token"],"RUSTFRP_NATIVE_E2E_NAME":name,"RUSTFRP_NATIVE_E2E_REPORT":str(report)}
         env.pop("RUSTFRP_DESKTOP_STATE_DIR",None)
         thread=threading.Thread(target=echo.serve_forever,daemon=True); thread.start()
         evidence={}
@@ -112,6 +112,9 @@ def main():
                             detail=f" ({progress[1]}/30)" if stage=="window-cycles" else ""
                             print(f"Native WebView: {stage}{detail}",flush=True)
                             previous=progress
+                            if sys.platform == "darwin" and progress == ("window-cycles", 1):
+                                bundle = executable.parent.parent.parent
+                                subprocess.run(["open", "-a", str(bundle)], check=True, capture_output=True, text=True, timeout=10)
                         if not evidence.get("passed"): raise AssertionError(evidence.get("message","native test failed"))
                         if stage=="local-started" and not single_instance:
                             second=subprocess.Popen([str(executable),"--e2e-secondary"],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)

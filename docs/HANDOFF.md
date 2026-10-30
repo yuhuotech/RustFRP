@@ -1,5 +1,7 @@
 # RustFRP 交接文档
 
+> 最新管理入口：服务端单 TOML `[admin].token`，Web/桌面“管理服务器 + 管理 token → 连接”。没有用户名密码或账号初始化步骤，空值/`change-me` 不启动。修改配置重启生效并吊销旧管理会话，设备身份和隧道保留。`start_dev.sh` 使用 `target/dev-panel/server.toml`。旧本机工具保留在桌面高级维护，历史账号/自动化接口只保留迁移兼容；认证契约见 `rustfrp-protocol/MANAGEMENT_AUTH.md`。下文此前本机引导描述不再作为普通入口。
+
 > 更新于 2026-10-15。项目功能清单见 `docs/IMPLEMENTATION_STATUS.md`；管理 UI 重构、覆盖率和当前验收状态以 `docs/UI_REFACTOR_STATUS.md` 为准。重构计划见 `docs/UI_REFACTOR_PLAN_20261014.md`。
 
 已有 Linux Agent/Controller、Web 管理台、跨主机迁移和离线恢复记录，详见 [双主机验收记录](WAN_ACCEPTANCE_20261013.md)。共享 UI、三引擎浏览器 E2E、真实 macOS WKWebView 和各覆盖率门槛已在本机通过；跨平台宿主、签名 Release、桌面进程树内存对照与窗口恢复性能目标仍保留。当前证据见 [UI 重构验收清单](UI_REFACTOR_STATUS.md)。
@@ -28,7 +30,7 @@ make e2e
 
 管理 UI 使用 `make ui-test ui-cov ui-build ui-e2e`；桌面使用 `make desktop-test desktop-cov desktop-e2e`。`make cov` 包含共享 UI 与桌面 crate。
 
-桌面本机接入已增加简化流程：直接登录入口、本机 Controller 地址快捷填写、管理员选节点后自动配置证书与一次性凭据并启动。手动连接设置将程序/身份目录和证书折叠到高级设置，保留原有自定义值；工具栏与状态分类首个按钮取消额外底部间距。相关用例在 `rustfrp-ui/tests/local.test.ts`、`e2e/local-onboarding.spec.ts` 和真实 WebView E2E，逐项验证结果见 `UI_REFACTOR_STATUS.md`。
+Web 与桌面首次连接只填写管理服务器和管理 token，成功进入相同概览；更换配置 token 后重启会撤销旧管理会话。设备接入流程、程序/身份目录与证书仍保留在桌面高级维护，供已有部署维护使用，不作为管理登录前置。相关用例在 `rustfrp-ui/tests/app.test.ts`、`e2e/permissions.spec.ts`、`rustfrp-server/tests/management_auth.rs` 和真实 WebView E2E，验证结果见 `UI_REFACTOR_STATUS.md`。
 
 本机主操作按宿主 `info.local_enrolled` 读取到的真实身份分流：保存地址不等于接入完成；未接入先登录，成功后自动续接节点选择，已有身份则无令牌直接启动。手动令牌仍在“管理员手动接入”折叠入口保留，不能为了简化流程删除原身份、绕过权限或接受未知证书。
 

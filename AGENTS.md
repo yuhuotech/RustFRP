@@ -1,5 +1,7 @@
 # AGENTS.md — RustFRP 协作约定
 
+> **2026-10-15 管理认证修订**：普通管理入口统一为管理服务器地址 + 配置文件 `[admin].token`，不再使用用户名密码、账号创建或本机 Agent 启动作为登录前置。token 与设备接入凭据分离，修改配置重启生效；保持 Cookie/CSRF/同源/审计和旧设备身份。协议见 `rustfrp-protocol/MANAGEMENT_AUTH.md`，此修订替代下文历史管理员登录描述。
+
 > 给人和 AI 编程助手共同使用。**开始任何工作前先读：** `docs/RUSTFRP_TECH_DESIGN_V1.0.md` §0（两条最高原则）与 `docs/DEVELOPMENT_STANDARDS.md`。
 
 > **涉及 UI 时额外必读：** [`docs/UI_SPEC.md`](docs/UI_SPEC.md)。用户确认的菜单命名、紧凑指标卡、管理表格、详情分组与配色以该文件为准；修改界面约定时同步更新该文件。
@@ -58,7 +60,7 @@ UI 使用 `rustfrp-ui/` 维护的语义化 HTML、原生 CSS 与 TypeScript，We
 - `rustfrp-server` = SQLite（单连接 + spawn_blocking）+ axum 管理 API + **内置 Edge**（`rustfrp-agent::edge`，通过 `Policy` 接入 `DbPolicy`）。
 - 设备接入：Client 用一次性令牌换身份（Ed25519 公钥入库）；之后用签名登录。**配置下发复用隧道连接**（控制流上的 `ServerMsg::Config` 全量快照，Edge 对账增删代理，无 WebSocket）。
 - 代理名即隧道 ID；隧道状态由 Edge 回报（`ProxyEvent`）写回 DB。
-- 管理 API：Cookie 会话 + CSRF + 同源检查 + 登录限流；写操作必须带 `reason` 并与业务同事务写审计。首个管理员只能经 CLI（`rustfrp-server admin create`）创建；其后 Owner 可经 API/面板管理管理员与角色。
+- 管理 API：单配置 `[admin].token` 登录后使用 Cookie 会话 + CSRF + 同源检查 + 登录限流；写操作必须带 `reason` 并与业务同事务写审计。不需要创建账号，token 修改后重启生效；设备接入凭据独立。旧管理员 CLI/API 只保留迁移兼容，普通界面不提供账号/密码/多管理密钥管理。
 
 ## 当前进度
 > 详细逐项状态见 `docs/IMPLEMENTATION_STATUS.md`；此处只给概览。

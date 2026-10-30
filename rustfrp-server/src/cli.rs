@@ -1,4 +1,4 @@
-//! 命令行：`run`（启动服务）与 `admin`（管理员账号维护，唯一的创建途径）。
+//! 命令行：`run [-c file]` 使用单管理 token；`admin` 仅保留旧数据维护兼容。
 
 use std::io::{BufRead, Write};
 
@@ -15,7 +15,7 @@ pub const HELP: &str = "\
 rustfrp-server — RustFRP controller (management API + embedded edge)
 
 USAGE:
-  rustfrp-server run
+  rustfrp-server run [-c rustfrp-server.toml]
   rustfrp-server backup <new-file>
   rustfrp-server admin create <name> [--role owner|admin|operator|viewer]
   rustfrp-server admin list
@@ -24,10 +24,12 @@ USAGE:
   rustfrp-server admin passwd <name>
   rustfrp-server version
 
-The password for `admin create` / `admin passwd` is read from RUSTFRP_ADMIN_PASSWORD,
-or from the first line of standard input. There is no default administrator.
+Management login uses only [admin].token in rustfrp-server.toml.
+Edit the token and restart. It is separate from client authentication tokens.
+Legacy admin commands remain for existing integrations; passwords cannot log in.
 
 ENVIRONMENT:
+  RUSTFRP_CONFIG (rustfrp-server.toml)   RUSTFRP_ADMIN_TOKEN (overrides [admin].token)
   RUSTFRP_DB (rustfrp.db)   RUSTFRP_HTTP (127.0.0.1:8080)   RUSTFRP_EDGE (0.0.0.0:7000)
   RUSTFRP_PROXY_BIND (0.0.0.0)   RUSTFRP_ALLOW_PORTS (e.g. 6000-6100,7000)
   RUSTFRP_VHOST_HTTP / RUSTFRP_VHOST_HTTPS (ports for http / https tunnels)   RUSTFRP_SUBDOMAIN_HOST
@@ -41,6 +43,8 @@ ENVIRONMENT:
 pub enum Cmd {
     /// 启动服务。
     Run,
+    /// 启动并使用指定管理配置文件。
+    RunConfig(String),
     /// 在线一致性快照；目标必须不存在。
     Backup(String),
     /// 创建管理员。
@@ -64,6 +68,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         [] | ["help" | "-h" | "--help"] => Ok(Cmd::Help),
         ["version" | "-v" | "--version"] => Ok(Cmd::Version),
         ["run"] => Ok(Cmd::Run),
+        ["run", "-c" | "--config", path] if !path.is_empty() => Ok(Cmd::RunConfig((*path).into())),
         ["backup", path] if !path.is_empty() => Ok(Cmd::Backup((*path).into())),
         ["admin", "list"] => Ok(Cmd::AdminList),
         ["admin", "create", name] => Ok(Cmd::AdminCreate((*name).into(), Role::Owner)),
@@ -105,7 +110,17 @@ pub async fn execute(
         let _ = writeln!(err, "error: {m}");
         1
     };
-    let cfg = match Config::from_lookup(env) {
+    let config_env = |key: &str| {
+        if key == "RUSTFRP_CONFIG" {
+            match &cmd {
+                Cmd::RunConfig(path) => Some(path.clone()),
+                _ => env(key),
+            }
+        } else {
+            env(key)
+        }
+    };
+    let cfg = match Config::from_lookup(config_env) {
         Ok(c) => c,
         Err(e) => return fail(err, e),
     };
@@ -136,7 +151,7 @@ pub async fn execute(
                 Err(e) => fail(err, e.to_string()),
             }
         }
-        Cmd::Run => {
+        Cmd::Run | Cmd::RunConfig(_) => {
             let log =
                 Logger::from_target("console", Level::Info).unwrap_or_else(|_| Logger::silent());
             match app::start(cfg, log).await {
@@ -231,7 +246,7 @@ async fn admin_command(
                 "password updated for \"{name}\"; all of its sessions were revoked"
             );
         }
-        Cmd::Run | Cmd::Backup(_) | Cmd::Version | Cmd::Help => {}
+        Cmd::Run | Cmd::RunConfig(_) | Cmd::Backup(_) | Cmd::Version | Cmd::Help => {}
     }
     Ok(())
 }

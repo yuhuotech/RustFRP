@@ -873,7 +873,7 @@ mod tests {
             .request(
                 "login",
                 RequestArgs {
-                    body: Some(json!({"name":"root","password":"test"})),
+                    body: Some(json!({"token":"test-management-token"})),
                     ..Default::default()
                 },
             )

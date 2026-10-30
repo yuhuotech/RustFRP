@@ -25,6 +25,10 @@ tauri-plugin-notification = "=2.4.0"
 tauri-plugin-dialog = "=2.7.3"
 tempfile = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSResponder"] }
+
 [build-dependencies]
 tauri-build = { version = "=2.7.2", features = [] }
 

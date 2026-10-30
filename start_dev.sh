@@ -13,6 +13,7 @@ HTTP_PORT=9674
 EDGE_PORT="${DEV_EDGE_PORT:-17000}"
 NODE_PORT="${DEV_NODE_PORT:-17001}"
 DB="${DEV_DB:-$ROOT/target/panel-preview.db}"
+CONFIG="${DEV_CONFIG:-$ROOT/target/dev-panel/server.toml}"
 URL="http://localhost:$HTTP_PORT"
 
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -23,7 +24,7 @@ usage() {
     '  --skip-build：使用现有构建，快速启动。' \
     '  status / stop：查看状态 / 停止此脚本启动的服务。' \
     '  可选环境变量：DEV_EDGE_PORT、DEV_NODE_PORT、DEV_DB。Web 固定使用 9674。' \
-    '  首次初始化：创建 preview 管理员，交互输入密码；也可提供 RUSTFRP_ADMIN_PASSWORD。'
+    '  管理 token：修改 target/dev-panel/server.toml 的 [admin].token 后重启。'
 }
 
 ACTION="${1:-start}"
@@ -126,31 +127,21 @@ fi
 [[ -x "$SERVER" && -f "$ROOT/rustfrp-ui/dist/index.html" ]] || \
   die '缺少构建产物；请先运行 ./start_dev.sh（不带 --skip-build）。'
 mkdir -p "$STATE_DIR" "$(dirname -- "$DB")"
+if [[ ! -f "$CONFIG" ]]; then
+  mkdir -p "$(dirname -- "$CONFIG")"
+  cp rustfrp-server.example.toml "$CONFIG"
+  die "已创建 ${CONFIG}，请修改 [admin].token（不要保留 change-me）后重新启动。"
+fi
 
 # 只传入本地开发配置，避免继承终端中的生产环境 RUSTFRP_* 设置。
 RUNNER=(env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=${TMPDIR:-/tmp}" \
+  "RUSTFRP_CONFIG=$CONFIG" \
   "RUSTFRP_DB=$DB" "RUSTFRP_HTTP=127.0.0.1:$HTTP_PORT" \
   "RUSTFRP_EDGE=127.0.0.1:$EDGE_PORT" "RUSTFRP_NODE_ADDR=127.0.0.1:$NODE_PORT" \
   'RUSTFRP_PROXY_BIND=127.0.0.1' \
   'RUSTFRP_PUBLIC_HOST=127.0.0.1' "RUSTFRP_PANEL_DIR=$ROOT/rustfrp-ui/dist")
-ADMINS="$("${RUNNER[@]}" "$SERVER" admin list)"
-if [[ -z "$ADMINS" ]]; then
-  PASSWORD="${RUSTFRP_ADMIN_PASSWORD:-}"
-  if [[ -z "$PASSWORD" ]]; then
-    [[ -t 0 ]] || die '首次启动需设置密码：在终端运行脚本，或提供 RUSTFRP_ADMIN_PASSWORD（至少 10 个字符）。'
-    read -r -s -p '首次启动，请设置 preview 管理员密码（至少 10 个字符）：' PASSWORD
-    printf '\n'
-    read -r -s -p '再次输入密码：' CONFIRM
-    printf '\n'
-    [[ "$PASSWORD" == "$CONFIRM" ]] || die '两次密码不一致。'
-    unset CONFIRM
-  fi
-  printf '%s\n' "$PASSWORD" | "${RUNNER[@]}" "$SERVER" admin create preview
-  unset PASSWORD
-fi
-unset RUSTFRP_ADMIN_PASSWORD
 
-# 构建和管理员检查完成后再回收旧服务，避免构建失败时造成不必要的停机。
+# 构建和配置文件检查完成后再回收旧服务。
 stop_http_owner
 if lsof -nP -iTCP:"$EDGE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   die "Edge 端口 $EDGE_PORT 已被其他服务占用；可用 DEV_EDGE_PORT 指定其他端口。"
@@ -169,9 +160,8 @@ for ((i = 0; i < 100; i++)); do
     die "服务启动失败，请查看 $LOG_FILE"
   fi
   if curl --fail --silent --max-time 1 "$URL/" > /dev/null; then
-    printf '\n已启动：%s\n管理员：\n%s\n独立节点接入端口：127.0.0.1:%s\n数据库：%s\n日志：%s\n停止：./start_dev.sh stop\n修改 UI 后重启脚本并在浏览器按 ⌘⇧R / Ctrl+Shift+R 强制刷新。\n' \
-      "$URL" "$ADMINS" "$NODE_PORT" "$DB" "$LOG_FILE"
-    if [[ -z "$ADMINS" ]]; then printf 'preview（密码为首次启动时设置的密码）\n'; fi
+    printf '\n已启动：%s\n管理 token 配置：%s（[admin].token）\n独立节点接入端口：127.0.0.1:%s\n数据库：%s\n日志：%s\n停止：./start_dev.sh stop\n' \
+      "$URL" "$CONFIG" "$NODE_PORT" "$DB" "$LOG_FILE"
     exit 0
   fi
   sleep 0.1

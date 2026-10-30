@@ -5,18 +5,33 @@ if (!window.__rustfrpNativeE2E) {
     const invoke = (command, args = {}) => window.__TAURI_INTERNALS__.invoke(command, args);
     const host = (action, args = {}) => invoke('host_command', { action, args });
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-    const visibleFrame = async () => {
+    const visibleFrame = async cycle => {
+      const started = performance.now();
       const deadline = Date.now() + 10000;
       while (document.visibilityState !== 'visible') {
-        if (Date.now() >= deadline) throw new Error('Native WebView did not become visible');
+        if (Date.now() >= deadline) {
+          const nativeVisible = await invoke('native_window_visibility').catch(() => null);
+          throw new Error(`Native WebView did not become visible at cycle ${cycle}; native=${nativeVisible}; focused=${document.hasFocus()}`);
+        }
         await sleep(10);
       }
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const visibleAt = performance.now();
+      let firstFrameAt = 0;
+      let secondFrameAt = 0;
+      await new Promise(resolve => requestAnimationFrame(() => { firstFrameAt = performance.now(); resolve(); }));
+      await new Promise(resolve => requestAnimationFrame(() => { secondFrameAt = performance.now(); resolve(); }));
+      return {
+        visibility_ms: visibleAt - started,
+        first_frame_ms: firstFrameAt - visibleAt,
+        second_frame_ms: secondFrameAt - firstFrameAt,
+        total_ms: secondFrameAt - started,
+      };
     };
     const wait = async (condition, timeout = 30000) => {
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) { const result = await condition(); if (result) return result; await sleep(50); }
-      throw new Error(`Native WebView condition timed out: ${String(condition).slice(0, 220)}`);
+      const formError = [...document.querySelectorAll('.form-error')].find(element => !element.hidden)?.textContent ?? '';
+      throw new Error(`Native WebView condition timed out: ${String(condition).slice(0, 160)}; ${formError.slice(0, 220)}`);
     };
     const bounded = async (operation, timeout, label) => {
       let timer;
@@ -39,9 +54,13 @@ if (!window.__rustfrpNativeE2E) {
     const report = result => { evidence = { ...evidence, ...result }; localStorage.setItem('native-e2e.evidence', JSON.stringify(evidence)); return invoke('native_test_report', { result: evidence }); };
     try {
       const config = await invoke('native_test_config');
+      const measureFrames = config.mode !== 'functional';
       const trayPolicy = await invoke('native_test_tray_policy');
       assert(trayPolicy.show && trayPolicy.exit && trayPolicy.unknown && trayPolicy.left_release && !trayPolicy.right_release, 'Tray actions do not follow the native policy');
       if (['isolated-startup', 'home-startup', 'no-tray-startup'].includes(config.mode)) {
+        // Initial server selection persists its address under the same native
+        // settings lock. Wait for the connection page before probing OS setup.
+        await wait(() => document.querySelector('#login-token') || document.querySelector('.app-shell'));
         const info = await host('info');
         const preferences = await host('preferences');
         assert(info.desktop && info.local_defaults, 'Native startup capabilities are missing');
@@ -54,20 +73,19 @@ if (!window.__rustfrpNativeE2E) {
       if (localStorage.getItem('native-e2e.run') !== config.name) { localStorage.setItem('native-e2e.run', config.name); localStorage.removeItem('native-e2e.phase'); evidence = {}; }
       if (localStorage.getItem('native-e2e.phase') === 'release') {
         await wait(() => document.querySelector('[data-testid="page-title"]')?.textContent === '客户端');
-        const me = await api('me'); assert(me.admin.name === 'preview', 'Native session was lost on WebView restoration');
+        const me = await api('me'); assert(me.admin.name === '管理 token', 'Native session was lost on WebView restoration');
         const local = await host('localStatus'); assert(local.connected, 'Agent stopped after WebView release');
         assert(local.pid === Number(localStorage.getItem('native-e2e.agent-pid')), 'Window release replaced the background Agent');
         await report({ stage: 'restored', passed: true, session_restored: true, page_restored: true, agent_survives_release: true, agent_pid: local.pid });
         return;
       }
-      await wait(() => document.querySelector('[data-testid="local-start"]'));
-      assert(document.querySelector('[data-testid="local-start"]').textContent === '登录并连接此电脑', 'Saved address was mistaken for enrollment');
-      click('local-start'); await wait(() => document.querySelector('#login-name'));
-      field('#login-server', config.controller); field('#login-name', 'preview'); field('#login-password', config.password);
-      click('login-submit'); await wait(() => document.querySelector('dialog select[name="node"]'));
-      assert(!document.querySelector('dialog input[name="enrollToken"]'), 'Login continuation asked the user for a token');
-      click('dialog-cancel'); navigation('overview'); await wait(() => document.querySelectorAll('.metric-card').length === 6);
-      evidence.saved_settings_login = true;
+      await wait(() => document.querySelector('#login-token'));
+      assert(!document.querySelector('#login-name') && !document.querySelector('#login-password'), 'Console still asks for account credentials');
+      field('#login-server', config.controller); field('#login-token', config.adminToken);
+      click('login-submit'); await wait(() => document.querySelectorAll('.metric-card').length === 6);
+      assert(!JSON.stringify(localStorage).includes(config.adminToken), 'Management credential persisted in renderer');
+      evidence.management_token_login = true;
+      await report({ stage: 'authenticated', passed: true, management_token_login: true });
       assert(!document.cookie.includes('rfrp_session'), 'Cookie exposed to JavaScript');
       assert(!(await api('me')).csrf, 'CSRF exposed to JavaScript');
       const rejected = async operation => { try { await operation(); } catch (error) { assert(error?.code === 'invalid_request', 'Unexpected native rejection'); return; } throw new Error('Native boundary accepted an invalid operation'); };
@@ -82,7 +100,7 @@ if (!window.__rustfrpNativeE2E) {
       await rejected(() => host('pickFile', { kind: 'unknown' }));
       await rejected(() => host('rawShell', { command: 'echo unsafe' }));
       await rejected(() => host('selectController', { url: 'https://user:password@example.com' }));
-      assert((await api('me')).admin.name === 'preview', 'Invalid controller selection discarded a valid session');
+      assert((await api('me')).admin.name === '管理 token', 'Invalid controller selection discarded a valid session');
       await rejected(() => api('rawHttp', { body: {} }));
       const cancelId = crypto.randomUUID();
       assert((await invoke('controller_cancel', { requestId: cancelId })).cancelled === false, 'Cancellation claimed an active request before dispatch');
@@ -98,7 +116,7 @@ if (!window.__rustfrpNativeE2E) {
       assert((await host('setStartup', { enabled: false })) === false && (await host('startup')) === false, 'Native login startup did not disable');
       evidence.startup_roundtrip = true;
       for (const section of ['nodes', 'clients', 'tunnels', 'settings', 'overview']) { navigation(section); await sleep(75); assert(document.querySelector('[data-testid="page-title"]'), 'Navigation lost the real page'); }
-      navigation('local'); await wait(() => {const button=document.querySelector('[data-testid="local-start"]'); return button && !button.disabled;});
+      navigation('settings'); await wait(() => document.querySelector('[data-testid="setting-desktop"]')); click('setting-desktop'); await wait(() => document.querySelector('[data-testid="local-maintenance"]')); click('local-maintenance'); await wait(() => {const button=document.querySelector('[data-testid="local-start"]'); return button && !button.disabled;});
       assert(document.querySelector('[data-testid="local-start"]').textContent === '连接此电脑', 'Fresh setup did not offer guided connection');
       click('local-start'); await wait(() => document.querySelector('dialog select[name="node"]'));
       assert(!document.querySelector('dialog input[name="controller"]') && !document.querySelector('dialog input[name="binary"]'), 'Guided setup requires technical paths or addresses');
@@ -125,32 +143,55 @@ if (!window.__rustfrpNativeE2E) {
       const cycleTimings = [];
       for (let cycle = 0; cycle < 30; cycle++) {
         const started = performance.now();
+        const commandStarted = performance.now();
         await bounded(invoke('native_window_cycle', { delayMs: 25 }), 15000, `Native window cycle ${cycle + 1}/30`);
-        await bounded(visibleFrame(), 15000, `Native visible frame ${cycle + 1}/30`);
-        cycleTimings.push(performance.now() - started);
+        const commandMs = performance.now() - commandStarted;
+        const frame = measureFrames ? await bounded(visibleFrame(cycle + 1), 15000, `Native visible frame ${cycle + 1}/30`) : {};
+        cycleTimings.push({ command_ms: commandMs, ...frame, total_ms: performance.now() - started });
         assert(await invoke('native_window_visibility'), 'Native WebView is not visible after its first frame');
         if (cycle === 0 || cycle === 29) await report({ stage: 'window-cycles', passed: true, cycles: cycle + 1 });
       }
       const afterCycles = await bounded(host('localStatus'), 15000, 'Agent status after window cycles');
       assert(afterCycles.pid === local.pid, 'Warm window cycles changed Agent PID');
-      const p95 = values => [...values].sort((a, b) => a - b)[Math.ceil(values.length * 0.95) - 1];
-      await report({ stage: 'warm-cycles', passed: true, cycles: 30, visible_first_frame_p95_ms: p95(cycleTimings), agent_pid: local.pid });
+      const p95 = key => [...cycleTimings].map(sample => sample[key]).sort((a, b) => a - b)[Math.ceil(cycleTimings.length * 0.95) - 1];
+      const rounded = value => Math.round(value * 10) / 10;
+      await report({
+        stage: 'warm-cycles', passed: true, cycles: 30,
+        frame_measurement: measureFrames,
+        ...(measureFrames ? {
+        visible_first_frame_p95_ms: rounded(p95('total_ms')),
+        cycle_command_p95_ms: rounded(p95('command_ms')),
+        visibility_wait_p95_ms: rounded(p95('visibility_ms')),
+        first_frame_wait_p95_ms: rounded(p95('first_frame_ms')),
+        second_frame_wait_p95_ms: rounded(p95('second_frame_ms')),
+        cycle_samples: cycleTimings.map((item, index) => ({
+          n: index + 1,
+          c: rounded(item.command_ms),
+          v: rounded(item.visibility_ms),
+          f1: rounded(item.first_frame_ms),
+          f2: rounded(item.second_frame_ms),
+          t: rounded(item.total_ms),
+        })),
+        } : {}),
+        agent_pid: local.pid,
+      });
       await host('window', { action: 'minimize' });
       await host('window', { action: 'show' });
       await host('window', { action: 'close' });
       await sleep(100);
       await host('window', { action: 'show' });
       assert((await host('localStatus')).pid === local.pid, 'Close-to-tray replaced the background Agent');
-      navigation('settings'); await wait(() => document.querySelector('[data-testid="setting-api"]')); click('setting-api'); await wait(() => document.querySelector('[data-testid="new-api-token"]'));
-      click('new-api-token'); field('dialog input[name="name"]', config.name); field('dialog input[name="reason"]', 'Native credentials release guard E2E'); submit();
+      navigation('clients'); await wait(() => document.querySelector('[data-testid="new-client"]')); click('new-client');
+      await wait(() => document.querySelector('dialog input[name="name"]'));
+      field('dialog input[name="name"]', config.name + '-once'); field('dialog input[name="reason"]', 'Native one-time device credential guard'); submit();
       await wait(() => document.querySelector('dialog[data-sensitive="true"] textarea'));
       await invoke('native_window_cycle', { delayMs: 51000 });
       assert(document.querySelector('dialog[data-sensitive="true"] textarea')?.value, 'One-time credential dialog was destroyed');
       await host('window', { action: 'show' }); click('dialog-submit'); await wait(() => !document.querySelector('dialog'));
-      const tokens = await api('apiTokens'); const token = tokens.find(item => item.name === config.name); assert(token, 'Test token missing');
-      await api('revokeApiToken', { id: token.id, body: { reason: 'Native E2E cleanup' } });
+      const tokens = await api('enrollTokens'); const token = tokens.find(item => item.name === config.name + '-once'); assert(token, 'Test device credential missing');
+      await api('revokeEnrollToken', { id: token.id, query: { reason: 'Native E2E cleanup' } });
       await report({ stage: 'sensitive-protected', passed: true, one_time_credential_preserved: true, credential_cleanup: true });
-      navigation('clients'); await sleep(100); await host('savePreferences', { local_mode: false });
+      navigation('clients'); await sleep(100);
       localStorage.setItem('native-e2e.phase', 'release'); await report({ stage: 'release', passed: true }); await host('window', { action: 'hide' });
     } catch (error) { await report({ stage: 'failed', passed: false, message: error.message ?? String(error) }); }
   })();

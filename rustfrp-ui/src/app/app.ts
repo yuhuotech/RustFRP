@@ -1,4 +1,4 @@
-import { ApiClient } from '../api/client';
+import { ApiClient, ApiError } from '../api/client';
 import { allowed, record, role, type Admin } from '../api/models';
 import { createHost, type Host } from '../platform/host';
 import { Resources } from './resources';
@@ -19,7 +19,6 @@ export class App {
   private id?: string;
   private timer?: ReturnType<typeof setInterval>;
   private busy = false;
-  private returnToLocal = false;
   private disposed = false;
   private generation = 0;
   private stopWindow: () => void = () => {};
@@ -44,16 +43,16 @@ export class App {
         if (typeof preferences.theme === 'string') { localStorage.setItem('rustfrp.theme', preferences.theme); this.applyTheme(); }
         if (typeof preferences.sidebar_collapsed === 'boolean') { localStorage.setItem('rustfrp.collapsed', String(preferences.sidebar_collapsed)); this.applyTheme(); }
         if (typeof preferences.controller_url === 'string' && preferences.controller_url) { await this.host.call('selectController', { url: preferences.controller_url }); localStorage.setItem('rustfrp.server', preferences.controller_url); }
-        if (preferences.local_mode === true) { this.section = 'local'; this.restorePage(); this.shell(); return; }
+        if (!(typeof preferences.controller_url === 'string' && preferences.controller_url)) await this.host.call('selectController', { url: 'http://127.0.0.1:9674' });
       }
       const value = record(await this.api.request('me')); this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin;
       if (!this.disposed) { this.restorePage(); this.shell(); }
-    } catch (error) { if (!this.disposed) this.login(error); }
+    } catch (error) { if (!this.disposed) this.login(error instanceof ApiError && error.status === 401 ? undefined : error); }
   }
   private context(): Context {
     return { api: this.api, resources: this.resources, host: this.host, admin: this.admin,
       navigate: (section, id) => this.navigate(section, id), refresh: () => this.refresh(true), logout: () => this.logout(), showError: error => this.showError(error),
-      loginLocal: async () => { this.returnToLocal = true; await this.logout(); },
+      loginLocal: () => this.logout(),
       write: async (operation, args) => { const value = await this.api.request(operation, args); this.resources.invalidate(); await this.refresh(true); return value; },
     };
   }
@@ -64,35 +63,38 @@ export class App {
     for (const dialog of document.querySelectorAll<HTMLDialogElement>('dialog')) dialog.close();
     const card = el('form', 'login-card'); const logo = el('img'); logo.src = '/logo.svg'; logo.alt = 'RustFRP';
     card.append(el('div', 'login-brand', logo, el('h1', '', 'RustFRP')));
-    if (this.returnToLocal) card.append(el('p', 'muted-text', '登录后选择节点即可连接此电脑，应用会自动处理接入凭据。'));
-    const server = el('input'); server.type = 'url'; server.name = 'server'; server.value = localStorage.getItem('rustfrp.server') ?? (this.returnToLocal ? 'http://127.0.0.1:9674' : ''); server.placeholder = 'https://controller.example.com';
-    const name = el('input'); name.name = 'name'; name.autocomplete = 'username'; name.required = true;
-    const password = el('input'); password.name = 'password'; password.type = 'password'; password.autocomplete = 'current-password'; password.required = true;
-    for (const [label, control] of [...(this.host.desktop ? [['Controller 地址', server] as const] : []), ['账号', name] as const, ['密码', password] as const]) {
+    const server = el('input'); server.type = 'url'; server.name = 'server'; server.required = true; server.value = this.host.desktop ? localStorage.getItem('rustfrp.server') || 'http://127.0.0.1:9674' : location.origin; server.placeholder = 'https://server.example.com:9674';
+    const token = el('input'); token.name = 'token'; token.type = 'password'; token.autocomplete = 'off'; token.required = true; token.maxLength = 1024;
+    for (const [label, control] of [['管理服务器', server] as const, ['管理 token', token] as const]) {
       control.id = `login-${control.name}`; const caption = el('label', '', label); caption.htmlFor = control.id; card.append(el('div', 'form-field', caption, control));
     }
-    if (this.host.desktop) server.closest('.form-field')?.append(button('使用本机管理服务', () => { server.value = 'http://127.0.0.1:9674'; name.focus(); }, { id: 'login-local-controller', compact: true }));
+    const current = this.host.desktop ? 'http://127.0.0.1:9674' : location.origin;
+    const choices = el('datalist'); choices.id = 'management-servers';
+    for (const address of new Set([current, localStorage.getItem('rustfrp.server')].filter((value): value is string => !!value))) { const choice = el('option'); choice.value = address; choice.label = address === current ? '当前服务器' : '上次连接'; choices.append(choice); }
+    server.setAttribute('list', choices.id); card.append(choices, el('p', 'field-help', '填写服务端配置文件 [admin].token，与客户端接入令牌不同。'));
     const error = el('p', 'form-error'); error.setAttribute('role', 'alert'); error.hidden = !failure;
     if (failure instanceof Error) error.textContent = failure.message;
-    const submit = button('登录', () => {}, { primary: true, id: 'login-submit' }); submit.type = 'submit'; card.append(error, submit);
-    if (this.host.desktop) card.append(button('管理本机', () => this.navigate('local'), { id: 'login-local' }));
+    const submit = button('连接', () => {}, { primary: true, id: 'login-submit' }); submit.type = 'submit'; card.append(error, submit);
+    server.addEventListener('input', () => {
+      let remote = false;
+      try { const target = new URL(server.value); remote = !this.host.desktop && (target.origin !== location.origin || target.pathname.replace(/\/$/, '') !== location.pathname.replace(/\/$/, '')); } catch { /* Form validation reports invalid addresses. */ }
+      token.disabled = remote; token.required = !remote; if (remote) token.value = '';
+      submit.textContent = remote ? '前往管理服务器' : '连接';
+    });
     card.addEventListener('submit', async event => {
       event.preventDefault(); if (this.busy) return; this.busy = true; submit.disabled = true; submit.setAttribute('aria-busy', 'true'); error.hidden = true;
       try {
+        const target = new URL(server.value);
+        if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password || target.search || target.hash) throw new Error('请输入有效的 HTTP(S) 管理服务器地址');
+        if (!this.host.desktop && (target.origin !== location.origin || target.pathname.replace(/\/$/, '') !== location.pathname.replace(/\/$/, ''))) { token.value = ''; location.assign(target.href); return; }
         if (this.host.desktop) { await this.host.call('selectController', { url: server.value }); localStorage.setItem('rustfrp.server', server.value); }
-        const value = record(await this.api.request('login', { body: { name: name.value.trim(), password: password.value } }));
-        this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin; password.value = '';
-        const connect = this.returnToLocal; this.returnToLocal = false;
-        if (connect) { this.section = 'local'; await this.host.call('savePreferences', { local_mode: true }); }
+        const value = record(await this.api.request('login', { body: { token: token.value } }));
+        this.admin = { ...record(value.admin), role: role(record(value.admin).role) } as Admin; token.value = ''; this.section = 'overview';
         this.shell();
-        if (connect) {
-          try { const { connectComputer } = await import('../features/local-connect'); await connectComputer(this.context()); }
-          catch (error) { this.showError(error); }
-        }
       } catch (reason) { error.textContent = reason instanceof Error ? reason.message : String(reason); error.hidden = false; }
       finally { this.busy = false; submit.disabled = false; submit.setAttribute('aria-busy', 'false'); }
     });
-    this.root.replaceChildren(el('div', 'login-screen', card)); name.focus();
+    this.root.replaceChildren(el('div', 'login-screen', card)); token.focus();
   }
   private shell(): void {
     const sidebar = el('aside', 'sidebar'); const logo = el('img'); logo.src = '/logo.svg'; logo.alt = 'RustFRP';
@@ -114,7 +116,6 @@ export class App {
       item.addEventListener('click', () => this.navigate(section)); return item;
     };
     for (const section of sections) { (section === 'settings' ? foot : menu).append(nav(section)); bottom.append(nav(section)); }
-    if (this.host.desktop && this.admin) foot.append(nav('local'));
     sidebar.append(menu, el('div', 'connection-state', el('span', 'status-dot'), this.admin ? '已连接控制器' : '本机模式'), foot);
     const header = el('header', 'page-header'); const heading = el('h1'); heading.dataset.testid = 'page-title'; heading.setAttribute('data-tauri-drag-region', '');
     this.actions = el('div', 'actions'); header.append(heading, this.actions);
@@ -128,7 +129,6 @@ export class App {
     this.section = section; this.id = id; this.resources.cancel();
     if (this.host.desktop) {
       localStorage.setItem('rustfrp.page', JSON.stringify({ section, id }));
-      if (section !== 'settings') void this.host.call('savePreferences', { local_mode: section === 'local' }).catch(error => this.showError(error));
     }
     if (!this.content?.isConnected) this.shell(); else this.mount();
   }
@@ -136,7 +136,7 @@ export class App {
     if (!this.host.desktop) return;
     try {
       const saved = record(JSON.parse(localStorage.getItem('rustfrp.page') ?? '{}'));
-      if (typeof saved.section === 'string' && Object.hasOwn(titles, saved.section) && (this.admin || saved.section === 'local' || saved.section === 'settings') && (saved.section !== 'audit' || allowed(this.admin?.role, 'admin'))) {
+      if (typeof saved.section === 'string' && saved.section !== 'local' && Object.hasOwn(titles, saved.section) && this.admin && (saved.section !== 'audit' || allowed(this.admin?.role, 'admin'))) {
         this.section = saved.section as Section; this.id = typeof saved.id === 'string' && saved.id.length <= 256 ? saved.id : undefined;
       }
     } catch { localStorage.removeItem('rustfrp.page'); }
@@ -165,10 +165,6 @@ export class App {
     catch (error) { this.showError(error); }
     finally {
       this.admin = null; this.resources.clear();
-      if (this.host.desktop) {
-        try { await this.host.call('savePreferences', { local_mode: false }); }
-        catch (error) { this.showError(error); }
-      }
       this.login();
     }
   }

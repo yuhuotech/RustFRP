@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const PK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const PASSWORD: &str = "correct horse battery";
+const PASSWORD: &str = "correct-horse-battery";
 
 fn pw_hash() -> &'static str {
     static H: OnceLock<String> = OnceLock::new();
@@ -172,7 +172,11 @@ async fn healthz_and_security_headers() {
 
 #[tokio::test]
 async fn login_logout_cycle_and_guards() {
-    let r = rig().await;
+    let r = rig_with(Config {
+        admin_token: PASSWORD.into(),
+        ..Config::default()
+    })
+    .await;
     let _ = r.admin("boss", Role::Owner).await;
     let login = |pw: &'static str| {
         let r = &r;
@@ -184,9 +188,7 @@ async fn login_logout_cycle_and_guards() {
                 .header(header::ORIGIN, "http://panel.test")
                 .header("x-rustfrp-admin", "1")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({"name": "boss", "password": pw}).to_string(),
-                ))
+                .body(Body::from(json!({"token": pw}).to_string()))
                 .unwrap();
             let res = r.app.clone().oneshot(req).await.unwrap();
             let (st, h) = (res.status(), res.headers().clone());
@@ -203,7 +205,7 @@ async fn login_logout_cycle_and_guards() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({"name":"boss","password":PASSWORD})),
+            Some(json!({"token":PASSWORD})),
         )
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -214,9 +216,7 @@ async fn login_logout_cycle_and_guards() {
         .header(header::ORIGIN, "http://evil.test")
         .header("x-rustfrp-admin", "1")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({"name":"boss","password":PASSWORD}).to_string(),
-        ))
+        .body(Body::from(json!({"token":PASSWORD}).to_string()))
         .unwrap();
     assert_eq!(
         r.app.clone().oneshot(req).await.unwrap().status(),
@@ -238,7 +238,7 @@ async fn login_logout_cycle_and_guards() {
             && !cookie.contains("Secure")
     );
     let csrf = v["csrf"].as_str().unwrap().to_string();
-    assert_eq!(v["admin"]["name"], "boss");
+    assert_eq!(v["admin"]["name"], "管理 token");
     assert_eq!(v["api"], "v1");
     let sess = Sess {
         cookie: cookie.split(';').next().unwrap().to_string(),
@@ -274,7 +274,7 @@ async fn login_logout_cycle_and_guards() {
 }
 
 #[tokio::test]
-async fn login_rate_limit_unknown_user_and_disabled_admin() {
+async fn login_rate_limit_and_rejection_of_legacy_password_form() {
     let r = rig().await;
     r.admin("boss", Role::Owner).await;
     let attempt = |name: &'static str, pw: &'static str| {
@@ -287,13 +287,13 @@ async fn login_rate_limit_unknown_user_and_disabled_admin() {
                 .header("x-rustfrp-admin", "1")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"name": name, "password": pw}).to_string(),
+                    json!({"token": format!("{name}-{pw}")}).to_string(),
                 ))
                 .unwrap();
             r.app.clone().oneshot(req).await.unwrap().status()
         }
     };
-    // 不存在的用户与错误密码返回同样的状态，不泄露账号是否存在。
+    // 所有错误管理 token 统一拒绝，并计入同一来源的限流。
     assert_eq!(
         attempt("ghost", "whatever-password").await,
         StatusCode::UNAUTHORIZED
@@ -301,7 +301,7 @@ async fn login_rate_limit_unknown_user_and_disabled_admin() {
     for _ in 0..4 {
         assert_eq!(attempt("boss", "bad").await, StatusCode::UNAUTHORIZED);
     }
-    // 第 5 次失败之后同一来源被限流（即使密码正确）。
+    // 第 5 次失败之后同一来源被限流。
     assert_eq!(
         attempt("boss", PASSWORD).await,
         StatusCode::TOO_MANY_REQUESTS
@@ -325,7 +325,7 @@ async fn login_rate_limit_unknown_user_and_disabled_admin() {
         .unwrap();
     assert_eq!(
         r2.app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
+        StatusCode::UNPROCESSABLE_ENTITY
     );
 }
 

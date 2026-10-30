@@ -5,9 +5,9 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createConnection, createServer } from 'node:net';
 
-const password = process.env.RUSTFRP_E2E_PASSWORD ?? 'native ui test password';
+const tokenValue = process.env.RUSTFRP_E2E_ADMIN_TOKEN ?? 'native-ui-test-management-token';
 async function login(page: Page): Promise<void> {
-  await page.goto('/'); await page.getByLabel('账号', { exact: true }).fill('preview'); await page.getByLabel('密码', { exact: true }).fill(password); await page.getByTestId('login-submit').click();
+  await page.goto('/'); await page.getByLabel('管理 token', { exact: true }).fill(tokenValue); await page.getByTestId('login-submit').click();
   await expect(page.getByTestId('page-title')).toHaveText('概览'); await expect(page.locator('.metric-card')).toHaveCount(6);
 }
 async function token(api: APIRequestContext, csrf: string, name: string) {
@@ -79,9 +79,7 @@ test('real agents, TCP forwarding, CRUD, visitors, import/export, credentials an
     await page.getByTestId('import-config').click(); await page.getByLabel('TOML / YAML / JSON 完整配置').fill(`[[proxies]]\nname = "导入-${suffix}"\ntype = "tcp"\nlocalIP = "127.0.0.1"\nlocalPort = ${address.port}\nremotePort = 0`);
     await page.getByTestId('config-preview').click(); await expect(page.getByText('预览 1 条变更')).toBeVisible(); await page.getByLabel('已检查兼容报告，并确认按上述变更导入').check(); await save(page);
     await page.getByTestId('export-config').click(); await expect(page.locator('dialog textarea')).toHaveValue(new RegExp(`导入-${suffix}`)); await page.locator('dialog').getByRole('button', { name: '完成', exact: true }).click();
-    await nav(page, '系统设置'); await page.getByTestId('setting-api').click(); await page.getByTestId('new-api-token').click(); await page.getByLabel('名称', { exact: true }).fill(`API-${suffix}`); await page.getByLabel('权限范围', { exact: true }).selectOption('read'); await page.getByLabel('操作理由').fill('API Token E2E'); await page.getByTestId('dialog-submit').click();
-    await expect(page.locator('dialog h2')).toHaveText('保存 API Token'); const original = await page.locator('dialog textarea').inputValue(); expect(original).toMatch(/^rfrp_/); await page.locator('dialog').getByRole('button', { name: '完成', exact: true }).click(); expect(await page.locator('body').textContent()).not.toContain(original);
-    const tokens = await (await context.request.get('/api/v1/api-tokens')).json(); const apiToken = tokens.find((item: { name: string }) => item.name === `API-${suffix}`); await page.getByTestId(`revoke-api-token-${apiToken.id}`).click(); await save(page);
+    await nav(page, '系统设置'); await expect(page.getByTestId('setting-api')).toHaveCount(0); await expect(page.getByTestId('setting-admins')).toHaveCount(0);
     await nav(page, '审计日志'); await expect(page.getByText('UI 端到端维护验证', { exact: true }).first()).toBeVisible(); await expect(page.getByText('创建隧道', { exact: true }).first()).toBeVisible(); expect(errors).toEqual([]);
   } finally {
     for (const agent of agents) await stop(agent);

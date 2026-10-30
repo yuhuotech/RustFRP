@@ -1,0 +1,5 @@
+# 复制为 rustfrp-server.toml，修改 token，再运行 rustfrp-server run。
+# 桌面 App 和 Web 使用同一个管理 token；更改后重启生效。
+# 此 token 与 frp [auth].token、客户端/节点接入令牌完全独立。
+[admin]
+token = "change-me"

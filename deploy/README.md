@@ -12,6 +12,10 @@ separately in the host firewall.
    `RUSTFRP_HTTP=127.0.0.1:8080`, `RUSTFRP_EDGE=0.0.0.0:7000`,
    `RUSTFRP_PANEL_DIR=/opt/rustfrp/panel`,
    `RUSTFRP_PUBLIC_URL=https://frp.example.com`, and your port policy.
+   Copy `rustfrp-server.example.toml` to `/etc/rustfrp/rustfrp-server.toml`, set
+   `[admin].token`, and add `RUSTFRP_CONFIG=/etc/rustfrp/rustfrp-server.toml` to the
+   environment file. This is the only console login credential; it is separate
+   from client enrollment. Edit it and restart to change the credential.
 3. Install `rustfrp-server.service` and enable it with systemd.
 4. Set `RUSTFRP_DOMAIN` and `ACME_EMAIL`, then load `Caddyfile`. Caddy manages
    the HTTPS certificate and WebSocket proxying.
@@ -30,3 +34,5 @@ configured for live panel events.
 of the Controller. Build the panel with `make web-build`, then mount its output
 at `deploy/panel`. Pin release images by digest in production. With containers,
 bind `RUSTFRP_HTTP` to the private service network and keep port 8080 unpublished.
+Set `RUSTFRP_ADMIN_TOKEN` in `.env` (replace `change-me`). Web and desktop use the
+same token; no administrator account creation is needed.

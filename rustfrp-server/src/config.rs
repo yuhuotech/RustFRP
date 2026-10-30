@@ -1,11 +1,27 @@
 //! 运行配置（环境变量 + 默认值）。
 
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    #[serde(default)]
+    admin: AdminConfig,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminConfig {
+    #[serde(default)]
+    token: String,
+}
+
 /// 服务配置。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
+    /// 管理控制台唯一凭据，与设备接入令牌分离；不得输出。
+    pub admin_token: String,
     /// 数据库文件。
     pub db_path: PathBuf,
     /// 管理 API / 面板监听地址（默认仅本机）。
@@ -61,9 +77,20 @@ pub struct Config {
     pub edge_tls_fingerprint: String,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("db_path", &self.db_path)
+            .field("http_addr", &self.http_addr)
+            .field("edge_addr", &self.edge_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            admin_token: String::new(),
             db_path: PathBuf::from("rustfrp.db"),
             http_addr: "127.0.0.1:8080".into(),
             edge_addr: "0.0.0.0:7000".into(),
@@ -119,9 +146,44 @@ pub fn parse_ports(s: &str) -> Result<Vec<(u16, u16)>, String> {
 }
 
 impl Config {
+    /// 服务启动必须显式配置管理凭据，错误不包含原值。
+    pub fn validate_admin(&self) -> Result<(), String> {
+        if self.admin_token.is_empty()
+            || self.admin_token == "change-me"
+            || self.admin_token.len() > 1024
+            || self.admin_token.chars().any(char::is_whitespace)
+        {
+            return Err("请修改 rustfrp-server.toml 的 [admin].token（非空、非 change-me、无空白，最多 1024 字节）后重启；也可设置 RUSTFRP_ADMIN_TOKEN".into());
+        }
+        Ok(())
+    }
     /// 从「键 → 值」查询函数构造（便于测试，不直接读进程环境）。
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
+        use std::io::Read;
+        let configured_path = get("RUSTFRP_CONFIG");
+        let path = configured_path.as_deref().unwrap_or("rustfrp-server.toml");
+        let file = match std::fs::File::open(path) {
+            Ok(file) => {
+                let mut source = String::new();
+                file.take(65537)
+                    .read_to_string(&mut source)
+                    .map_err(|_| "无法读取管理配置文件".to_string())?;
+                if source.len() > 65536 {
+                    return Err("管理配置文件不能超过 64 KiB".into());
+                }
+                toml::from_str::<FileConfig>(&source).map_err(|_| {
+                    "管理配置文件无效：请检查 [admin] 和 token，不支持的字段不能忽略".to_string()
+                })?
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && configured_path.is_none() =>
+            {
+                FileConfig::default()
+            }
+            Err(_) => return Err("无法打开指定的管理配置文件".into()),
+        };
         let mut c = Config {
+            admin_token: get("RUSTFRP_ADMIN_TOKEN").unwrap_or(file.admin.token),
             edge_tls_cert: get("RUSTFRP_EDGE_TLS_CERT")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),

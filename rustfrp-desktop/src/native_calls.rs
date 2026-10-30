@@ -95,9 +95,7 @@ pub fn show_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         .get_webview_window("main")
         .or_else(|| main_window(app).ok())
     {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        let _ = native_host::window(&window, WindowAction::Show);
     }
 }
 

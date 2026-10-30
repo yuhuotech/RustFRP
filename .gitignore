@@ -23,3 +23,4 @@ rustfrp-desktop/resources/bin/
 # Generated persistent Edge identities (private keys)
 *.edge-tls/
 *.edge-tls-*.partial/
+rustfrp-server.toml

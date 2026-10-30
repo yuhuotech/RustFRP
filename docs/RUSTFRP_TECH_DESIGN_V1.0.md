@@ -1,5 +1,7 @@
 # RustFRP 技术设计文档 V1.0
 
+> **2026-10-15 管理认证修订**：Web/桌面统一以服务端 TOML `[admin].token` 登录；单凭据、完整管理权限，不再提供用户名密码登录。用户编辑配置重启即可更换凭据并撤销旧管理会话。保留既有 Cookie/CSRF/同源/审计，设备接入令牌和设备身份独立。协议见 `rustfrp-protocol/MANAGEMENT_AUTH.md`，历史管理员账号设计仅用于旧数据/接口迁移，不再代表普通用户流程。
+
 > **2026-10-14 管理 UI 架构修订**：Web 管理面与桌面共享 `rustfrp-ui/` 手写 HTML/CSS/TypeScript；Controller 以目录或内嵌资源托管同一 UI，桌面使用 Tauri 系统 WebView，Rust IPC 仅开放有类型和大小限制的能力。此修订替换本文件早期 Flutter 单工程方案与其对应目录、构建和测试描述。当前实施与验收以 [`UI_REFACTOR_STATUS.md`](UI_REFACTOR_STATUS.md) 为准。
 
 > 状态：草案，待评审　｜　编制日期：2026-10-11

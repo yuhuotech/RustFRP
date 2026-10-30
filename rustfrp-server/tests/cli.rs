@@ -16,6 +16,10 @@ struct Env(HashMap<String, String>);
 impl Env {
     fn new(db: &std::path::Path, extra: &[(&str, &str)]) -> Env {
         let mut m = HashMap::new();
+        m.insert(
+            "RUSTFRP_ADMIN_TOKEN".to_string(),
+            "test-only-management-token".to_string(),
+        );
         m.insert("RUSTFRP_DB".to_string(), db.display().to_string());
         for (k, v) in extra {
             m.insert(k.to_string(), v.to_string());
@@ -184,6 +188,48 @@ async fn run_starts_and_stops_on_cancel() {
     )
     .await;
     assert_eq!(code, 1);
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn explicit_management_config_starts_without_creating_password_accounts() {
+    let db = tmp_db();
+    let file = db.with_extension("toml");
+    std::fs::write(&file, "[admin]\ntoken='test-file-management-token'\n").unwrap();
+    let env = Env::new(
+        &db,
+        &[
+            ("RUSTFRP_HTTP", "127.0.0.1:0"),
+            ("RUSTFRP_EDGE", "127.0.0.1:0"),
+        ],
+    );
+    let lookup = |key: &str| {
+        if key == "RUSTFRP_ADMIN_TOKEN" {
+            None
+        } else {
+            env.0.get(key).cloned()
+        }
+    };
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let go = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.cancel();
+    };
+    let mut input: &[u8] = b"";
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let run = execute(
+        Cmd::RunConfig(file.to_string_lossy().into_owned()),
+        &lookup,
+        &mut input,
+        &mut out,
+        &mut err,
+        cancel,
+    );
+    let (code, _) = tokio::join!(run, go);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    std::fs::remove_file(file).unwrap();
     cleanup(&db);
 }
 

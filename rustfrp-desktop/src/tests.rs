@@ -174,6 +174,15 @@ fn ipc_uses_typed_policy_preserves_native_errors_and_rejects_untrusted_windows()
     // MockRuntime's native setters are no-ops; the actual state changes are checked
     // by native_window.py. Here the IPC response and typed dispatch are the contract.
     for action in ["minimize", "hide", "show"] {
+        if cfg!(target_os = "macos") && action == "show" {
+            // MockRuntime executes inline on this test worker, which is not the
+            // AppKit main thread. Real activation is exercised by native E2E.
+            assert_eq!(
+                command("window", json!({"action":action})).unwrap_err()["code"],
+                "local_io"
+            );
+            continue;
+        }
         assert_eq!(
             command("window", json!({"action":action})).unwrap(),
             Value::Null
@@ -185,7 +194,14 @@ fn ipc_uses_typed_policy_preserves_native_errors_and_rejects_untrusted_windows()
         rustfrp_desktop_support::bridge::WindowAction::Show,
         rustfrp_desktop_support::bridge::WindowAction::Close,
     ] {
-        native_host::window(&main, action).unwrap();
+        let result = native_host::window(&main, action);
+        if cfg!(target_os = "macos")
+            && matches!(action, rustfrp_desktop_support::bridge::WindowAction::Show)
+        {
+            assert_eq!(result.unwrap_err().code, "local_io");
+        } else {
+            result.unwrap();
+        }
     }
     native_host::report_window(
         &state,

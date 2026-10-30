@@ -124,10 +124,15 @@ async fn edge_identity(cfg: &Config) -> Result<Option<rustfrp_core::tls::Identit
 
 /// 启动 Controller（立即返回，后台运行）。
 pub async fn start(mut cfg: Config, log: Logger) -> Result<Server, String> {
+    cfg.validate_admin()?;
     let logs = Arc::new(rustfrp_agent::log_ring::LogRing::default());
     let log = log.with_ring(logs.clone());
     crate::process::mark_start();
     let db = Db::open(&cfg.db_path).map_err(|e| format!("open database: {e}"))?;
+    let digest = crate::auth::token_hash(&cfg.admin_token);
+    db.call(move |c| crate::store::bind_management_token(c, &digest, crate::store::now_ms()))
+        .await
+        .map_err(|e| e.to_string())?;
     let identity = edge_identity(&cfg).await?;
     let (hub, events) = Hub::new(db.clone());
     let cancel = CancellationToken::new();

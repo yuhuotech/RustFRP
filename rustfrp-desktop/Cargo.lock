@@ -3419,6 +3419,8 @@ name = "rustfrp-desktop"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "objc2",
+ "objc2-app-kit",
  "open",
  "rustfrp-desktop-support",
  "serde_json",

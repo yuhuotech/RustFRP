@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
@@ -17,6 +17,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 use crate::auth::{self, token_hash};
 use crate::config::Config;
@@ -267,6 +268,9 @@ impl FromRequestParts<AppState> for Auth {
                     e.into()
                 }
             })?;
+        if !state.cfg.admin_token.is_empty() && admin.id != "__management__" {
+            return Err(ApiError::unauthorized());
+        }
         if !is_safe(&parts.method) {
             if !same_origin(&parts.headers) {
                 return Err(ApiError::forbidden("cross-origin request rejected"));
@@ -335,14 +339,10 @@ struct ReasonQuery {
 // ───────────── 认证 ─────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoginBody {
-    name: String,
-    password: String,
-}
-
-fn dummy_hash() -> &'static str {
-    static H: OnceLock<String> = OnceLock::new();
-    H.get_or_init(|| auth::hash_password("rustfrp-dummy-password").unwrap_or_default())
+    #[serde(default)]
+    token: String,
 }
 
 async fn login(
@@ -364,24 +364,14 @@ async fn login(
             "too many failed attempts, try again later",
         ));
     }
-    let name = body.name.trim().to_string();
-    let n2 = name.clone();
-    let found = st
-        .db
-        .call(move |c| store::find_admin_with_hash(c, &n2))
-        .await;
-    // 账号不存在时也做一次等耗时的哈希校验，避免通过响应时间枚举用户名。
-    let (admin, ok) = match found {
-        Ok((a, h)) => {
-            let ok = auth::verify_password(&body.password, &h) && a.disabled_at.is_none();
-            (Some(a), ok)
-        }
-        Err(_) => {
-            let _ = auth::verify_password(&body.password, dummy_hash());
-            (None, false)
-        }
-    };
-    let (actor, ip2) = (name.clone(), ip.clone());
+    let ok = st.cfg.validate_admin().is_ok()
+        && body.token.len() <= 1024
+        && bool::from(
+            token_hash(&body.token)
+                .as_bytes()
+                .ct_eq(token_hash(&st.cfg.admin_token).as_bytes()),
+        );
+    let (actor, ip2) = ("管理 token".to_string(), ip.clone());
     let result = if ok { "ok" } else { "denied" };
     let _ = st
         .db
@@ -399,15 +389,20 @@ async fn login(
             )
         })
         .await;
-    let Some(admin) = admin.filter(|_| ok) else {
+    if !ok {
         st.limiter.fail(&ip, now);
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
-            "invalid user name or password",
+            "管理 token 不正确，请核对服务端 [admin].token",
         ));
-    };
+    }
     st.limiter.clear(&ip);
+    let digest = token_hash(&st.cfg.admin_token);
+    let admin = st
+        .db
+        .call(move |c| store::bind_management_token(c, &digest, now))
+        .await?;
 
     let token = auth::new_token()
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?;

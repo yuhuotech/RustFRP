@@ -1,70 +1,28 @@
-import { expect, test, type Page } from '@playwright/test';
-
-const password = process.env.RUSTFRP_E2E_PASSWORD ?? 'native ui test password';
-async function login(page: Page, name: string, secret: string) {
+import { test, expect } from '@playwright/test';
+const token = process.env.RUSTFRP_E2E_ADMIN_TOKEN ?? 'native-ui-test-management-token';
+test('single management token authentication, credential separation and CSRF', async ({ page, context }) => {
   await page.goto('/');
-  await page.getByLabel('账号', { exact: true }).fill(name);
-  await page.getByLabel('密码', { exact: true }).fill(secret);
-  await page.getByTestId('login-submit').click();
-  await expect(page.getByTestId('page-title')).toHaveText('概览');
-}
-
-test('real roles restrict controls and writes, and protect the current owner', async ({ page, context, playwright }, info) => {
-  test.setTimeout(60000);
-  const owner = await playwright.request.newContext({ baseURL: 'http://127.0.0.1:9674', extraHTTPHeaders: { Origin: 'http://127.0.0.1:9674', 'x-rustfrp-admin': '1' } });
-  const accounts: string[] = [];
-  const reason = 'Native role E2E';
-  let csrf = '';
-  try {
-    expect((await owner.post('/api/v1/auth/login', { data: { name: 'preview', password } })).ok()).toBe(true);
-    const identity = await (await owner.get('/api/v1/auth/me')).json(); csrf = identity.csrf;
-    const headers = { 'x-csrf-token': csrf, Origin: 'http://127.0.0.1:9674', 'x-rustfrp-admin': '1' };
-    for (const role of ['viewer', 'operator', 'admin']) {
-      const name = `ui-role-${info.project.name}-${role}-${Date.now()}`;
-      const secret = 'native role test password';
-      const response = await owner.post('/api/v1/admins', { headers, data: { name, password: secret, role, reason } });
-      expect(response.ok()).toBe(true); const account = await response.json(); accounts.push(account.id);
-      await context.clearCookies(); await login(page, name, secret);
-      await page.locator('.nav-main').getByRole('button', { name: '客户端', exact: true }).click();
-      await expect(page.getByTestId('page-title')).toHaveText('客户端');
-      await expect(page.getByTestId('new-client')).toHaveCount(role === 'admin' ? 1 : 0);
-      await page.locator('.nav-main').getByRole('button', { name: '节点管理', exact: true }).click();
-      await expect(page.getByTestId('new-node')).toHaveCount(role === 'admin' ? 1 : 0);
-      await page.locator('.nav-main').getByRole('button', { name: '隧道管理', exact: true }).click();
-      await expect(page.getByTestId('new-tunnel')).toHaveCount(role === 'viewer' ? 0 : 1);
-      await page.locator('.nav-foot').getByRole('button', { name: '系统设置', exact: true }).click();
-      await expect(page.getByTestId('setting-admins')).toHaveCount(0);
-      await expect(page.getByTestId('setting-api')).toHaveCount(0);
-      await expect(page.getByTestId('setting-enroll')).toHaveCount(role === 'admin' ? 1 : 0);
-      const session = await (await context.request.get('/api/v1/auth/me')).json();
-      expect(session.admin.role).toBe(role);
-      const forbidden = await context.request.post('/api/v1/admins', { headers: { ...headers, 'x-csrf-token': session.csrf }, data: { name: 'must-not-exist', password: secret, role: 'owner', reason } });
-      expect(forbidden.status()).toBe(403);
-      if (role !== 'admin') {
-        const enrollment = await context.request.post('/api/v1/enroll-tokens', { headers: { ...headers, 'x-csrf-token': session.csrf }, data: { name: 'forbidden enrollment', ttl_minutes: 5, reason } });
-        expect(enrollment.status()).toBe(403);
-      }
-    }
-    await context.clearCookies(); await login(page, 'preview', password);
-    await page.locator('.nav-foot').getByRole('button', { name: '系统设置', exact: true }).click();
-    await page.getByTestId('setting-admins').click();
-    await page.getByTestId(`edit-admin-${identity.admin.id}`).click();
-    await expect(page.locator('dialog').getByLabel('角色', { exact: true })).toBeDisabled();
-    await expect(page.locator('dialog').getByLabel('停用账号', { exact: true })).toBeDisabled();
-    await page.keyboard.press('Escape');
-    const refused = await owner.patch(`/api/v1/admins/${identity.admin.id}`, { headers, data: { disabled: true, reason } });
-    expect(refused.status()).toBe(403);
-    expect((await refused.json()).error).toMatchObject({ code: 'forbidden', message: 'cannot change your own role or status' });
-    expect((await (await owner.get('/api/v1/auth/me')).json()).admin.id).toBe(identity.admin.id);
-    // A cleared private session must return to login before displaying management data.
-    await context.clearCookies(); await page.reload();
-    await expect(page.getByTestId('login-submit')).toBeVisible();
-    await expect(page.locator('.resource-table')).toHaveCount(0);
-  } finally {
-    for (const id of accounts) {
-      const response = await owner.patch(`/api/v1/admins/${id}`, { headers: { 'x-csrf-token': csrf, Origin: 'http://127.0.0.1:9674', 'x-rustfrp-admin': '1' }, data: { disabled: true, reason: 'Native role E2E cleanup' } });
-      expect(response.ok()).toBe(true);
-    }
-    await owner.dispose();
-  }
+  await expect(page.getByLabel('管理服务器', { exact: true })).toHaveValue('http://127.0.0.1:9674');
+  await expect(page.locator('#login-name,#login-password')).toHaveCount(0);
+  await page.getByLabel('管理 token', { exact: true }).fill('wrong-management-token');
+  await page.getByTestId('login-submit').click(); await expect(page.locator('.form-error')).toContainText('管理 token 不正确');
+  await page.getByLabel('管理 token', { exact: true }).fill(token); await page.getByTestId('login-submit').click(); await expect(page.locator('.metric-card')).toHaveCount(6);
+  const me = await (await context.request.get('/api/v1/auth/me')).json();
+  const headers = { 'x-csrf-token': me.csrf, Origin: 'http://127.0.0.1:9674' };
+  const result = await context.request.post('/api/v1/enroll-tokens', { headers, data: { name: 'separation-test', ttl_minutes: 5, reason: 'Credential separation E2E' } }); expect(result.ok()).toBe(true); const device = await result.json();
+  const forbidden = await context.request.post('/api/v1/enroll-tokens', { data: { name: 'CSRF-failure', ttl_minutes: 5, reason: 'No CSRF' } }); expect(forbidden.status()).toBe(403);
+  await page.locator('.nav-foot').getByRole('button', { name: '系统设置', exact: true }).click();
+  await expect(page.getByTestId('setting-api')).toHaveCount(0); await expect(page.getByTestId('setting-admins')).toHaveCount(0);
+  await page.getByRole('button', { name: '断开连接', exact: true }).click(); await expect(page.getByTestId('login-submit')).toBeVisible();
+  await page.getByLabel('管理 token', { exact: true }).fill(device.token); await page.getByTestId('login-submit').click(); await expect(page.locator('.form-error')).toContainText('管理 token 不正确');
+  await page.getByLabel('管理 token', { exact: true }).fill(token); await page.getByTestId('login-submit').click(); await expect(page.locator('.metric-card')).toHaveCount(6);
+  const current = await (await context.request.get('/api/v1/auth/me')).json(); expect(current.admin.role).toBe('owner');
+  expect((await context.request.delete('/api/v1/enroll-tokens/' + device.id + '?reason=E2E-cleanup', { headers: { 'x-csrf-token': current.csrf } })).ok()).toBe(true);
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain(token);
+  await context.clearCookies(); await page.reload(); await expect(page.getByTestId('login-submit')).toBeVisible(); await expect(page.locator('.resource-table')).toHaveCount(0);
+  const forwarded: { method: string; url: string; body: string | null }[] = [];
+  await page.route('https://other-management.example/**', async route => { const request=route.request(); forwarded.push({method:request.method(),url:request.url(),body:request.postData()}); await route.fulfill({contentType:'text/html',body:'<p>Other management console</p>'}); });
+  await page.getByLabel('管理服务器', { exact: true }).fill('https://other-management.example/'); await expect(page.getByLabel('管理 token', { exact: true })).toBeDisabled(); await expect(page.getByTestId('login-submit')).toHaveText('前往管理服务器');
+  await page.getByTestId('login-submit').click(); await expect(page).toHaveURL('https://other-management.example/');
+  expect(forwarded).toEqual([{method:'GET',url:'https://other-management.example/',body:null}]);
 });

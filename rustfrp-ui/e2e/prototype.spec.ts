@@ -1,10 +1,9 @@
 import { test, expect } from '@playwright/test';
 
-const password = process.env.RUSTFRP_E2E_PASSWORD ?? 'native ui test password';
+const token = process.env.RUSTFRP_E2E_ADMIN_TOKEN ?? 'native-ui-test-management-token';
 async function login(page: import('@playwright/test').Page) {
   await page.goto('/');
-  await page.getByLabel('账号', { exact: true }).fill('preview');
-  await page.getByLabel('密码', { exact: true }).fill(password);
+  await page.getByLabel('管理 token', { exact: true }).fill(token);
   await page.getByTestId('login-submit').click();
   await expect(page.getByTestId('page-title')).toHaveText('概览');
   await expect(page.locator('.metric-card')).toHaveCount(6);
@@ -35,7 +34,7 @@ test('real Controller login, session, navigation and CSRF boundary', async ({ pa
   await page.getByRole('button', { name: '系统设置', exact: true }).first().click();
   await page.getByRole('button', { name: '深色', exact: true }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
-  await page.getByRole('button', { name: '退出登录', exact: true }).click();
+  await page.getByRole('button', { name: '断开连接', exact: true }).click();
   await expect(page.getByTestId('login-submit')).toBeVisible(); expect(failures).toEqual([]);
 });
 test('narrow navigation and strict CSP render real controls without a canvas engine', async ({ page }) => {

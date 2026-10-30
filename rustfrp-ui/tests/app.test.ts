@@ -3,135 +3,117 @@ import { App } from '../src/app/app';
 import { ApiClient } from '../src/api/client';
 import { WebHost, type Host } from '../src/platform/host';
 import type { Json } from '../src/api/models';
-
 const apps: App[] = [];
 afterEach(() => { for (const app of apps.splice(0)) app.dispose(); vi.useRealTimers(); });
-const client = { id: 'c', name: '中文 NAS', online: true, tags: ['生产'], node_id: '', os: 'linux', arch: 'x86_64', version: '0.1.0', last_ip: '203.0.113.1', last_seen_at: 1700000000000, disabled_at: null };
-const node = { id: '', name: '内置节点', builtin: true, online: true, clients: 1, public_host: 'example.com', edge_port: 7000, version: '0.1.0', vhost_http: 80, disabled_at: null };
-function harness(currentRole = 'owner', authenticated = true, host: Host = new WebHost()) {
+function harness(authenticated = false, host: Host = new WebHost(), currentRole = 'owner') {
   let signedIn = authenticated;
-  const requests: { path: string; method: string }[] = [];
-  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const path = String(input).split('?')[0]; const method = init?.method ?? 'GET'; requests.push({ path, method });
-    if (path.endsWith('/auth/login')) { signedIn = true; return new Response(JSON.stringify({ csrf: 'test', admin: { id: 'a', name: 'root', role: currentRole, disabled_at: null } })); }
+  const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    const path = String(input).split('?')[0];
+    if (path.endsWith('/auth/login')) { signedIn = true; return new Response(JSON.stringify({ csrf: 'test', admin: { id: '__management__', name: '管理 token', role: currentRole } })); }
     if (path.endsWith('/auth/logout')) { signedIn = false; return new Response('{}'); }
-    if (!signedIn) return new Response(JSON.stringify({ error: { code: 'unauthorized', message: '登录失败' } }), { status: 401 });
+    if (!signedIn) return new Response(JSON.stringify({ error: { code: 'unauthorized', message: '请连接管理服务器' } }), { status: 401 });
     const data: Record<string, Json> = {
-      '/api/v1/auth/me': { csrf: 'test', admin: { id: 'a', name: 'root', role: currentRole, disabled_at: null } },
-      '/api/v1/overview': { counts: { tunnels_running: 0, tokens_pending: 0 }, clients_online: 1, traffic: { connections: 0 }, traffic_24h: { bytes_in: 0, bytes_out: 0 }, process: { rss_bytes: null }, version: '0.1.0' },
-      '/api/v1/nodes': [node], '/api/v1/clients': [client], '/api/v1/tunnels': [],
+      '/api/v1/auth/me': { csrf: 'test', admin: { id: '__management__', name: '管理 token', role: currentRole } },
+      '/api/v1/overview': { counts: { tunnels_running: 0, tokens_pending: 0 }, clients_online: 1, traffic: {}, traffic_24h: {}, process: {}, version: '0.1.0' },
+      '/api/v1/nodes': [], '/api/v1/clients': [], '/api/v1/tunnels': [],
       '/api/v1/traffic': { range_hours: 24, window_end: 1700000000000, bucket_ms: 3600000, items: [] },
     };
     return new Response(JSON.stringify(data[path] ?? {}));
   });
-  const app = new App(document.getElementById('app')!, host, new ApiClient(undefined, fetcher)); apps.push(app);
-  return { app, requests, fetcher };
+  const app = new App(document.getElementById('app')!, host, new ApiClient(undefined, fetcher)); apps.push(app); return { app, fetcher };
 }
-describe('shared application lifecycle', () => {
-  it('polling pauses for hidden pages and open dialogs and session expiry disposes resource state', async () => {
-    vi.useFakeTimers(); const { app, fetcher } = harness(); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6)); const before = fetcher.mock.calls.length;
-    Object.defineProperty(document, 'hidden', { value: true, configurable: true }); document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(5000); expect(fetcher.mock.calls.length).toBe(before);
-    Object.defineProperty(document, 'hidden', { value: false, configurable: true }); const dialog = document.createElement('dialog'); dialog.setAttribute('open', ''); document.body.append(dialog); await vi.advanceTimersByTimeAsync(5000); expect(fetcher.mock.calls.length).toBe(before); dialog.remove(); document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(0); expect(fetcher.mock.calls.length).toBeGreaterThan(before);
-    app.api.onUnauthorized(); expect(document.querySelector('#login-password')).not.toBeNull(); expect(app.resources.get('clients')).toBeUndefined(); vi.useRealTimers();
+const input = (name: string) => document.querySelector<HTMLInputElement>(`#login-${name}`)!;
+const submit = () => document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
+describe('single management token console', () => {
+  it('sends only the token, prevents duplicate login and never stores credentials', async () => {
+    const { app, fetcher } = harness(); await app.start(); expect(input('name')).toBeNull(); expect(input('password')).toBeNull(); expect(input('server').value).toBe(location.origin);
+    expect(document.querySelector('[data-testid=login-local]')).toBeNull(); expect(document.querySelector<HTMLElement>('.form-error')!.hidden).toBe(true); const secret = input('token'); secret.value = 'test-management-token'; submit(); submit();
+    await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6)); const calls = fetcher.mock.calls.filter(([path]) => String(path).endsWith('/auth/login'));
+    expect(calls).toHaveLength(1); expect(JSON.parse(String(calls[0]![1]?.body))).toEqual({ token: 'test-management-token' }); expect(secret.value).toBe(''); expect(JSON.stringify(localStorage)).not.toContain('test-management-token');
+    expect(document.querySelector('.nav-foot [data-section=local]')).toBeNull();
   });
-  it('native preference failures and logout network failures remain visible and clear local admin state', async () => {
-    const host: Host = { desktop: true, call: vi.fn().mockRejectedValue(new Error('private preferences unavailable')), request: vi.fn() }; const first = harness('owner', true, host); await first.app.start(); expect(document.querySelector('.form-error')?.textContent).toBe('private preferences unavailable'); first.app.dispose();
-    const second = harness(); await second.app.start(); second.app.navigate('settings'); await vi.waitFor(() => expect(document.body.textContent).toContain('退出登录')); second.fetcher.mockRejectedValue(new Error('offline')); [...document.querySelectorAll('button')].find(control => control.textContent === '退出登录')!.click(); await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull()); expect(document.querySelector('.toast.danger')).not.toBeNull();
+  it('ignores old local-mode startup and selects the local management service', async () => {
+    const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({ local_mode: true }), request: vi.fn() }; const { app } = harness(false, host); await app.start();
+    expect(input('server').value).toBe('http://127.0.0.1:9674'); expect(host.call).toHaveBeenCalledWith('selectController', { url: 'http://127.0.0.1:9674' });
+    input('token').value = 'test-token'; submit(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6)); expect(host.call).not.toHaveBeenCalledWith('localStart', expect.anything());
+    app.navigate('clients'); expect(host.call).not.toHaveBeenCalledWith('savePreferences', expect.objectContaining({ local_mode: expect.anything() }));
   });
-  it('loads the last native page and preferences without exposing native sessions to the DOM', async () => {
-    const host: Host = { desktop: true, call: vi.fn(async action => action === 'preferences' ? { theme: 'dark', sidebar_collapsed: true, controller_url: 'https://controller.example.com' } : null), request: vi.fn() };
-    localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'clients', id: 'c' }));
-    const { app } = harness('owner', true, host); await app.start(); await vi.waitFor(() => expect(document.body.textContent).toContain('中文 NAS'));
-    expect(document.documentElement.dataset.theme).toBe('dark'); expect(document.documentElement.dataset.collapsed).toBe('true'); expect(host.call).toHaveBeenCalledWith('selectController', { url: 'https://controller.example.com' });
-    expect(document.querySelector('.collapse svg')).not.toBeNull(); expect(document.querySelector('.collapse')!.getAttribute('aria-label')).toBe('展开菜单');
-    (document.querySelector('.collapse') as HTMLButtonElement).click(); expect(host.call).toHaveBeenCalledWith('savePreferences', { sidebar_collapsed: false });
-    expect(document.querySelector('.collapse')!.getAttribute('aria-label')).toBe('收起菜单'); expect(document.querySelector('.collapse')!.getAttribute('aria-expanded')).toBe('true');
-    app.navigate('tunnels'); app.navigate('nodes'); app.navigate('settings', 'appearance'); await vi.waitFor(() => expect(document.body.textContent).toContain('跟随系统')); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('系统设置'); expect(host.call).toHaveBeenCalledWith('savePreferences', { local_mode: false });
+  it('restores server and appearance while refusing an old local route', async () => {
+    const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({ theme: 'dark', sidebar_collapsed: true, controller_url: 'https://controller.example.com', local_mode: true }), request: vi.fn() };
+    localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'local' })); const { app } = harness(true, host); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));
+    expect(document.documentElement.dataset.theme).toBe('dark'); const toggle = document.querySelector<HTMLButtonElement>('.collapse')!; expect(toggle.querySelector('svg')).not.toBeNull(); expect(toggle.getAttribute('aria-label')).toBe('展开菜单');
+    toggle.click(); expect(toggle.getAttribute('aria-expanded')).toBe('true'); expect(host.call).toHaveBeenCalledWith('savePreferences', { sidebar_collapsed: false });
+    app.navigate('settings'); await vi.waitFor(() => expect(document.body.textContent).toContain('单管理 token')); expect(document.querySelector('[data-testid=setting-admins]')).toBeNull(); expect(document.querySelector('[data-testid=setting-api]')).toBeNull();
   });
-  it('starts native local mode without a controller session and keeps local access separate from admin navigation', async () => {
-    const host: Host = { desktop: true, call: vi.fn(async action => action === 'preferences' ? { local_mode: true, local: { configFile: '/test/frpc.toml' } } : null), request: vi.fn() };
-    const { app, requests } = harness('viewer', false, host); await app.start(); await vi.waitFor(() => expect(document.body.textContent).toContain('本机 Agent'));
-    expect(requests).toHaveLength(0); expect(document.querySelector('[data-section=clients]')).toBeNull(); app.navigate('nodes'); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('本机模式');
-    app.navigate('settings', 'desktop'); await vi.waitFor(() => expect(document.body.textContent).toContain('后台 Agent 独立于窗口运行'));
+  it('reports wrong tokens, invalid addresses and connection failures in the form', async () => {
+    const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() }; const { app, fetcher } = harness(false, host); await app.start(); input('server').value = 'https://other.example'; input('token').value = 'wrong-token';
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'invalid_credentials', message: '管理 token 不正确' } }), { status: 401 })); submit(); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toContain('管理 token 不正确'));
+    expect(host.call).toHaveBeenCalledWith('selectController', { url: 'https://other.example' }); expect(JSON.stringify(localStorage)).not.toContain('wrong-token');
+    input('server').value = 'file:///etc/passwd'; submit(); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toContain('有效的 HTTP(S)'));
   });
-  it('returns from local mode to login without a server request and offers the local Controller address', async () => {
-    const host: Host = { desktop: true, call: vi.fn(async action => action === 'preferences' ? { local_mode: true } : null), request: vi.fn() };
-    const { app, requests } = harness('owner', false, host); await app.start();
-    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-login-entry]')).not.toBeNull());
-    document.querySelector<HTMLButtonElement>('[data-testid=local-login-entry]')!.click();
-    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull());
-    expect(requests).toHaveLength(0);
-    document.querySelector<HTMLButtonElement>('[data-testid=login-local-controller]')!.click();
-    expect(document.querySelector<HTMLInputElement>('#login-server')!.value).toBe('http://127.0.0.1:9674');
-    expect(document.activeElement).toBe(document.querySelector('#login-name'));
+  it('pauses polling while hidden or editing and clears resources on expiry', async () => {
+    vi.useFakeTimers(); const { app, fetcher } = harness(true); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6)); const count = fetcher.mock.calls.length;
+    Object.defineProperty(document, 'hidden', { value: true, configurable: true }); await vi.advanceTimersByTimeAsync(5000); expect(fetcher.mock.calls.length).toBe(count);
+    Object.defineProperty(document, 'hidden', { value: false, configurable: true }); const dialog = document.createElement('dialog'); dialog.setAttribute('open', ''); document.body.append(dialog);
+    await vi.advanceTimersByTimeAsync(5000); expect(fetcher.mock.calls.length).toBe(count); dialog.remove(); document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(0); expect(fetcher.mock.calls.length).toBeGreaterThan(count);
+    app.api.onUnauthorized(); expect(input('token')).not.toBeNull(); expect(app.resources.get('clients')).toBeUndefined();
   });
-  it('rejects inherited or malformed restored routes and ignores late page loading after disposal', async () => {
+  it('keeps offline reads visible and disconnects even if the server is unavailable', async () => {
+    const { app, fetcher } = harness(true); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6)); fetcher.mockRejectedValue(new Error('offline')); document.querySelector<HTMLButtonElement>('[data-testid=refresh-page]')!.click();
+    await vi.waitFor(() => expect(document.querySelector('.toast.danger')).not.toBeNull()); app.navigate('settings'); await vi.waitFor(() => expect(document.body.textContent).toContain('断开连接'));
+    [...document.querySelectorAll('button')].find(button => button.textContent === '断开连接')!.click(); await vi.waitFor(() => expect(input('token')).not.toBeNull());
+  });
+  it('reports preference failures and discards malformed restored pages', async () => {
+    const host: Host = { desktop: true, call: vi.fn().mockRejectedValue(new Error('无法读取偏好')), request: vi.fn() }; const first = harness(false, host); await first.app.start(); expect(document.querySelector('.form-error')!.textContent).toContain('无法读取偏好'); first.app.dispose();
+    localStorage.setItem('rustfrp.page', 'invalid'); const second = harness(true, { ...host, call: vi.fn().mockResolvedValue({}) }); await second.app.start(); expect(localStorage.getItem('rustfrp.page')).toBeNull(); second.app.dispose();
+  });
+  it('retains every management section, retry action and theme across navigation', async () => {
+    const { app } = harness(true); await app.start();
+    for (const section of ['nodes', 'clients', 'tunnels', 'audit', 'settings', 'overview'] as const) {
+      document.querySelector<HTMLButtonElement>(`.nav-item[data-section=${section}]`)!.click();
+      await vi.waitFor(() => expect(document.querySelector('[data-testid=refresh-page]')).not.toBeNull());
+      await vi.waitFor(() => expect(document.body.textContent).not.toContain('正在加载页面'));
+    }
+    app.navigate('settings', 'appearance'); await vi.waitFor(() => expect(document.body.textContent).toContain('跟随系统'));
+    [...document.querySelectorAll('button')].find(button => button.textContent === '深色')!.click(); expect(document.documentElement.dataset.theme).toBe('dark');
+    document.querySelector<HTMLButtonElement>('.collapse')!.click(); expect(document.documentElement.dataset.collapsed).toBe('true');
+    document.querySelector<HTMLButtonElement>('.collapse')!.click(); expect(document.documentElement.dataset.collapsed).toBe('false');
+  });
+  it('rejects unsigned management navigation and legacy lower privilege audit access', async () => {
+    const first = harness(); await first.app.start(); first.app.navigate('nodes'); expect(document.querySelector('.app-shell')).toBeNull(); first.app.dispose();
+    const second = harness(true, new WebHost(), 'viewer'); await second.app.start(); second.app.navigate('audit'); expect(document.querySelector('[data-testid=page-title]')!.textContent).toBe('概览');
+    expect(document.querySelector('[data-section=audit]')).toBeNull();
+  });
+  it('restores valid desktop sections and ignores inherited or inaccessible route names', async () => {
     const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() };
-    localStorage.setItem('rustfrp.page', JSON.stringify({ section: 'toString' })); const first = harness('viewer', true, host); await first.app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));
-    first.app.dispose(); localStorage.setItem('rustfrp.page', 'not-json'); const second = harness('viewer', true, host); await second.app.start(); expect(localStorage.getItem('rustfrp.page')).toBeNull(); second.app.navigate('tunnels'); second.app.dispose(); await Promise.resolve(); expect(document.getElementById('app')!.children).toHaveLength(0);
+    for (const section of ['nodes','clients','tunnels','settings','audit','toString']) {
+      localStorage.setItem('rustfrp.page', JSON.stringify({ section, id: 'x' })); const h = harness(true, host); await h.app.start();
+      await vi.waitFor(() => expect(document.querySelector('[data-testid=refresh-page]')).not.toBeNull());
+      expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe(section === 'toString' ? '概览' : {nodes:'节点管理',clients:'客户端',tunnels:'隧道管理',settings:'系统设置',audit:'审计日志'}[section]);
+      h.app.dispose();
+    }
+    localStorage.setItem('rustfrp.page', JSON.stringify({section:'audit',id:'x'.repeat(257)})); const h=harness(true,host,'viewer'); await h.app.start(); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('概览');
   });
-  it('continues a configured but unenrolled local computer from login directly to node selection', async () => {
-    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true, local: { binary: '/agent', stateDir: '/identity', controller: '127.0.0.1:7000' } } : action === 'info' ? { local_enrolled: false, local_defaults: { binary: '/agent', stateDir: '/identity', name: '本机' } } : null), request: vi.fn() };
-    const { app, requests } = harness('owner', false, host); await app.start();
-    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-start]')).not.toBeNull());
-    document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click();
-    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull());
-    expect(document.querySelector<HTMLInputElement>('#login-server')!.value).toBe('http://127.0.0.1:9674');
-    document.querySelector<HTMLInputElement>('#login-name')!.value = 'preview'; document.querySelector<HTMLInputElement>('#login-password')!.value = 'test password';
-    document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
-    await vi.waitFor(() => expect(document.querySelector('dialog select[name=node]')).not.toBeNull());
-    expect(document.querySelector('[data-testid=page-title]')!.textContent).toBe('本机模式');
-    expect(document.querySelector('dialog [name=enrollToken]')).toBeNull(); expect(requests.some(request => request.path.endsWith('/enroll-tokens'))).toBe(false);
-    document.querySelector<HTMLButtonElement>('[data-testid=dialog-cancel]')!.click();
+  it('drops a token before leaving for another Web control panel and sends no cross-site login', async () => {
+    const { app, fetcher } = harness(); await app.start(); input('server').value = 'https://other.example/panel/'; const secret=input('token'); secret.value='never-send-cross-site'; submit();
+    await vi.waitFor(() => expect(secret.value).toBe('')); expect(fetcher.mock.calls.some(([url]) => String(url).endsWith('/auth/login'))).toBe(false);
   });
-  it('finishes persisting local mode before exposing a login that selects a Controller', async () => {
-    let save!: (value: Json) => void;
-    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true } : action === 'savePreferences' ? new Promise(resolve => { save = resolve; }) : action === 'localStatus' ? null : {}), request: vi.fn() };
-    const { app } = harness('owner', false, host); await app.start(); await vi.waitFor(() => { const action = document.querySelector<HTMLButtonElement>('[data-testid=local-start]'); expect(action).toBeDefined(); expect(action!.disabled).toBe(false); });
-    document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click(); await vi.waitFor(() => expect(save).toBeDefined());
-    expect(document.querySelector('#login-name')).toBeNull(); save(null);
-    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull()); expect(host.call).not.toHaveBeenCalledWith('selectController', expect.anything());
+  it('goes to a remote Web console before asking for its token', async () => {
+    const {app}=harness(); await app.start(); input('token').value='local-only'; input('server').value='https://other.example/'; input('server').dispatchEvent(new Event('input'));
+    expect(input('token').disabled).toBe(true); expect(input('token').value).toBe(''); expect(document.querySelector('[data-testid=login-submit]')!.textContent).toBe('前往管理服务器');
+    input('server').value=location.origin; input('server').dispatchEvent(new Event('input')); expect(input('token').required).toBe(true); expect(input('token').disabled).toBe(false);
+    input('server').value='invalid-url'; input('server').dispatchEvent(new Event('input')); expect(input('token').disabled).toBe(false);
   });
-  it('shows a permission failure after successful local login in the current page', async () => {
-    const host: Host = { desktop: true, call: vi.fn(async (action): Promise<Json> => action === 'preferences' ? { local_mode: true } : action === 'info' ? { local_enrolled: false } : null), request: vi.fn() };
-    const { app } = harness('viewer', false, host); await app.start();
-    await vi.waitFor(() => expect(document.querySelector('[data-testid=local-start]')).not.toBeNull()); document.querySelector<HTMLButtonElement>('[data-testid=local-start]')!.click();
-    await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull()); document.querySelector<HTMLInputElement>('#login-name')!.value = 'reader'; document.querySelector<HTMLInputElement>('#login-password')!.value = 'test password';
-    document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
-    await vi.waitFor(() => expect(document.querySelector('.toast.danger')?.textContent).toContain('当前账号没有接入电脑的权限'));
-    expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('本机模式'); expect(document.querySelector('dialog')).toBeNull();
+  it('keeps local maintenance in advanced desktop settings and clears an expired dialog', async () => {
+    const host: Host = { desktop:true, call:vi.fn(async(action):Promise<Json>=>action==='preferences'?{}:action==='localStatus'?null:action==='startup'?false:action==='info'?{local_enrolled:false,local_defaults:{binary:'/agent',stateDir:'/identity'}}:{}),request:vi.fn() };
+    const { app }=harness(true,host); await app.start(); app.navigate('settings','desktop'); await vi.waitFor(()=>expect(document.querySelector('[data-testid=local-maintenance]')).not.toBeNull());
+    document.querySelector<HTMLButtonElement>('[data-testid=local-maintenance]')!.click(); await vi.waitFor(()=>expect(document.body.textContent).toContain('此电脑尚未接入'));
+    const dialog=document.createElement('dialog'); dialog.showModal(); document.body.append(dialog); app.api.onUnauthorized(); expect(dialog.open).toBe(false); expect(input('token')).not.toBeNull();
   });
-  it('native login selection and login errors remain actionable without storing passwords', async () => {
-    const host: Host = { desktop: true, call: vi.fn().mockResolvedValue({}), request: vi.fn() }; const { app, fetcher } = harness('owner', false, host); await app.start();
-    (document.querySelector('#login-server') as HTMLInputElement).value = 'https://controller.example.com'; (document.querySelector('#login-name') as HTMLInputElement).value = 'root'; (document.querySelector('#login-password') as HTMLInputElement).value = 'private test password';
-    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'invalid_credentials', message: '密码无效' } }), { status: 401 }));
-    document.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await vi.waitFor(() => expect(document.querySelector('.form-error')!.textContent).toBe('密码无效')); expect(host.call).toHaveBeenCalledWith('selectController', { url: 'https://controller.example.com' }); expect(localStorage.getItem('rustfrp.server')).toBe('https://controller.example.com'); expect(JSON.stringify(localStorage)).not.toContain('private test password');
-    (document.querySelector('[data-testid=login-local]') as HTMLButtonElement).click(); await vi.waitFor(() => expect(document.querySelector('[data-testid=page-title]')!.textContent).toBe('本机模式'));
-  });
-  it('restores a browser session and exposes matching navigation and compact real metrics', async () => {
-    const { app } = harness(); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));
-    expect(document.body.textContent).toContain('概览'); expect(document.querySelector('[data-section=audit]')).not.toBeNull();
-    (document.querySelector('.collapse') as HTMLButtonElement).click(); expect(document.documentElement.dataset.collapsed).toBe('true');
-    app.navigate('clients'); await vi.waitFor(() => expect(document.body.textContent).toContain('中文 NAS'));
-    (document.querySelector('[data-testid=detail-c]') as HTMLButtonElement).click(); await vi.waitFor(() => expect(document.body.textContent).toContain('返回列表'));
-    app.navigate('tunnels'); await vi.waitFor(() => expect(document.body.textContent).toContain('暂无记录'));
-    app.navigate('settings'); await vi.waitFor(() => expect(document.body.textContent).toContain('当前账号'));
-    const theme = [...document.querySelectorAll('button')].find(button => button.textContent === '深色')!; theme.click(); expect(document.documentElement.dataset.theme).toBe('dark');
-    const logout = [...document.querySelectorAll('button')].find(button => button.textContent === '退出登录')!; logout.click(); await vi.waitFor(() => expect(document.querySelector('#login-name')).not.toBeNull());
-  });
-  it('does not show privileged navigation to a viewer or send an unauthorized route', async () => {
-    const { app } = harness('viewer'); await app.start(); expect(document.querySelector('[data-section=audit]')).toBeNull();
-    app.navigate('audit'); expect(document.querySelector('[data-testid=page-title]')?.textContent).toBe('概览');
-  });
-  it('logs in using a real form, prevents duplicate submission and clears password values', async () => {
-    const { app, requests } = harness('owner', false); await app.start(); expect(document.querySelector('#login-server')).toBeNull();
-    (document.querySelector('#login-name') as HTMLInputElement).value = 'root'; const password = document.querySelector('#login-password') as HTMLInputElement; password.value = 'test password';
-    const form = document.querySelector('form')!; form.dispatchEvent(new Event('submit', { cancelable: true })); form.dispatchEvent(new Event('submit', { cancelable: true }));
-    await vi.waitFor(() => expect(document.querySelector('.app-shell')).not.toBeNull()); expect(requests.filter(request => request.path.endsWith('/auth/login'))).toHaveLength(1); expect(password.value).toBe('');
-  });
-  it('reports offline reads without discarding the last valid screen', async () => {
-    const { app, fetcher } = harness(); await app.start(); await vi.waitFor(() => expect(document.querySelectorAll('.metric-card')).toHaveLength(6));
-    fetcher.mockRejectedValue(new Error('offline')); (document.querySelector('[data-testid=refresh-page]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(document.querySelector('.toast.danger')).not.toBeNull()); expect(document.querySelectorAll('.metric-card')).toHaveLength(6);
+  it('surfaces failed desktop preference writes and does not render a late page after disposal', async () => {
+    const host: Host = { desktop:true,call:vi.fn().mockResolvedValue({}),request:vi.fn() }; const { app }=harness(true,host); await app.start();
+    vi.mocked(host.call).mockRejectedValue(new Error('preferences unavailable')); document.querySelector<HTMLButtonElement>('.collapse')!.click(); await vi.waitFor(()=>expect(document.querySelector('.toast.danger')).not.toBeNull());
+    app.navigate('settings'); await vi.waitFor(()=>expect(document.querySelector('[data-testid=switch-controller]')).not.toBeNull()); document.querySelector<HTMLButtonElement>('[data-testid=switch-controller]')!.click(); await vi.waitFor(()=>expect(input('token')).not.toBeNull());
+    app.navigate('settings'); app.dispose(); await Promise.resolve(); expect(document.getElementById('app')!.children).toHaveLength(0);
   });
 });

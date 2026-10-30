@@ -101,12 +101,12 @@ def wait(predicate, label, timeout=40):
 
 
 class Api:
-    def __init__(self, name="root", password=None):
+    def __init__(self, admin_token=None):
         self.cookie = self.csrf = None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        if password is None:
-            password = load("credentials.json")["password"]
-        me = self.call("POST", "/auth/login", {"name": name, "password": password},
+        if admin_token is None:
+            admin_token = load("credentials.json")["admin_token"]
+        me = self.call("POST", "/auth/login", {"token": admin_token},
                        headers={"X-Rustfrp-Admin": "1"})
         self.csrf = me["csrf"]
         self.admin = me["admin"]
@@ -218,12 +218,13 @@ def local_control(command):
 
 def bootstrap():
     if not (ROOT / "credentials.json").exists():
-        save("credentials.json", {"name": "root", "password": secrets.token_urlsafe(24),
+        save("credentials.json", {"admin_token": secrets.token_urlsafe(32),
                                   "metrics_token": secrets.token_urlsafe(32)})
     credentials = load("credentials.json")
-    code = "import json,os,subprocess,sys; x=json.load(sys.stdin); env=dict(os.environ,RUSTFRP_DB='/var/lib/rustfrp-test/controller.db',RUSTFRP_ADMIN_PASSWORD=x['password']); subprocess.run(['/opt/rustfrp-test/bin/rustfrp-server','admin','create','root'],env=env,check=True)"
-    ssh(SERVER, "sudo -u rustfrp-test python3 -c " + shlex.quote(code), json.dumps(credentials).encode())
-    env = Path("deploy/wan-test/server.env").read_text() + "RUSTFRP_METRICS_TOKEN=" + credentials["metrics_token"] + "\n"
+    if "admin_token" not in credentials:
+        credentials["admin_token"] = secrets.token_urlsafe(32)
+        save("credentials.json", credentials)
+    env = Path("deploy/wan-test/server.env").read_text() + "RUSTFRP_METRICS_TOKEN=" + credentials["metrics_token"] + "\nRUSTFRP_ADMIN_TOKEN=" + credentials["admin_token"] + "\n"
     write_remote(SERVER, "/etc/rustfrp-test/server.env", env)
     ssh(SERVER, "sudo systemctl daemon-reload && sudo systemctl enable --now rustfrp-test-server")
     wait(lambda: urllib.request.urlopen(BASE + "/healthz", timeout=10).status == 200, "public HTTPS health")
@@ -362,16 +363,8 @@ def managed():
     api.call("POST", "/enroll-tokens", {"name": "bad-origin", "reason": "test"}, headers={"Origin": "https://foreign.example"}, expected=403)
     api.call("POST", "/enroll-tokens", {"name": "bad-csrf", "reason": "test"}, headers={"X-CSRF-Token": "bad"}, expected=403)
     ok("Port policy / reserved ports / reason required / authentication / Origin / CSRF rejection")
-    readonly = api.call("POST", "/admins", {"name": "wan-viewer", "password": "wan-viewer-test-only", "role": "viewer", "reason": "WAN RBAC"})
-    viewer = Api("wan-viewer", "wan-viewer-test-only")
-    viewer.call("GET", "/overview")
-    viewer.call("POST", "/tunnels", {"client_id": client, "name": "viewer-rejected", "local_port": 28081, "reason": "WAN RBAC"}, expected=403)
-    api.call("PATCH", f"/admins/{readonly['id']}", {"disabled": True, "reason": "WAN revoke session"})
-    viewer.call("GET", "/overview", expected=401)
-    api.call("PATCH", f"/admins/{readonly['id']}", {"password": "changed-test-only-password", "role": "operator", "disabled": False, "reason": "WAN admin update"})
-    operator = Api("wan-viewer", "changed-test-only-password")
-    operator.call("POST", "/enroll-tokens", {"name": "operator-rejected", "reason": "WAN RBAC"}, expected=403)
-    api.call("PATCH", f"/admins/{readonly['id']}", {"disabled": True, "reason": "WAN cleanup"})
+    api.call("POST", "/auth/login", {"token": "wrong-management-token"}, headers={"X-Rustfrp-Admin": "1"}, auth=False, expected=401)
+    ok("Single management token authentication rejects incorrect credentials")
     token = api.call("POST", "/api-tokens", {"name": "WAN read", "scope": "read", "days": 1, "reason": "WAN token"})
     api.call("GET", "/overview", headers={"Authorization": "Bearer " + token["token"]}, auth=False)
     api.call("POST", "/api-tokens", {"name": "denied", "scope": "admin", "days": 1, "reason": "test"},
@@ -672,7 +665,7 @@ def finish():
         assert not any(c["id"] == state["visitor_client"] for c in api.call("GET", "/clients"))
         ok("Disposable visitor device deletion, credential denial and cleanup")
     actions = {row["action"] for row in api.call("GET", "/audit?limit=1000")}
-    for action in ("tunnel.create", "tunnel.update", "tunnel.batch", "client.restart", "client.kick", "client.move_node", "node.update", "admin.update", "api_token.revoke"):
+    for action in ("tunnel.create", "tunnel.update", "tunnel.batch", "client.restart", "client.kick", "client.move_node", "node.update", "api_token.revoke"):
         assert action in actions, (action, sorted(actions))
     ok("Audit records cover accepted writes and denied permissions", sorted(actions))
     for host, service_name, path, pid, checksum in (

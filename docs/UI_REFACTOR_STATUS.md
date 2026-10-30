@@ -1,5 +1,25 @@
 # 原生 UI 重构实施与验收
 
+## 全局下拉框样式修订（2026-10-16）
+
+共享 CSS 统一所有下拉框及普通按钮的 32px 最小高度；筛选栏中的紧凑按钮同步对齐，其他紧凑操作仍保持 26px。下拉框使用主题底色、统一箭头、留白、悬停与禁用态，保留原生选项交互和键盘焦点；高对比度模式回退系统箭头。Web 与桌面共用此修订，未修改业务与 Rust 代码。
+
+`make ui-test ui-cov ui-build ui-e2e desktop-test desktop-e2e` 通过：103 项 UI 测试、三引擎 30 项 E2E、87 项桌面单测及本机服务联调。三引擎额外实测 1440/390px、深浅色、筛选控件高度/对齐、表单焦点与禁用态；截图在 `target/ui/select-review/`。UI 行/函数/分支为 99.21% / 93.94% / 90.30%。`RUSTFRP_NATIVE_E2E_MODE=functional make desktop-cov` 通过，桌面壳为 97.51% / 100% / 96.15%，支持库为 95.82% / 93.23% / 90.36%；原生功能模式不包含首帧性能测量。桌面应用已重新构建、签名校验并更新至 `/Applications/RustFRP.app`，旧包在 `target/delivery/before-select-style-20261016/`。
+
+## 单管理 token 修订（2026-10-15）
+
+普通入口已统一为“管理服务器 + 管理 token → 连接”，配置源为 `rustfrp-server.example.toml` 的 `[admin].token`，空值和 `change-me` 明确拒绝启动。文件修改后重启生效，旧管理会话失效，设备身份和隧道保留。Web 默认当前服务器，桌面默认 `http://127.0.0.1:9674`；切换到远程 Web 控制台先导航再填写 token，不转发原 token。正常未登录状态不显示错误。
+
+用户名密码登录已拒绝，普通设置不再显示多管理员/API Token 签发。原有账号和自动化接口仅保留数据与集成兼容；本机维护收进桌面高级设置，不能再由旧 `local_mode` 偏好绕过管理连接页。认证、配置、轮换、凭据区分、CLI、全栈、三引擎和原生 WebView 测试均已迁移到新契约。
+
+本轮已通过 Rust workspace 全量测试、fmt/clippy、103 项共享 UI 行为测试、三引擎 30 项 E2E、全栈冒烟、桌面单测/本机服务 E2E 和 Agent/Edge 内存基准。服务端行/函数/分支为 96.70% / 95.63% / 90.77%，UI 为 99.21% / 93.94% / 90.30%。内存基准 Edge/Client 峰值 6.64 / 7.06 MiB。首次启动脚本已实测创建 0600 配置模板、明确要求修改 token，且不创建数据库。
+
+macOS 原生功能模式通过管理 token 登录、会话恢复、30 次原生窗口切换、一次性设备凭据保护、隔离启动、后台存活和退出后真实转发；`target/ui/native-window-e2e.json` 中 `management_token_login=true`、`passed=true`、`frame_measurement=false`。本轮默认完整首帧测量模式曾因共享桌面遮挡/失焦而在第 8/24 次循环超时，未记为通过；完整测量默认仍保留，功能模式可用 `RUSTFRP_NATIVE_E2E_MODE=functional make desktop-cov` 复现，但不产生首帧性能结论。原生初始化/弹窗异步等待条件已同步修正，普通导航不再写入旧 `local_mode` 偏好。
+
+在同一覆盖率目录完成原生功能复验后，`tools/cov/desktop.py --report-only` 校验通过：桌面壳 97.51% / 100% / 96.15%，支持库 95.82% / 93.23% / 90.36%（行/函数/分支）。没有调整门槛或覆盖率排除项。历史整仓结果保留在下文，不代表此修订重新验证了 Windows/Linux 实机、首帧性能或公网部署。
+
+本地已构建并安装 `/Applications/RustFRP.app`，旧包备份 `target/delivery/RustFRP-before-single-token-soq4pktn/RustFRP.app`；独立交付包 `target/delivery/single-admin-token-20261015/RustFRP.app`。签名校验通过，实际打开的窗口仅显示管理服务器、管理 token 和连接按钮。`./start_dev.sh --skip-build` 已用私有的 `target/dev-panel/server.toml` 启动本地服务，9674/17000/17001 均仅 loopback 监听；HTTP 200，配置 token 实际登录、会话读取和退出通过。公网环境未部署此认证修订。
+
 更新于 2026-10-15。目标按 [重构计划](UI_REFACTOR_PLAN_20261014.md) 执行：Web 与桌面共用原生 HTML/CSS/TypeScript 页面，迁移原有功能并删除 Flutter 工程、依赖和活动构建入口。覆盖率和自动化验收已达到本地门槛；本机外平台、真实签名 Release、桌面进程树内存对照及一个窗口恢复性能目标仍按实测边界记录。
 
 基线：`6058ade`；重构分支：`refactor/native-ui`。重构批次已提交，没有推送。

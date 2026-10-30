@@ -138,12 +138,11 @@ def main():
         RUSTFRP_PUBLIC_HOST="127.0.0.1",
         RUSTFRP_VHOST_HTTP=str(vhost_port),
         RUSTFRP_SUBDOMAIN_HOST="t.example.com",
-        RUSTFRP_ADMIN_PASSWORD="a-long-enough-password",
+        RUSTFRP_ADMIN_TOKEN="test-only-management-token",
     )
     procs = []
     echo = echo_server(echo_port)
     try:
-        subprocess.run([server_bin, "admin", "create", "root"], env=env, check=True, stdout=subprocess.DEVNULL)
         procs.append(subprocess.Popen([server_bin, "run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         api = Api(f"http://127.0.0.1:{http_port}")
         wait(lambda: not port_closed(http_port), "controller HTTP")
@@ -154,7 +153,7 @@ def main():
                 assert response.read().startswith(marker)
         print("未登录安装脚本入口 OK")
 
-        me = api.call("POST", "/auth/login", {"name": "root", "password": env["RUSTFRP_ADMIN_PASSWORD"]}, login=True)
+        me = api.call("POST", "/auth/login", {"token": env["RUSTFRP_ADMIN_TOKEN"]}, login=True)
         api.csrf = me["csrf"]
         print("登录 OK，角色", me["admin"]["role"])
 
