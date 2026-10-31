@@ -32,6 +32,7 @@ def save_png(image, path):
 
 def main():
     source = SVG.read_bytes()
+    (ROOT / 'rustfrp-web/logo.svg').write_bytes(source)
     for size in (16, 32, 64, 128, 256, 512, 1024):
         image = render(source, size)
         save_png(image, BRAND / f'rustfrp-logo-{size}.png')
@@ -46,7 +47,7 @@ def main():
         mark.set('fill', color)
         mark_tree.append(mark)
         (BRAND / f'rustfrp-mark{suffix}.svg').write_bytes(ET.tostring(mark_tree) + b'\n')
-    print('Regenerated canonical brand, macOS ICNS and Windows ICO icons.')
+    print('Regenerated brand, website, macOS ICNS and Windows ICO icons.')
 
 
 if __name__ == '__main__':
